@@ -1,0 +1,44 @@
+{
+  "downstream_diff": {
+    "default_min": 1,
+    "poolA_min": 1,
+    "poolB_min": 1
+  },
+  "listen": {
+    "host": "0.0.0.0",
+    "port": 3351
+  },
+  "listen_port": 3351,
+  "logging": {
+    "json": true,
+    "level": "INFO"
+  },
+  "metrics": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 9210
+  },
+  "metrics_enabled": false,
+  "metrics_port": 9210,
+  "pools": {
+    "A": {
+      "host": "192.168.0.25",
+      "name": "BCH",
+      "port": 3333,
+      "wallet": "bitcoincash:qqlldmmc978u5u7uzas8cakxgfftraquxvjhcc8a3q"
+    },
+    "B": {
+      "host": "127.0.0.1",
+      "name": "BTC",
+      "port": 2018,
+      "wallet": "bc1q9qrn7lsdnpy8w33dsdnu6cr4jdpg53zexgxh59"
+    }
+  },
+  "scheduler": {
+    "min_switch_seconds": 30,
+    "mode": "ratio",
+    "poolA_weight": 50,
+    "poolB_weight": 50,
+    "slice_seconds": 30
+  }
+}
