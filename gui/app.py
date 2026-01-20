@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
@@ -42,3 +43,12 @@ def put_config(cfg: dict):
     tmp.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     tmp.replace(CONFIG_PATH)
     return {"ok": True}
+
+
+@app.post("/api/restart")
+def restart():
+    try:
+        subprocess.check_call(["/home/umbrel/dpmp/gui/restart_dpmpv2.sh"])
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"restart failed: {e}")

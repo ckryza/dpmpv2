@@ -29,6 +29,7 @@
       <div>
         <button id="reload" class="btn" type="button">Reload</button>
         <button id="save" class="btn" type="button">Save</button>
+        <button id="apply" class="btn" type="button">Apply (Restart DPMP)</button>
       </div>
     </div>
 
@@ -178,6 +179,7 @@ async function save(){
 
 $("reload").onclick = load;
 $("save").onclick = save;
+$("apply").onclick = async () => { await save(); setMsg("Restarting..."); const r = await fetch("/api/restart",{method:"POST"}); if(!r.ok){ setMsg("Restart failed: "+r.status); return;} setMsg("Saved + restarted."); };
 load();
 </script>
 </body>
