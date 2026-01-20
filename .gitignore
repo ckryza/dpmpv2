@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+*.log
+dpmpv2_run.log*
+dpmp_run.log*
+*.bak*
+logs/
