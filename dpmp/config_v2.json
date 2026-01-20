@@ -9,6 +9,8 @@
     "port": 3351
   },
   "logging": {
+    "allow": [],
+    "deny": [],
     "json": true,
     "level": "INFO"
   },
