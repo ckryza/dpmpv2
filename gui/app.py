@@ -14,7 +14,7 @@ class LocalOnlyAPIMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         if request.url.path.startswith("/api/"):
             ip = request.client.host if request.client else ""
-            if ip not in ("127.0.0.1", "::1"):
+            if not (ip in ("127.0.0.1", "::1") or ip.startswith("192.168.0.")):
                 return HTMLResponse("Forbidden", status_code=403)
         return await call_next(request)
 
