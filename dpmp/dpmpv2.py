@@ -157,8 +157,29 @@ class AppCfg:
     downstream_diff: dict
 
 def load_config(path: str) -> AppCfg:
+    global LOG_LEVEL, LOG_ALLOW, LOG_DENY
     with open(path, "rb") as f:
         cfg = loads_json(f.read())
+
+    # Config-driven logging defaults (env vars still override if set)
+    logcfg = cfg.get("logging", {})
+    if isinstance(logcfg, dict):
+        if "DPMP_LOG_LEVEL" not in os.environ:
+            lvl = str(logcfg.get("level", "")).strip().lower()
+            if lvl:
+                LOG_LEVEL = lvl
+        if "DPMP_LOG_ALLOW" not in os.environ:
+            allow = logcfg.get("allow", None)
+            if isinstance(allow, str):
+                LOG_ALLOW = set(x.strip() for x in allow.split(",") if x.strip())
+            elif isinstance(allow, list):
+                LOG_ALLOW = set(str(x).strip() for x in allow if str(x).strip())
+        if "DPMP_LOG_DENY" not in os.environ:
+            deny = logcfg.get("deny", None)
+            if isinstance(deny, str):
+                LOG_DENY = set(x.strip() for x in deny.split(",") if x.strip())
+            elif isinstance(deny, list):
+                LOG_DENY = set(str(x).strip() for x in deny if str(x).strip())
 
     listen = cfg.get("listen", {})
     if not isinstance(listen, dict):
