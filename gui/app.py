@@ -8,6 +8,19 @@ CONFIG_PATH = Path(__file__).resolve().parents[1] / "dpmp" / "config_v2.json"
 
 app = FastAPI()
 
+from starlette.middleware.base import BaseHTTPMiddleware
+
+class LocalOnlyAPIMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        if request.url.path.startswith("/api/"):
+            ip = request.client.host if request.client else ""
+            if ip not in ("127.0.0.1", "::1"):
+                return HTMLResponse("Forbidden", status_code=403)
+        return await call_next(request)
+
+app.add_middleware(LocalOnlyAPIMiddleware)
+
+
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """
