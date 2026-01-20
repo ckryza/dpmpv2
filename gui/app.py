@@ -14,7 +14,7 @@ def home():
     <h1>DPMP v2 Config GUI</h1>
     <ul>
       <li><a href="/settings">Settings</a></li>
-      <li><a href="/api/config">GET /api/config</a></li>
+      
     </ul>
     """
 
