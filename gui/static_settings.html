@@ -1,0 +1,184 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>DPMP v2 Settings</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:0;background:#f3f4f6;}
+    .wrap{max-width:1100px;margin:0 auto;padding:24px;}
+    .top{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;}
+    h1{font-size:22px;margin:0;}
+    .grid{display:grid;grid-template-columns:1fr;gap:14px;}
+    .card{background:#fff;border-radius:14px;box-shadow:0 1px 8px rgba(0,0,0,.08);padding:16px;}
+    .card h2{font-size:16px;margin:0 0 10px 0;}
+    .row{display:grid;grid-template-columns:220px 1fr;gap:12px;align-items:center;margin:10px 0;}
+    label{color:#374151;font-size:13px;}
+    input,select,textarea{width:100%;padding:10px;border:1px solid #d1d5db;border-radius:10px;font-size:14px;background:#fff;}
+    textarea{min-height:90px;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;}
+    .btn{padding:10px 14px;border-radius:12px;border:0;background:#111827;color:#fff;font-weight:600;cursor:pointer;}
+    .btn:disabled{opacity:.5;cursor:not-allowed;}
+    .msg{font-size:13px;color:#111827;}
+    .small{font-size:12px;color:#6b7280;}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <h1>DPMP v2 Settings</h1>
+      <div>
+        <button id="reload" class="btn" type="button">Reload</button>
+        <button id="save" class="btn" type="button">Save</button>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Listen</h2>
+        <div class="row"><label>Host</label><input id="listen_host" /></div>
+        <div class="row"><label>Port</label><input id="listen_port" type="number" /></div>
+        <div class="small">Miners connect here (Stratum v1).</div>
+      </div>
+
+      <div class="card">
+        <h2>Metrics</h2>
+        <div class="row"><label>Enabled</label>
+          <select id="metrics_enabled"><option value="true">true</option><option value="false">false</option></select>
+        </div>
+        <div class="row"><label>Host</label><input id="metrics_host" /></div>
+        <div class="row"><label>Port</label><input id="metrics_port" type="number" /></div>
+      </div>
+
+      <div class="card">
+        <h2>Pools</h2>
+        <div class="row"><label>Pool A host</label><input id="poolA_host" /></div>
+        <div class="row"><label>Pool A port</label><input id="poolA_port" type="number" /></div>
+        <div class="row"><label>Pool A name</label><input id="poolA_name" /></div>
+        <div class="row"><label>Pool A wallet</label><input id="poolA_wallet" /></div>
+        <hr/>
+        <div class="row"><label>Pool B host</label><input id="poolB_host" /></div>
+        <div class="row"><label>Pool B port</label><input id="poolB_port" type="number" /></div>
+        <div class="row"><label>Pool B name</label><input id="poolB_name" /></div>
+        <div class="row"><label>Pool B wallet</label><input id="poolB_wallet" /></div>
+      </div>
+
+      <div class="card">
+        <h2>Scheduler</h2>
+        <div class="row"><label>Mode</label><input id="sched_mode" /></div>
+        <div class="row"><label>Pool A weight</label><input id="sched_wA" type="number" /></div>
+        <div class="row"><label>Pool B weight</label><input id="sched_wB" type="number" /></div>
+        <div class="row"><label>Slice seconds</label><input id="sched_slice" type="number" /></div>
+        <div class="row"><label>Min switch seconds</label><input id="sched_minsw" type="number" /></div>
+      </div>
+
+      <div class="card">
+        <h2>Logging</h2>
+        <div class="row"><label>Level</label><input id="log_level" /></div>
+        <div class="row"><label>Allow (comma or list)</label><input id="log_allow" /></div>
+        <div class="row"><label>Deny (comma or list)</label><input id="log_deny" /></div>
+      </div>
+
+      <div class="card">
+        <h2>Downstream diff</h2>
+        <textarea id="downstream_diff"></textarea>
+        <div class="small">JSON object (advanced).</div>
+      </div>
+
+      <div class="card">
+        <div id="msg" class="msg"></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+let CURRENT = null;
+
+function $(id){ return document.getElementById(id); }
+
+function setMsg(t){ $("msg").textContent = t || ""; }
+
+function fill(cfg){
+  CURRENT = cfg;
+  $("listen_host").value = cfg.listen?.host ?? "";
+  $("listen_port").value = cfg.listen?.port ?? "";
+
+  $("metrics_enabled").value = String(cfg.metrics?.enabled ?? true);
+  $("metrics_host").value = cfg.metrics?.host ?? "";
+  $("metrics_port").value = cfg.metrics?.port ?? "";
+
+  $("poolA_host").value = cfg.pools?.A?.host ?? "";
+  $("poolA_port").value = cfg.pools?.A?.port ?? "";
+  $("poolA_name").value = cfg.pools?.A?.name ?? "A";
+  $("poolA_wallet").value = cfg.pools?.A?.wallet ?? "";
+
+  $("poolB_host").value = cfg.pools?.B?.host ?? "";
+  $("poolB_port").value = cfg.pools?.B?.port ?? "";
+  $("poolB_name").value = cfg.pools?.B?.name ?? "B";
+  $("poolB_wallet").value = cfg.pools?.B?.wallet ?? "";
+
+  $("sched_mode").value = cfg.scheduler?.mode ?? "ratio";
+  $("sched_wA").value = cfg.scheduler?.poolA_weight ?? 50;
+  $("sched_wB").value = cfg.scheduler?.poolB_weight ?? 50;
+  $("sched_slice").value = cfg.scheduler?.slice_seconds ?? 30;
+  $("sched_minsw").value = cfg.scheduler?.min_switch_seconds ?? 30;
+
+  $("log_level").value = cfg.logging?.level ?? "INFO";
+  $("log_allow").value = Array.isArray(cfg.logging?.allow) ? cfg.logging.allow.join(",") : (cfg.logging?.allow ?? "");
+  $("log_deny").value = Array.isArray(cfg.logging?.deny) ? cfg.logging.deny.join(",") : (cfg.logging?.deny ?? "");
+
+  $("downstream_diff").value = JSON.stringify(cfg.downstream_diff ?? {}, null, 2);
+}
+
+function readForm(){
+  const cfg = JSON.parse(JSON.stringify(CURRENT || {}));
+  cfg.listen = { host: $("listen_host").value.trim(), port: Number($("listen_port").value) };
+  cfg.metrics = { enabled: $("metrics_enabled").value === "true", host: $("metrics_host").value.trim(), port: Number($("metrics_port").value) };
+
+  cfg.pools = cfg.pools || {};
+  cfg.pools.A = { host: $("poolA_host").value.trim(), port: Number($("poolA_port").value), name: $("poolA_name").value.trim(), wallet: $("poolA_wallet").value.trim() };
+  cfg.pools.B = { host: $("poolB_host").value.trim(), port: Number($("poolB_port").value), name: $("poolB_name").value.trim(), wallet: $("poolB_wallet").value.trim() };
+
+  cfg.scheduler = { mode: $("sched_mode").value.trim(), poolA_weight: Number($("sched_wA").value), poolB_weight: Number($("sched_wB").value),
+                    slice_seconds: Number($("sched_slice").value), min_switch_seconds: Number($("sched_minsw").value) };
+
+  cfg.logging = cfg.logging || {};
+  cfg.logging.level = $("log_level").value.trim();
+  cfg.logging.allow = $("log_allow").value.trim() ? $("log_allow").value.split(",").map(x=>x.trim()).filter(Boolean) : [];
+  cfg.logging.deny  = $("log_deny").value.trim()  ? $("log_deny").value.split(",").map(x=>x.trim()).filter(Boolean)  : [];
+
+  try{
+    cfg.downstream_diff = JSON.parse($("downstream_diff").value || "{}");
+  }catch(e){
+    throw new Error("downstream_diff must be valid JSON");
+  }
+  return cfg;
+}
+
+async function load(){
+  setMsg("Loading...");
+  const r = await fetch("/api/config");
+  if(!r.ok){ setMsg("Load failed: " + r.status); return; }
+  const cfg = await r.json();
+  fill(cfg);
+  setMsg("Loaded.");
+}
+
+async function save(){
+  let cfg;
+  try{ cfg = readForm(); }catch(e){ setMsg("Save blocked: " + e.message); return; }
+  setMsg("Saving...");
+  const r = await fetch("/api/config", {method:"PUT", headers:{"Content-Type":"application/json"}, body: JSON.stringify(cfg)});
+  if(!r.ok){
+    const t = await r.text();
+    setMsg("Save failed: " + r.status + " " + t);
+    return;
+  }
+  setMsg("Saved. (Restart DPMP to apply)");
+}
+
+$("reload").onclick = load;
+$("save").onclick = save;
+load();
+</script>
+</body>
+</html>
