@@ -18,7 +18,7 @@
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 0,
-  "id": 0,
+  "id": 1,
   "links": [],
   "panels": [
     {
@@ -109,7 +109,7 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
+        "h": 6,
         "w": 6,
         "x": 0,
         "y": 2
@@ -205,7 +205,7 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
+        "h": 6,
         "w": 6,
         "x": 6,
         "y": 2
@@ -300,7 +300,7 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
+        "h": 6,
         "w": 7,
         "x": 12,
         "y": 2
@@ -386,10 +386,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
+        "h": 5,
         "w": 9,
         "x": 0,
-        "y": 10
+        "y": 8
       },
       "id": 2,
       "options": {
@@ -453,10 +453,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
+        "h": 5,
         "w": 10,
         "x": 9,
-        "y": 10
+        "y": 8
       },
       "id": 1,
       "options": {
@@ -507,6 +507,48 @@
       ],
       "title": "Connections",
       "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "ffarj7m8gbl6oc"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 19,
+        "x": 0,
+        "y": 13
+      },
+      "id": 7,
+      "options": {
+        "dedupStrategy": "none",
+        "enableInfiniteScrolling": false,
+        "enableLogDetails": true,
+        "showControls": false,
+        "showTime": false,
+        "sortOrder": "Descending",
+        "wrapLogMessage": false
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "ffarj7m8gbl6oc"
+          },
+          "direction": "backward",
+          "editorMode": "code",
+          "expr": "{job=\"dpmpv2\"}\r\n",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Log Output",
+      "type": "logs"
     }
   ],
   "preload": false,
@@ -524,5 +566,5 @@
   "timezone": "browser",
   "title": "Dual Pool Mining Dashboard",
   "uid": "ad59rxr",
-  "version": 15
+  "version": 16
 }
