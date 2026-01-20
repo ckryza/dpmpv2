@@ -19,3 +19,5 @@ DPMP v2 Git workflow (safe)
    git add dpmp/dpmpv2.py dpmp/config_v2.json
    git commit -m "Describe change"
    git push
+
+NOTE: dpmp_active_pool is label-based; use grep '^dpmp_active_pool' to see it.
