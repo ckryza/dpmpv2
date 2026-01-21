@@ -1,8 +1,19 @@
-.venv/
-__pycache__/
-*.pyc
+# Secrets / local configs
+config.json
+dpmp/config.json
+dpmp/config.json.*
+*.env
+
+# Logs
 *.log
-dpmpv2_run.log*
-dpmp_run.log*
+dpmpv2_run.log
+dpmpv2_gui.log
+
+# Backups / scratch / dumps
+*.BAK*
 *.bak*
-logs/
+*.KNOWN_GOOD*
+*.SAFE_RESTORE*
+*.BEFORE_*
+*.TRUNCATED*
+*.old

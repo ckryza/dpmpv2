@@ -1,0 +1,15 @@
+[Unit]
+Description=DPMP v2 GUI (non-docker)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=%h/dpmp
+ExecStart=%h/dpmp/.venv/bin/python -m uvicorn gui.app:app --host 0.0.0.0 --port 8844
+Restart=always
+RestartSec=2
+StandardOutput=append:%h/dpmp/dpmpv2_gui.log
+StandardError=append:%h/dpmp/dpmpv2_gui.log
+
+[Install]
+WantedBy=default.target
