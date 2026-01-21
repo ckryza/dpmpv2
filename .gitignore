@@ -17,3 +17,28 @@ dpmpv2_gui.log
 *.BEFORE_*
 *.TRUNCATED*
 *.old
+
+# Local docs (don’t track)
+RUNBOOK*.md
+HANDOFF*.md
+
+# One-off tooling / scratch (don’t track)
+exact_replace.py
+tools/
+dpmp.py
+dpmp/test_miner.py
+
+# Docker artifacts (we’re back to non-docker)
+dpmp/Dockerfile
+gui/Dockerfile
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Old v1 artifacts / backups we don’t track
+dpmp/config.example.json
+dpmp/dpmp_old_version.py
+
+# Rotated / archived logs
+dpmpv2_run.log.*
