@@ -14,3 +14,9 @@
 - Package as Umbrel Community App.
 - Simplify configuration UX.
 - Harden multi-miner handling.
+
+## Post-Reject Investigation Cleanup
+- Fix dpmpv2.service shutdown behavior:
+  - systemctl stop currently times out and requires SIGKILL
+  - investigate graceful cancellation of async tasks and faster exit
+  - ensure clean stop before restart
