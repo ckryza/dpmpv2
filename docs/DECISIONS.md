@@ -62,3 +62,21 @@
 - Queue flush timing vs session state changes.
 - Out-of-order notify/submit mapping if async tasks interleave.
 - Only downstream setup is locked; other shared mappings rely on async discipline.
+
+## Code Review Summary (Handlers: notify/diff/extranonce/submit)
+### Handler Flows
+- maybe_send_downstream_extranonce(): change-detect extranonce and send mining.set_extranonce for active context; updates last_downstream_extranonce_* tracking.
+- maybe_send_downstream_diff(): change-detect diff and send mining.set_difficulty (per-pool tracking); often serialized with downstream_setup_lock.
+- resend_active_notify_clean(): re-sends latest job with clean_jobs=true after setup changes.
+- miner_to_pools():
+  - mining.configure/subscribe/authorize: forwarded to handshake pool; authorize also mirrored to other pool; then sync downstream extranonce/diff.
+  - mining.submit: routes shares using job mapping + last_forwarded heuristics; rejects/drops if jid unknown or extranonce context mismatch (safer than misroute).
+
+### Ordering Assumptions
+- Downstream extranonce/diff should be synced before forwarding jobs and before accepts.
+- resend_active_notify_clean is used to reduce mismatch windows after setup changes.
+
+### Primary Routing Pitfalls
+- Stale job mapping or last_forwarded state near pool switches.
+- Extranonce context mismatch (expected drop/reject behavior if out of sync).
+- Any lag between setup change and notify forwarding can create a brief reject window.
