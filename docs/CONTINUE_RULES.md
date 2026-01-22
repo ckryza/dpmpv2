@@ -10,3 +10,5 @@ Behavior:
 - No autocomplete/inline guessing.
 - Generate code only when explicitly requested.
 - Focus on debugging, architecture, and safe changes.
+
+- Read docs/ANCHOR_A.md
