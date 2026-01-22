@@ -323,7 +323,7 @@ class ProxySession:
         self.cfg = cfg
         self.sid = sid  # downstream session id (peer)
         self.pool_w: Dict[str, asyncio.StreamWriter] = {}
-        self.up_q: Dict[str, list[str]] = {"A": [], "B": []}  # queued upstream JSON lines until writer exists
+        self.up_q: Dict[str, list[tuple[str, str]]] = {"A": [], "B": []}  # (raw, tag) queued until writer exists
         self.miner_r = miner_r
         self.miner_w = miner_w
 
@@ -384,7 +384,7 @@ class ProxySession:
         if w is None:
             # pool writer not ready yet -> queue the raw line and flush when pool connects
             q = self.up_q.setdefault(pool_key, [])
-            q.append(raw)
+            q.append((raw, pool_key))
             log("send_upstream_queued", sid=self.sid, pool=pool_key, qlen=len(q))
             return
         await write_line(w, raw, f"upstream{pool_key}")
@@ -428,11 +428,14 @@ class ProxySession:
         self.pool_w[pcfg.key] = w
         q = self.up_q.get(pcfg.key) or []
         if q:
-            log("send_upstream_flush_start", sid=self.sid, pool=pcfg.key, qlen=len(q))
-            for raw in q:
-                await write_line(w, raw, f"upstream{pcfg.key}")
-            self.up_q[pcfg.key] = []
-            log("send_upstream_flush_done", sid=self.sid, pool=pcfg.key)
+            to_flush = [raw for (raw, tag) in q if tag == pcfg.key]
+            keep = [(raw, tag) for (raw, tag) in q if tag != pcfg.key]
+            if to_flush:
+                log("send_upstream_flush_start", sid=self.sid, pool=pcfg.key, qlen=len(to_flush))
+                for raw in to_flush:
+                    await write_line(w, raw, f"upstream{pcfg.key}")
+                log("send_upstream_flush_done", sid=self.sid, pool=pcfg.key)
+            self.up_q[pcfg.key] = keep
 
         await self.bootstrap_pool(pcfg)
         return r, w
