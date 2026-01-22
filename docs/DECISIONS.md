@@ -80,3 +80,21 @@
 - Stale job mapping or last_forwarded state near pool switches.
 - Extranonce context mismatch (expected drop/reject behavior if out of sync).
 - Any lag between setup change and notify forwarding can create a brief reject window.
+
+## Code Review Summary (Final section: lifecycle/cleanup)
+### Lifecycle
+- Enforces single active miner session using ACTIVE_MINER_WRITER + ACTIVE_MINER_LOCK.
+- handle_miner creates ProxySession and runs it; rejects additional miner connections.
+- Cleanup closes miner + upstream streams, resets per-session downstream state, updates metrics.
+- Graceful shutdown via SIGINT/SIGTERM.
+
+### Disconnect/Error Paths
+- Exceptions in session are caught/logged; cleanup runs in finally.
+- Close operations are try/except guarded to avoid cascading failures.
+- Metrics server startup errors are logged and proxy continues.
+
+### Reconnect Risk Points
+- If ACTIVE_MINER_WRITER not cleared due to edge-case failure, new sessions could be blocked.
+- Metrics counters can drift if cleanup is skipped (hard kill).
+- Any per-session “seen” sets are safe if ProxySession is truly discarded; state bleed only if reuse occurs.
+- Task cancellation ordering could matter if any tasks outlive the session unexpectedly.
