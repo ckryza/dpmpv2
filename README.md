@@ -111,8 +111,8 @@ Installation, configuration, and operational runbooks will be added once those w
 
 DPMP v2 is designed for users who:
 
-- Run one or more ASIC or CPU/GPU miners
-- Want to split hash power across pools deterministically
+- Run one or more ASIC or CPU/GPU miners that do not internally support dual-pool mining (i.e., Avalon Q, Avalon Nano3S, etc.)
+- Want to split hash power across pools deterministically, such as mine to a Bitcoin pool and a Bitcoin Cash pool simultaneously
 - Care about correctness, observability, and long-term stability
 - Prefer transparent tooling over black-box pool logic
 
