@@ -42,3 +42,7 @@ dpmp/dpmp_old_version.py
 
 # Rotated / archived logs
 dpmpv2_run.log.*
+
+# VS Code (local)
+.vscode/
+*.code-workspace
