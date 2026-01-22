@@ -19,3 +19,14 @@
 ## Do NOT Edit Live Config Blindly
 - config_v2.json changes can break running service.
 - Always restart dpmpv2 after config edits.
+
+## Queue Flush vs Pool Switch (Race Window)
+### Symptom
+- Messages queued for a pool can be flushed after active_pool/handshake_pool changes, sending stale-context traffic to an unintended upstream.
+
+### Minimal Fix Strategy (Invariant-based)
+- Tag queued items with intended pool (or a generation counter captured at enqueue time).
+- On connect_pool() flush, only flush items whose tag matches the pool being connected; leave others queued.
+
+### Invariant
+- A queued message must only ever be sent to the pool intended at enqueue-time.
