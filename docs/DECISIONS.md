@@ -43,3 +43,22 @@
 1. Job ID mapping races during pool switches.
 2. Missing or malformed handshake/setup forwarding.
 3. Difficulty desynchronization causing invalid shares.
+
+## Code Review Summary (dpmpv2.py: config + IO + scheduler + ProxySession)
+### Responsibilities
+- Loads config with compatibility handling (logging/listen/metrics/pools/weights).
+- Async Stratum line IO helpers (iter_lines/write_line) with wire logging.
+- Extracts jobid from notify/submit.
+- RatioScheduler for weighted switching.
+- ProxySession owns per-miner session state: pool connections, queues, job routing, extranonce/diff tracking, internal bootstrap IDs.
+
+### Key Invariants
+- Job ownership mapping must remain correct for submit routing.
+- Extranonce + difficulty values sent downstream must match active context.
+- Internal request IDs for bootstrap must never collide with normal IDs.
+- active_pool / last_forwarded_jobid must reflect what miner most recently saw.
+
+### Main Risk Windows
+- Queue flush timing vs session state changes.
+- Out-of-order notify/submit mapping if async tasks interleave.
+- Only downstream setup is locked; other shared mappings rely on async discipline.
