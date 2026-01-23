@@ -47,6 +47,7 @@ JOBS_FORWARDED = Counter("dpmp_jobs_forwarded_total", "Jobs forwarded to miner",
 ACCEPTED_DIFFICULTY_SUM = Counter("dpmp_accepted_difficulty_sum", "Sum of difficulty for accepted shares", ["pool"])
 DIFF_DOWNSTREAM = Gauge("dpmp_downstream_difficulty", "Current downstream difficulty")
 ACTIVE_POOL = Gauge("dpmp_active_pool", "Active pool (1=active,0=inactive)", ["pool"])
+SWITCH_SUBMIT_GRACE_S = 0.75  # seconds to tolerate stale submits right after a pool switch
 
 def now_utc() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
@@ -322,6 +323,7 @@ class ProxySession:
     def __init__(self, cfg: AppCfg, miner_r: asyncio.StreamReader, miner_w: asyncio.StreamWriter, sid: str):
         self.cfg = cfg
         self.sid = sid  # downstream session id (peer)
+        self.last_switch_mono: float | None = None
         self.pool_w: Dict[str, asyncio.StreamWriter] = {}
         self.up_q: Dict[str, list[tuple[str, str]]] = {"A": [], "B": []}  # (raw, tag) queued until writer exists
         self.miner_r = miner_r
@@ -771,6 +773,17 @@ class ProxySession:
                 # building shares against the wrong extranonce1, which will produce mass rejects.
                 ex_pool = getattr(self, "last_downstream_extranonce_pool", None)
                 if ex_pool in ("A", "B") and ex_pool != pool:
+                    age = None
+                    if self.last_switch_mono is not None:
+                        age = time.monotonic() - float(self.last_switch_mono)
+
+                    if age is not None and age < SWITCH_SUBMIT_GRACE_S:
+                        log("submit_dropped_extranonce_mismatch_grace", sid=self.sid, mid=msg.get("id"), jid=jid,
+                            target_pool=pool, last_extranonce_pool=ex_pool, age_s=round(age, 3))
+                        await write_line(self.miner_w, dumps_json({"id": msg.get("id"), "result": False,
+                            "error": {"code": 23, "message": "stale extranonce context", "data": None}}), "downstream")
+                        continue
+
                     log("submit_dropped_extranonce_mismatch", sid=self.sid, mid=msg.get("id"), jid=jid,
                         target_pool=pool, last_extranonce_pool=ex_pool,
                         last_jobid=self.last_forwarded_jobid, last_pool=self.last_forwarded_pool)
@@ -1076,6 +1089,7 @@ class ProxySession:
                         current_pool = pick
                         last_switch_ts = now
                         log("pool_switched", sid=self.sid, to_pool=pick)
+                        self.last_switch_mono = time.monotonic()                      
 
                         # Immediately sync extranonce+diff and resend clean notify after switch
                         await self.maybe_send_downstream_extranonce(pick)
@@ -1105,6 +1119,7 @@ class ProxySession:
                     current_pool = pick
                     last_switch_ts = now
                     log("pool_switched", sid=self.sid, to_pool=pick)
+                    self.last_switch_mono = time.monotonic()
 
                     # Immediately sync extranonce+diff and resend clean notify after switch
                     await self.maybe_send_downstream_extranonce(pick)
