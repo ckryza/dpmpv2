@@ -30,3 +30,9 @@
 
 ### Invariant
 - A queued message must only ever be sent to the pool intended at enqueue-time.
+
+## Extranonce mismatch submit drops after pool switches (mitigated)
+- Symptom: `submit_dropped_extranonce_mismatch` events right after `pool_switched`, rejects spike.
+- Fix: add short grace window `SWITCH_SUBMIT_GRACE_S` and log `submit_dropped_extranonce_mismatch_grace` for submits arriving immediately after switch; still reject them locally to avoid upstream churn.
+- Result: non-grace mismatch drops eliminated in test window; Nano3S reject % dropped materially.
+- Commit: grace-window mitigation added in dpmpv2.py.
