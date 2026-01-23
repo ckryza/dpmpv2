@@ -1076,6 +1076,11 @@ class ProxySession:
                         current_pool = pick
                         last_switch_ts = now
                         log("pool_switched", sid=self.sid, to_pool=pick)
+
+                        # Immediately sync extranonce+diff and resend clean notify after switch
+                        await self.maybe_send_downstream_extranonce(pick)
+                        await self.maybe_send_downstream_diff(pick, force=True)
+                        await self.resend_active_notify_clean(pick, reason="switch")                
                     pick = current_pool
                 else:
                     targetB = (wB / totw)
@@ -1099,6 +1104,12 @@ class ProxySession:
                     ACTIVE_POOL.labels(pool="B").set(1 if pick == "B" else 0)
                     current_pool = pick
                     last_switch_ts = now
+                    log("pool_switched", sid=self.sid, to_pool=pick)
+
+                    # Immediately sync extranonce+diff and resend clean notify after switch
+                    await self.maybe_send_downstream_extranonce(pick)
+                    await self.maybe_send_downstream_diff(pick, force=True)
+                    await self.resend_active_notify_clean(pick, reason="switch")
 
             pick = current_pool
             raw = self.latest_notify_raw.get(pick)
