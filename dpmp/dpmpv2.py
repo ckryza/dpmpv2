@@ -1332,10 +1332,49 @@ async def main():
         except NotImplementedError:
             pass
 
-    async with server:
+    serve_task = asyncio.create_task(server.serve_forever())
+    try:
         await stop.wait()
+    finally:
+        log("shutdown_begin")
 
-    log("dpmp_stopped")
+        try:
+            log("shutdown_server_close_begin")
+            server.close()
+            try:
+                await asyncio.wait_for(server.wait_closed(), timeout=2.0)
+                log("shutdown_server_close_done")
+            except asyncio.TimeoutError:
+                log("shutdown_server_close_timeout")
+        except Exception as e:
+            log("shutdown_server_close_error", err=str(e))
+
+        # Stop the serve_forever loop        
+        log("shutdown_serve_task_cancel_begin")
+        try:
+            serve_task.cancel()
+            await asyncio.wait_for(asyncio.gather(serve_task, return_exceptions=True), timeout=2.0)
+            log("shutdown_serve_task_cancel_done")
+        except asyncio.TimeoutError:
+            log("shutdown_serve_task_cancel_timeout")
+        except Exception as e:
+            log("shutdown_serve_task_error", err=str(e))
+
+        log("shutdown_cancel_tasks")
+        current_task = asyncio.current_task()
+        tasks = [t for t in asyncio.all_tasks() if t is not current_task and t is not serve_task and not t.done()]
+        for t in tasks:
+            t.cancel()
+
+        if tasks:
+            try:
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5.0)
+            except asyncio.TimeoutError:
+                log("shutdown_timeout", n=len(tasks))
+
+        log("shutdown_done")
+
+
 
 if __name__ == "__main__":
     asyncio.run(main())
