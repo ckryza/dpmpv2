@@ -24,9 +24,24 @@
 - Metrics port: 9210
 - Logs: /home/umbrel/dpmp/dpmpv2_run.log
 
+### dpmpv2-nicegui.service (primary GUI)
+- Runs via systemd user service (auto-start)
+- Service file: /home/umbrel/.config/systemd/user/dpmpv2-nicegui.service
+- Python: /home/umbrel/dpmp/.venv/bin/python
+- Script: /home/umbrel/dpmp/gui_nice/app.py
+- Port: 8855
+- Control:
+  - Status: `systemctl --user --no-pager --full status dpmpv2-nicegui.service`
+  - Restart: `systemctl --user restart dpmpv2-nicegui.service`
+  - Stop: `systemctl --user stop dpmpv2-nicegui.service`
+  - Disable autostart: `systemctl --user disable --now dpmpv2-nicegui.service`
+  - Enable autostart: `systemctl --user enable --now dpmpv2-nicegui.service`
+- Notes: This replaces the legacy FastAPI GUI.
+
 ### dpmpv2-gui.service (legacy FastAPI GUI)
 - Script: /home/umbrel/dpmp/gui/app.py
 - Port: 8844
+- Status: **deprecated; disabled by default** (`systemctl --user disable --now dpmpv2-gui.service`)
 - Logs: /home/umbrel/dpmp/dpmpv2_gui.log
 
 ## URLs
