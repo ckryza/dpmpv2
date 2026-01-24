@@ -7,6 +7,33 @@ This repository contains the **v2 architecture**, which is a ground-up redesign 
 
 ---
 
+## Quick Install (Non-Docker, UmbrelOS)
+
+```bash
+git clone https://github.com/ckryza/dpmpv2.git ~/dpmp
+cd ~/dpmp
+./installer/install.sh
+```
+
+After install:
+- **Stratum**: `:3351`
+- **Metrics**: `:9210/metrics`
+- **NiceGUI**: `http://<umbrel-ip>:8855/`
+
+### Upgrade
+```bash
+cd ~/dpmp
+./installer/upgrade.sh
+```
+
+### Uninstall (keeps config/logs)
+```bash
+cd ~/dpmp
+./installer/uninstall.sh
+```
+
+---
+
 ## What DPMP v2 Does
 
 At a high level, DPMP v2:
@@ -56,9 +83,10 @@ The proxy is intentionally **transparent**: miners and pools do not need to be m
 - Designed for both human debugging and automated analysis
 - Suitable for ingestion into Loki or other log systems
 
-### 🖥 Optional Web UI (Legacy)
-- Simple FastAPI-based GUI for configuration/status
-- Intended as a stepping stone toward a richer NiceGUI-based interface
+### 🖥 Web UI
+- **NiceGUI-based interface** (primary)
+- Live config editing and status
+- Legacy FastAPI GUI is deprecated and disabled by default
 
 ---
 
