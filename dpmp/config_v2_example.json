@@ -1,0 +1,54 @@
+{
+  "downstream_diff": {
+    "default_min": 1,
+    "poolA_min": 1,
+    "poolB_min": 1
+  },
+  "listen": {
+    "host": "0.0.0.0",
+    "port": 3351
+  },
+  "logging": {
+    "allow": [],
+    "deny": [
+      "submit_route",
+      "share_result",
+      "id_response_seen",
+      "downstream_extranonce_skip_raw_subscribe",
+      "downstream_extranonce_skip_nochange",
+      "downstream_extranonce_set",
+      "downstream_diff_set",
+      "job_forwarded",
+      "pool_notify",
+      "notify_clean_forced"
+    ],
+    "json": true,
+    "level": "INFO"
+  },
+  "metrics": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 9210
+  },
+  "pools": {
+    "A": {
+      "host": "POOL_A_HOST",
+      "name": "POOL_A",
+      "port": 3333,
+      "wallet": "POOL_A_WALLET"
+    },
+    "B": {
+      "host": "POOL_B_HOST",
+      "name": "POOL_B",
+      "port": 3333,
+      "wallet": "POOL_B_WALLET"
+    }
+  },
+  "scheduler": {
+    "min_switch_seconds": 30,
+    "mode": "ratio",
+    "poolA_weight": 50,
+    "poolB_weight": 50,
+    "slice_seconds": 30
+  }
+}

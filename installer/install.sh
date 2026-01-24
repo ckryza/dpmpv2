@@ -24,6 +24,13 @@ fi
 
 cd "${INSTALL_DIR}"
 
+CONFIG_DST="${INSTALL_DIR}/dpmp/config_v2.json"
+CONFIG_SRC="${INSTALL_DIR}/dpmp/config_v2_example.json"
+if [ ! -f "${CONFIG_DST}" ]; then
+  echo "Creating default config at ${CONFIG_DST} (edit Pool A/B in GUI)..."
+  cp -a "${CONFIG_SRC}" "${CONFIG_DST}"
+fi
+
 echo "Creating venv (if missing)..."
 if [ ! -d ".venv" ]; then
   python3 -m venv .venv
