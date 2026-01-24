@@ -1,7 +1,7 @@
 <h3>About Dual-Pool Mining Proxy (DPMP)</h3>
 <p><strong>DPMP </strong>&nbsp;is a lightweight, high-reliability&nbsp;<strong>Stratum v1 mining proxy</strong>&nbsp;designed to sit between one or more miners and&nbsp;two upstream mining pools. It was designed primarily for Bitcoin solo-miners who run one or more ASIC miners (SHA-256) and want to split hash power across pools. Some miners, like the NerdQAxe++, have a built-in "dual pool mining" feature but the majority of miners out there do not.</p>
 <p>So if you have one or more miners that do NOT have a built-in dual-pool mining feature (like the Canaan Avalon Q or the Nano3S) and you would like, for example, to mine to a BTC pool and a Bitcoin Cash pool simultaneously, then <strong>DPMP</strong> is for you.&nbsp;</p>
-<p><strong>DPMP</strong> enables&nbsp;<strong>deterministic dual-pool scheduling</strong>, advanced difficulty/extranonce handling, and deep observability via Prometheus metrics &mdash; while remaining simple to deploy and operate.</p>
+<p><strong>DPMP</strong> enables&nbsp;<strong>deterministic dual-pool scheduling</strong>, advanced difficulty/extranonce handling, and observability via Prometheus metrics &mdash; while remaining simple to deploy and operate.</p>
 <p dir="auto">At a high level, <strong>DPMP</strong>:</p>
 <ul dir="auto">
 <li>Accepts Stratum connections from miners (acts like a pool)</li>
@@ -14,10 +14,10 @@
 <li>job IDs</li>
 </ul>
 </li>
-<li>Exposes detailed runtime metrics for monitoring and analysis</li>
+<li>Exposes runtime metrics for monitoring and analysis</li>
 <li>Logs structured, machine-readable events for debugging and auditing</li>
 </ul>
-<p dir="auto">The proxy is intentionally&nbsp;<strong>transparent</strong>: miners and pools do not need to be modified or aware that DPMP is in the middle.</p>
+<p dir="auto">The proxy is intentionally&nbsp;<strong>transparent</strong>: miners and pools do not need to be modified or aware that <strong>DPMP</strong> is in the middle.</p>
 <hr />
 <h4 dir="auto">Configuration and Setup</h4>
 <p dir="auto">On the <em>Config</em>&nbsp;tab you will need to edit the <strong>pools</strong> section and, for both pools, put in the URL/IP Address, Port, and the wallet address to be used when mining to that pool (make sure the wallet address is correct!) You can also give&nbsp;the pool a name.&nbsp;</p>
