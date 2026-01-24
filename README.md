@@ -34,6 +34,27 @@ cd ~/dpmp
 
 ---
 
+## Installer Behavior (Important)
+
+The non-docker installer is intentionally conservative.
+
+What `install.sh` **does**:
+- Creates `~/dpmp` if missing
+- Creates a Python virtualenv and installs dependencies
+- Installs **systemd user services** (`dpmpv2.service`, `dpmpv2-nicegui.service`)
+- Creates `dpmp/config_v2.json` from `config_v2_example.json` **only if missing**
+- Enables linger and auto-starts services
+
+What it **does NOT** do:
+- Does not overwrite an existing config
+- Does not touch wallets, pool credentials, or logs
+- Does not require root
+
+⚠️ **After first launch**:
+Open the NiceGUI and **update Pool A and Pool B settings**  
+(host, port, name, wallet) before mining.
+
+
 ## What DPMP v2 Does
 
 At a high level, DPMP v2:
