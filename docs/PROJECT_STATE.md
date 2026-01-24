@@ -7,6 +7,16 @@
 
 ## Umbrel Runtime (MUST NOT BREAK)
 ### dpmpv2.service (user service + linger)
+- **Runs via systemd user service (auto-start).** Prefer `systemctl --user` over `nohup` during normal operation.
+- Service file: /home/umbrel/.config/systemd/user/dpmpv2.service
+- Control:
+  - Status: `systemctl --user --no-pager --full status dpmpv2.service`
+  - Restart: `systemctl --user restart dpmpv2.service`
+  - Stop: `systemctl --user stop dpmpv2.service`
+  - Disable autostart: `systemctl --user disable --now dpmpv2.service`
+  - Enable autostart: `systemctl --user enable --now dpmpv2.service`
+- Ports owned by service when running: 3351 (stratum), 9210 (metrics)
+- If you must run manually for debugging: **stop the service first** to avoid `OSError: [Errno 98] address already in use`.
 - Python: /home/umbrel/dpmp/.venv/bin/python
 - Script: /home/umbrel/dpmp/dpmp/dpmpv2.py
 - Config: DPMP_CONFIG=/home/umbrel/dpmp/dpmp/config_v2.json
