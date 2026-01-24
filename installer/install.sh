@@ -24,6 +24,15 @@ fi
 
 cd "${INSTALL_DIR}"
 
+echo "Checking required ports (3351/9210/8855)..."
+for port in 3351 9210 8855; do
+  if ss -ltn 2>/dev/null | awk "{print \$4}" | grep -q ":${port}$"; then
+    echo "ERROR: port ${port} already in use. Stop the conflicting service and retry." >&2
+    ss -ltnp | grep ":${port}" || true
+    exit 1
+  fi
+done
+
 CONFIG_DST="${INSTALL_DIR}/dpmp/config_v2.json"
 CONFIG_SRC="${INSTALL_DIR}/dpmp/config_v2_example.json"
 if [ ! -f "${CONFIG_DST}" ]; then
