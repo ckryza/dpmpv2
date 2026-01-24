@@ -48,6 +48,7 @@ ACCEPTED_DIFFICULTY_SUM = Counter("dpmp_accepted_difficulty_sum", "Sum of diffic
 DIFF_DOWNSTREAM = Gauge("dpmp_downstream_difficulty", "Current downstream difficulty")
 ACTIVE_POOL = Gauge("dpmp_active_pool", "Active pool (1=active,0=inactive)", ["pool"])
 SWITCH_SUBMIT_GRACE_S = 0.75  # seconds to tolerate stale submits right after a pool switch
+MAX_CACHED_NOTIFY_AGE_S = 20.0  # don't switch into pool if cached notify older than this
 
 def now_utc() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
@@ -346,6 +347,7 @@ class ProxySession:
         self.latest_notify_raw: Dict[str, Optional[bytes]] = {"A": None, "B": None}
         self.latest_jobid: Dict[str, Optional[str]] = {"A": None, "B": None}
         self.notify_seq: Dict[str, int] = {"A": 0, "B": 0}
+        self.last_notify_mono: Dict[str, float | None] = {"A": None, "B": None}
         self.extranonce1: Dict[str, Optional[str]] = {"A": None, "B": None}
         self.extranonce2_size: Dict[str, Optional[int]] = {"A": None, "B": None}
 
@@ -370,6 +372,12 @@ class ProxySession:
         # de-dupe upstream responses (subscribe/authorize collisions)
         self.submit_diff: Dict[Any, float] = {}
         self.accepted_diff_sum: Dict[str, float] = {"A": 0.0, "B": 0.0}
+        # Deduplicate submits to avoid upstream "Duplicate share" when miners retry submits.
+        # key: pool -> {fingerprint: last_seen_monotonic}
+        self.submit_fp_last: Dict[str, Dict[tuple, float]] = {"A": {}, "B": {}}
+        self.submit_fp_max: int = 512
+        self.submit_fp_ttl_s: float = 45.0
+
 
         self.sched = RatioScheduler(cfg.sched.wA, cfg.sched.wB)
         # Internal upstream bootstrap (subscribe/auth) so both pools produce notify,
@@ -597,6 +605,12 @@ class ProxySession:
                 nm2 = sanitize_downstream_notification(nm)
                 log("downstream_send_notify", payload=nm2)
                 await write_line(self.miner_w, dumps_json(nm2), "downstream")
+                # Commit forwarded-job state for submit routing (resend path must mirror scheduler forward path)
+                self.last_forwarded_pool = pool_key
+                self.last_forwarded_jobid = jid
+                if jid:
+                    self.job_owner[(pool_key, jid)] = pool_key
+                self.last_notify_mono = time.monotonic()
                 log("resend_notify_clean", sid=self.sid, pool=pool_key, jobid=jid, reason=reason)
                 return
         except Exception as e:
@@ -767,6 +781,42 @@ class ProxySession:
                         reason = "last_forwarded_pool_fallback"
                 log("submit_route", sid=self.sid, jid=jid, pool=pool, reason=reason,
                     last_jobid=self.last_forwarded_jobid, last_pool=self.last_forwarded_pool)
+                # Dedupe: miners sometimes retry identical submits (timeout / reconnect).
+                # Forwarding duplicates upstream produces "Duplicate share" rejects.
+                try:
+                    pms = msg.get("params") or []
+                    # Params: [user, jobid, extranonce2, ntime, nonce, (optional) versionbits]
+                    fp = (
+                        str(pms[1]) if len(pms) > 1 else None,
+                        str(pms[2]) if len(pms) > 2 else None,
+                        str(pms[3]) if len(pms) > 3 else None,
+                        str(pms[4]) if len(pms) > 4 else None,
+                        str(pms[5]) if len(pms) > 5 else None,
+                    )
+                    now = time.monotonic()
+                    mfp = self.submit_fp_last.get(pool)
+                    if mfp is None:
+                        mfp = {}
+                        self.submit_fp_last[pool] = mfp
+                    ttl = float(getattr(self, "submit_fp_ttl_s", 45.0) or 45.0)
+                    if mfp:
+                        old = [k for k,v in mfp.items() if (now - float(v)) > ttl]
+                        for k in old:
+                            mfp.pop(k, None)
+                    mx = int(getattr(self, "submit_fp_max", 512) or 512)
+                    if len(mfp) > mx:
+                        for k,_v in sorted(mfp.items(), key=lambda kv: kv[1])[: max(1, len(mfp) - mx)]:
+                            mfp.pop(k, None)
+                    last = mfp.get(fp)
+                    if last is not None and (now - float(last)) <= ttl:
+                        log("submit_dropped_duplicate_fp", sid=self.sid, mid=msg.get("id"), jid=jid, pool=pool)
+                        await write_line(self.miner_w, dumps_json({"id": msg.get("id"), "result": False,
+                            "error": {"code": 22, "message": "duplicate share", "data": None}}), "downstream")
+                        continue
+                    mfp[fp] = now
+                except Exception as e:
+                    log("submit_dedupe_error", sid=self.sid, err=str(e))
+
 
                 # Guard: reject submits if miner extranonce context doesn't match target pool.
                 # If we recently sent mining.set_extranonce for the other pool, the miner may be
@@ -778,18 +828,17 @@ class ProxySession:
                         age = time.monotonic() - float(self.last_switch_mono)
 
                     if age is not None and age < SWITCH_SUBMIT_GRACE_S:
-                        log("submit_dropped_extranonce_mismatch_grace", sid=self.sid, mid=msg.get("id"), jid=jid,
+                        # Grace window: allow in-flight submits for the previous pool job to be forwarded.
+                        # We route by job ownership (target_pool=pool). Rejecting here creates unnecessary drops.
+                        log("submit_extranonce_mismatch_grace_forward", sid=self.sid, mid=msg.get("id"), jid=jid,
                             target_pool=pool, last_extranonce_pool=ex_pool, age_s=round(age, 3))
+                    else:
+                        log("submit_dropped_extranonce_mismatch", sid=self.sid, mid=msg.get("id"), jid=jid,
+                            target_pool=pool, last_extranonce_pool=ex_pool,
+                            last_jobid=self.last_forwarded_jobid, last_pool=self.last_forwarded_pool)
                         await write_line(self.miner_w, dumps_json({"id": msg.get("id"), "result": False,
                             "error": {"code": 23, "message": "stale extranonce context", "data": None}}), "downstream")
                         continue
-
-                    log("submit_dropped_extranonce_mismatch", sid=self.sid, mid=msg.get("id"), jid=jid,
-                        target_pool=pool, last_extranonce_pool=ex_pool,
-                        last_jobid=self.last_forwarded_jobid, last_pool=self.last_forwarded_pool)
-                    await write_line(self.miner_w, dumps_json({"id": msg.get("id"), "result": False,
-                        "error": {"code": 23, "message": "stale extranonce context", "data": None}}), "downstream")
-                    continue
 
                 self.submit_owner[msg.get("id")] = pool
                 mid = msg.get("id")
@@ -988,6 +1037,20 @@ class ProxySession:
                                         n["params"][-1] = True
                                         log("post_auth_push_notify_clean", sid=self.sid, pool=pool_key)
                                         await write_line(self.miner_w, dumps_json(n), "downstream")
+                                        # Commit forwarded-job state for submit routing (post-auth path must mirror resend/scheduler path)
+                                        jid = None
+                                        try:
+                                            if isinstance(n, dict):
+                                                ps = n.get("params")
+                                                if isinstance(ps, list) and len(ps) >= 1:
+                                                    jid = ps[0]
+                                        except Exception:
+                                            jid = None
+                                        self.last_forwarded_pool = pool_key
+                                        self.last_forwarded_jobid = jid
+                                        if jid:
+                                            self.job_owner[(pool_key, jid)] = pool_key
+                                        self.last_notify_mono = time.monotonic()
                                 except Exception as e:
                                     log("post_auth_push_notify_clean_error", sid=self.sid, pool=pool_key, err=str(e))
                         except Exception as e:
@@ -1042,6 +1105,7 @@ class ProxySession:
             now = time.monotonic()
             slice_s = max(1, int(self.cfg.sched.slice_seconds))
             min_switch = max(0, int(self.cfg.sched.min_switch_seconds))
+            switched_this_tick = False  # force-forward cached notify immediately after a switch
 
             # Time-slice switching (ratio by time), not by notify frequency.
             # Time-slice switching (ratio by time), not by notify frequency.
@@ -1089,6 +1153,7 @@ class ProxySession:
                         current_pool = pick
                         last_switch_ts = now
                         log("pool_switched", sid=self.sid, to_pool=pick)
+                        switched_this_tick = True
                         self.last_switch_mono = time.monotonic()                      
 
                         # Immediately sync extranonce+diff and resend clean notify after switch
@@ -1119,6 +1184,7 @@ class ProxySession:
                     current_pool = pick
                     last_switch_ts = now
                     log("pool_switched", sid=self.sid, to_pool=pick)
+                    switched_this_tick = True
                     self.last_switch_mono = time.monotonic()
 
                     # Immediately sync extranonce+diff and resend clean notify after switch
@@ -1134,7 +1200,7 @@ class ProxySession:
 
                 # Forward only when there's a new notify for this pool,
                 # or immediately after a switch (seq will differ).
-                if seq > last_sent_seq.get(pick, 0):
+                if (seq > last_sent_seq.get(pick, 0)) or switched_this_tick:
                     # Metrics truth: whichever pool we actually forward is 'active'.
                     self.active_pool = pick
                     ACTIVE_POOL.labels(pool="A").set(1 if pick == "A" else 0)
