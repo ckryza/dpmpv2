@@ -1,6 +1,7 @@
 # DPMP v2 — Dual-Pool Mining Proxy
 
-**DPMP v2** is a lightweight, high-reliability **Stratum v1 mining proxy** designed to sit between one or more miners and multiple upstream mining pools.  
+**DPMP v2** is a lightweight, high-reliability **Stratum v1 mining proxy** designed to sit between one or more miners and multiple upstream mining pools. 
+
 It enables **deterministic dual-pool scheduling**, advanced difficulty/extranonce handling, and deep observability via Prometheus metrics — while remaining simple to deploy and operate.
 
 This repository contains the **v2 architecture**, which is a ground-up redesign focused on correctness, robustness, and long-running stability.
@@ -51,8 +52,8 @@ What it **does NOT** do:
 - Does not require root
 
 ⚠️ **After first launch**:
-Open the NiceGUI and **update Pool A and Pool B settings**  
-(host, port, name, wallet) before mining.
+Open the DPMP GUI interface (i.e., browse to <ip of box DPMP is running on>:8855/), click on the Config tab, and **update Pool A and Pool B settings**  
+(host, port, name, wallet) before mining. Pay special attention to the wallet addresses and make sure the wallet address you add is correct for the pool you are adding it to.
 
 
 ## What DPMP v2 Does
@@ -106,7 +107,7 @@ The proxy is intentionally **transparent**: miners and pools do not need to be m
 
 ### 🖥 Web UI
 - **NiceGUI-based interface** (primary)
-- Live config editing and status
+- Live config editing, view logs, and status
 - Legacy FastAPI GUI is deprecated and disabled by default
 
 ---
