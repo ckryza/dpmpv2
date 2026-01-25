@@ -19,7 +19,7 @@ cd ~/dpmp
 After install:
 - **Stratum**: `:3351`
 - **Metrics**: `:9210/metrics`
-- **NiceGUI**: `http://<umbrel-ip>:8855/`
+- **Dashboard**: `http://<umbrel-ip>:8855/`
 
 ### Upgrade
 ```bash
@@ -52,8 +52,7 @@ What it **does NOT** do:
 - Does not require root
 
 ⚠️ **After first launch**:
-Open the DPMP GUI interface (i.e., browse to <ip of box DPMP is running on>:8855/), click on the Config tab, and **update Pool A and Pool B settings**  
-(host, port, name, wallet) before mining. Pay special attention to the wallet addresses and make sure the wallet address you add is correct for the pool you are adding it to.
+Open the **DPMP** GUI interface `(e.g., browse to '<ip-of-box-DPMP-is-running-on>:8855/')`, click on the **Config** tab, and **update Pool A and Pool B settings** (host, port, name, wallet) before mining. Pay special attention to the wallet addresses and make sure the wallet address you add is correct for the pool you are adding it to.
 
 
 ## What DPMP v2 Does
@@ -170,7 +169,7 @@ DPMP v2 is designed for users who:
 
 ## License
 
-License information will be added once the project stabilizes further.
+MIT License
 
 ---
 
