@@ -1,0 +1,23 @@
+id: ckryza-dpmpv2
+name: DPMP v2
+version: "0.1.0"
+tagline: Dual-Pool Stratum v1 mining proxy
+description: >
+  DPMP v2 is a Stratum v1 mining proxy that sits between miners and two upstream pools.
+  It supports deterministic time-sliced dual-pool scheduling, safe job/share routing, and a NiceGUI UI.
+
+developer: Chris Kryza
+website: https://github.com/ckryza/dpmpv2
+repo: https://github.com/ckryza/dpmpv2
+support: https://github.com/ckryza/dpmpv2/issues
+
+# Umbrel will reverse-proxy the app UI on this port.
+port: 8855
+path: /
+
+# Optional metadata (safe to keep even if Umbrel ignores some fields)
+category: Mining
+gallery: []
+releaseNotes: >
+  Initial Umbrel Community App packaging (NiceGUI + proxy).
+dependencies: []
