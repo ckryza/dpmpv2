@@ -1,0 +1,29 @@
+version: "3.7"
+
+services:
+  dpmpv2:
+    build: .
+    container_name: dpmpv2
+    restart: unless-stopped
+
+    # Expose Stratum + metrics + NiceGUI
+    ports:
+      - "3351:3351"
+      - "9210:9210"
+      - "8855:8855"
+
+    environment:
+      DPMP_CONFIG: /data/config_v2.json
+      DPMP_CONFIG_PATH: /data/config_v2.json
+      DPMP_METRICS_URL: http://127.0.0.1:9210/metrics
+      DPMP_LOG_PATH: /data/dpmpv2_run.log
+      GUI_LOG_PATH: /data/dpmpv2_gui.log
+      NICEGUI_HOST: 0.0.0.0
+      NICEGUI_PORT: 8855
+      NICEGUI_POLL_S: "2.0"
+
+    volumes:
+      - dpmpv2_data:/data
+
+volumes:
+  dpmpv2_data:
