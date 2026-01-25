@@ -281,16 +281,22 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
         lbl_note = ui.html("<b>Note</b>: The <i>SumDiff</i> and <i>Diff Ratio</i> metrics above are the best indicators for measuring proxy performance...over time the <i>Diff Ratio</i> values should converge toward the configured pool ratio in Scheduler Settings.", sanitize=False).classes("text-sm")
 
         def update_home_status() -> None:
-            # 1) dpmpv2 systemd state
-            active = systemd_is_active("dpmpv2")
-            lbl_dpmp.content = f"<b>DPMP</b>: {'running' if active else 'stopped'}"
-            if active:
-                lbl_status.style('color: green;')
-            else:
-                lbl_status.style('color: red;')
+
+            # 1) dpmpv2 systemd state (bare-metal). In Docker this will be unavailable.
+            active = False
+            try:
+                active = systemd_is_active("dpmpv2")
+            except Exception:
+                active = False
+
             # 2) metrics-derived status (regex, minimal)
             try:
                 raw = http_get_text(METRICS_URL)
+
+                # If we can successfully fetch metrics, DPMP is effectively "running"
+                # even if systemd isn't available (e.g., in Docker).
+                if raw and raw.strip():
+                    active = True
 
                 a = _prom_gauge_value(raw, "dpmp_active_pool", pool="A")
                 b = _prom_gauge_value(raw, "dpmp_active_pool", pool="B")
@@ -337,6 +343,10 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                     ui.notify(f"Home status error: {e}", type="negative")
                 except Exception:
                     pass
+
+            # Final status display (works for both bare-metal and Docker)
+            lbl_dpmp.content = f"<b>DPMP</b>: {'running' if active else 'stopped'}"
+            lbl_status.style('color: green;' if active else 'color: red;')
 
 
         update_home_status()
