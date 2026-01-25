@@ -700,7 +700,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
         ui.timer(0.2, lambda: asyncio.create_task(refresh_logs_loop()), once=True)
 
     with ui.tab_panel(t_about):
-        ABOUT_PATH = os.path.expanduser("~/dpmp/gui_nice/about.html")
+        ABOUT_PATH = os.path.join(os.path.dirname(__file__), "about.html")
 
         try:
             html = read_text_file(ABOUT_PATH, max_bytes=400_000)
