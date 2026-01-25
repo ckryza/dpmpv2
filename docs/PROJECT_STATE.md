@@ -45,5 +45,12 @@
 - Logs: /home/umbrel/dpmp/dpmpv2_gui.log
 
 ## URLs
+
+## Installer (non-docker)
+- `installer/install.sh` will create `dpmp/config_v2.json` from `dpmp/config_v2_example.json` if missing.
+- `dpmp/config_v2.json` is runtime-only and is **ignored** by git (never commit secrets).
+- Ports used: 3351 (stratum), 9210 (metrics), 8855 (NiceGUI).
+
 - Metrics: http://192.168.0.24:9210/metrics
-- GUI: http://192.168.0.24:8844/settings
+- GUI: http://<umbrel-ip>:8855/ (NiceGUI, primary)
+- Legacy GUI (deprecated): http://<umbrel-ip>:8844/settings (FastAPI)

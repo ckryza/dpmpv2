@@ -36,3 +36,8 @@
 - Fix: add short grace window `SWITCH_SUBMIT_GRACE_S` and log `submit_dropped_extranonce_mismatch_grace` for submits arriving immediately after switch; still reject them locally to avoid upstream churn.
 - Result: non-grace mismatch drops eliminated in test window; Nano3S reject % dropped materially.
 - Commit: grace-window mitigation added in dpmpv2.py.
+
+## Config Leakage / Secrets
+- `dpmp/config_v2.json` must never be committed (contains pool URLs/wallets). It is now git-ignored.
+- Keep any real configs only as local backups (e.g., `dpmp/config_backups/`) and do not ship them in a public distro repo.
+- Installer uses only `dpmp/config_v2_example.json` to seed a new install.
