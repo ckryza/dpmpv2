@@ -274,7 +274,11 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             lbl_acc = ui.html("<b>Accepted</b>: A … / B …", sanitize=False).classes("text-sm").tooltip("Total accepted shares per pool")
             lbl_rej = ui.html("<b>Rejected</b>: A … / B …", sanitize=False).classes("text-sm").tooltip("Total rejected shares per pool")
             lbl_jobs = ui.html("<b>Jobs</b>: A … / B …", sanitize=False).classes("text-sm").tooltip("Total jobs forwarded per pool")
+            lbl_dif = ui.html("<b>SumDiff</b>: A … / B …", sanitize=False).classes("text-sm").tooltip("Sum of difficulty of accepted shares per pool")
+            lbl_rat = ui.html("<b>Diff Ratio</b>: A …% / B …%", sanitize=False).classes("text-sm").tooltip("Percentage of accepted difficulty per pool")
 
+        ui.separator()
+        lbl_note = ui.html("<b>Note</b>: The <i>SumDiff</i> and <i>Diff Ratio</i> metrics above are the best indicators for measuring proxy performance...over time the <i>Diff Ratio</i> values should converge toward the configured pool ratio in Scheduler Settings.", sanitize=False).classes("text-sm")
 
         def update_home_status() -> None:
             # 1) dpmpv2 systemd state
@@ -310,10 +314,20 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                 jobA = _prom_gauge_value(raw, "dpmp_jobs_forwarded_total", pool="A") or 0.0
                 jobB = _prom_gauge_value(raw, "dpmp_jobs_forwarded_total", pool="B") or 0.0
 
+                difA = _prom_gauge_value(raw, "dpmp_accepted_difficulty_sum_total", pool="A") or 0.0
+                difB = _prom_gauge_value(raw, "dpmp_accepted_difficulty_sum_total", pool="B") or 0.0
+
+                total_dif = difA + difB
+                ratioA = (difA / total_dif * 100.0) if total_dif > 0.0 else 0.0
+                ratioB = (difB / total_dif * 100.0) if total_dif > 0.0 else 0.0
+                pctA = 100*difA/(total_dif or 1)
+                pctB = 100*difB/(total_dif or 1)
+
                 lbl_acc.content = f"<b>Accepted</b>: A {int(accA)} / B {int(accB)}"
                 lbl_rej.content = f"<b>Rejected</b>: A {int(rejA)} / B {int(rejB)}"
                 lbl_jobs.content = f"<b>Jobs</b>: A {int(jobA)} / B {int(jobB)}"
-
+                lbl_dif.content = f"<b>SumDiff</b>: A {int(difA)} / B {int(difB)}"
+                lbl_rat.content = f"<b>Diff Ratio</b>: A {pctA:.2f}% / B {pctB:.2f}%"
 
             except Exception as e:
                 lbl_pool.content = "<b>Active pool</b>: error"
