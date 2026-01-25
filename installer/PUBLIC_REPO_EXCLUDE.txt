@@ -1,0 +1,7 @@
+# Files/dirs that must NOT be shipped in a future public distribution repo/package.
+dpmp/config_backups/
+dpmp/config.json*
+dpmp/config.example.json
+dpmp/config_v2.json.bak*
+dpmpv2_run.log*
+dpmpv2_gui.log*
