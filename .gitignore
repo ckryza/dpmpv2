@@ -46,3 +46,6 @@ dpmpv2_run.log.*
 # VS Code (local)
 .vscode/
 *.code-workspace
+
+# runtime config (DO NOT COMMIT)
+dpmp/config_v2.json
