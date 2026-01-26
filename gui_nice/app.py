@@ -37,9 +37,15 @@ def now_utc() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime())
 
 import subprocess
+import signal
+
+def _in_container() -> bool:
+    return os.path.exists("/.dockerenv") or (os.environ.get("container") is not None)
 
 def systemd_is_active(unit: str) -> bool:
-    # returns True if systemd reports "active"
+    # returns True if systemd reports "active" (bare-metal).
+    if _in_container():
+        return False
     try:
         r = subprocess.run(
             ["systemctl", "--user", "is-active", unit],
@@ -188,7 +194,14 @@ def prom_value(text: str, metric: str, match_labels: Dict[str, str] | None = Non
 
 
 def restart_dpmpv2() -> tuple[bool, str]:
-    # Runs as the same user as the service, so --user is fine.
+    # In Umbrel (container), there is no systemd. Restart the container by terminating PID1.
+    if _in_container():
+        try:
+            os.kill(1, signal.SIGTERM)
+            return True, "restart requested (container)"
+        except Exception as e:
+            return False, f"container restart failed: {e}"
+    # Bare-metal dev: systemd user service
     try:
         p = subprocess.run(
             ["systemctl", "--user", "restart", "dpmpv2"],
