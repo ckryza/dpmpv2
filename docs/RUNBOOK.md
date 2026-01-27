@@ -73,3 +73,12 @@ Notes:
 - confirm store cache updated
 - uninstall/reinstall
 - confirm UI says running, and metrics are reachable inside container on 9210
+
+## Non-Docker DPMPv2 (Bare Metal) service control (BitNode1)
+- Start:   systemctl --user start dpmpv2
+- Stop:    systemctl --user stop dpmpv2
+- Restart: systemctl --user restart dpmpv2
+- Status:  systemctl --user status dpmpv2 --no-pager -l
+- Logs:    journalctl --user -u dpmpv2 -n 200 --no-pager
+- Verify single instance: pgrep -af "dpmpv2\.py"   (should show ONE line)
+- IMPORTANT: Do NOT run nohup/manual dpmpv2.py while the service is enabled.
