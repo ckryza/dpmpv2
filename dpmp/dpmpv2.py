@@ -1292,28 +1292,10 @@ class ProxySession:
                 except Exception:
                     pass
 
-ACTIVE_MINER_LOCK = asyncio.Lock()
-ACTIVE_MINER_WRITER = None
-
 async def handle_miner(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, cfg: AppCfg):
     peer = writer.get_extra_info("peername")
 
-    # Nano-class miners may open multiple parallel TCP sessions while probing pools.
-    # Keep ONLY ONE active miner session. Reject additional sessions to avoid
-    # difficulty/extranonce spraying across parallel connections.
-    global ACTIVE_MINER_WRITER
-    async with ACTIVE_MINER_LOCK:
-        if ACTIVE_MINER_WRITER is not None:
-            log("miner_rejected_extra_session",
-                active_peer=str(ACTIVE_MINER_WRITER.get_extra_info("peername")),
-                new_peer=str(peer))
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
-            return
-        ACTIVE_MINER_WRITER = writer
+    # Allow multiple miners to connect concurrently.
 
     CONN_DOWNSTREAM.inc()
     log("miner_connected", peer=str(peer))
@@ -1324,10 +1306,6 @@ async def handle_miner(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
     except Exception as e:
         log("session_error", peer=str(peer), err=str(e))
     finally:
-        # Only clear ACTIVE_MINER_WRITER if we are still the active session.
-        async with ACTIVE_MINER_LOCK:
-            if ACTIVE_MINER_WRITER is writer:
-                ACTIVE_MINER_WRITER = None
 
         # Clear per-session downstream state so reconnects start clean.
         try:
