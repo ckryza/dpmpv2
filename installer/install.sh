@@ -54,6 +54,13 @@ cp -a services/dpmpv2.service "${SYSTEMD_DIR}/dpmpv2.service"
 cp -a services/dpmpv2-nicegui.service "${SYSTEMD_DIR}/dpmpv2-nicegui.service"
 systemctl --user daemon-reload
 
+# Hard-disable legacy FastAPI GUI so it can never auto-start again
+systemctl --user disable --now dpmpv2-gui.service 2>/dev/null || true
+if [ -f "${SYSTEMD_DIR}/dpmpv2-gui.service" ] || [ -L "${SYSTEMD_DIR}/dpmpv2-gui.service" ]; then
+  mv -f "${SYSTEMD_DIR}/dpmpv2-gui.service" "${SYSTEMD_DIR}/dpmpv2-gui.service.DISABLED.$(date -u +%Y-%m-%d_%H%M%SZ)" 2>/dev/null || true
+fi
+ln -sf /dev/null "${SYSTEMD_DIR}/dpmpv2-gui.service"
+
 echo "Enabling linger..."
 loginctl enable-linger "${USER}" >/dev/null 2>&1 || true
 

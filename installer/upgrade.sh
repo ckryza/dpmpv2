@@ -14,6 +14,15 @@ echo "Stopping services..."
 systemctl --user stop dpmpv2-nicegui.service || true
 systemctl --user stop dpmpv2.service || true
 
+# Hard-disable legacy FastAPI GUI so it can never auto-start again
+SYSTEMD_DIR="${HOME}/.config/systemd/user"
+systemctl --user disable --now dpmpv2-gui.service 2>/dev/null || true
+if [ -f "${SYSTEMD_DIR}/dpmpv2-gui.service" ] || [ -L "${SYSTEMD_DIR}/dpmpv2-gui.service" ]; then
+  mv -f "${SYSTEMD_DIR}/dpmpv2-gui.service" "${SYSTEMD_DIR}/dpmpv2-gui.service.DISABLED.$(date -u +%Y-%m-%d_%H%M%SZ)" 2>/dev/null || true
+fi
+ln -sf /dev/null "${SYSTEMD_DIR}/dpmpv2-gui.service"
+systemctl --user daemon-reload
+
 echo "Updating repo..."
 git pull --ff-only
 
