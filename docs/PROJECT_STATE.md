@@ -29,7 +29,8 @@
 - Service file: /home/umbrel/.config/systemd/user/dpmpv2-nicegui.service
 - Python: /home/umbrel/dpmp/.venv/bin/python
 - Script: /home/umbrel/dpmp/gui_nice/app.py
-- Port: 8855
+- Port: 8845
+- Note: 8855 is the planned standard later; currently 8845 matches dpmpv2-nicegui.service
 - Control:
   - Status: `systemctl --user --no-pager --full status dpmpv2-nicegui.service`
   - Restart: `systemctl --user restart dpmpv2-nicegui.service`
@@ -39,18 +40,11 @@
 - Notes: This replaces the legacy FastAPI GUI.
 
 ### dpmpv2-gui.service (legacy FastAPI GUI)
-- Script: /home/umbrel/dpmp/gui/app.py
-- Port: 8844
-- Status: **deprecated; disabled by default** (`systemctl --user disable --now dpmpv2-gui.service`)
-- Logs: /home/umbrel/dpmp/dpmpv2_gui.log
 
-## URLs
-
-## Installer (non-docker)
-- `installer/install.sh` will create `dpmp/config_v2.json` from `dpmp/config_v2_example.json` if missing.
-- `dpmp/config_v2.json` is runtime-only and is **ignored** by git (never commit secrets).
-- Ports used: 3351 (stratum), 9210 (metrics), 8855 (NiceGUI).
-
-- Metrics: http://192.168.0.24:9210/metrics
-- GUI: http://<umbrel-ip>:8855/ (NiceGUI, primary)
-- Legacy GUI (deprecated): http://<umbrel-ip>:8844/settings (FastAPI)
+- Status: **deprecated; hard-disabled (masked)**
+  - We permanently prevent it from ever starting by masking it to `/dev/null`.
+  - Commands used on Umbrel:
+    - `systemctl --user disable --now dpmpv2-gui.service || true`
+    - `mv ~/.config/systemd/user/dpmpv2-gui.service ~/.config/systemd/user/dpmpv2-gui.service.DISABLED.<timestamp>`
+    - `ln -sf /dev/null ~/.config/systemd/user/dpmpv2-gui.service`
+    - `systemctl --user daemon-reload`
