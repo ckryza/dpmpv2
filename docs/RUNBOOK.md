@@ -55,3 +55,21 @@ Notes:
 - Installer fails early if ports 3351/9210/8855 are already in use.
 - Installer creates dpmp/config_v2.json from dpmp/config_v2_example.json if missing.
 - After install, edit Pool A/B in NiceGUI before pointing miners at DPMP.
+
+## Publishing a new Umbrel build (GHCR + store repo)
+
+1) Update dpmpv2 code (repo: ckryza/dpmpv2)
+- commit + push to main
+
+2) Build + push GHCR image (NOT docker.com)
+- `docker login ghcr.io -u ckryza` (password = GitHub token/PAT)
+- tag with git short SHA and also push :latest
+
+3) Update Umbrel store repo (repo: ckryza/ckryza-umbrel-app-store)
+- bump `ckryza-dpmpv2/docker-compose.yml` to the new GHCR SHA tag
+- ensure `DPMP_METRICS_URL=http://127.0.0.1:9210/metrics`
+
+4) Verify on clean Umbrel (BitNode3)
+- confirm store cache updated
+- uninstall/reinstall
+- confirm UI says running, and metrics are reachable inside container on 9210
