@@ -24,6 +24,13 @@ fi
 
 cd "${INSTALL_DIR}"
 
+PIN_COMMIT="44446eb"
+
+echo "Checking out pinned commit: ${PIN_COMMIT}"
+git fetch --all --tags --prune
+git checkout -f "${PIN_COMMIT}"
+
+
 echo "Checking required ports (3351/9210/8855)..."
 for port in 3351 9210 8855; do
   if ss -ltn 2>/dev/null | awk "{print \$4}" | grep -q ":${port}$"; then
