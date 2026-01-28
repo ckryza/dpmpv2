@@ -23,6 +23,10 @@ fi
 ln -sf /dev/null "${SYSTEMD_DIR}/dpmpv2-gui.service"
 systemctl --user daemon-reload
 
+# If we're in a detached HEAD (eg after pinned install), reattach to main tracking origin/main.
+git fetch --all --tags --prune
+git checkout -B main origin/main
+
 echo "Updating repo..."
 git pull --ff-only
 
