@@ -540,7 +540,7 @@ class ProxySession:
             new_en1 = str(en1)
             new_en2s = int(en2s)
             if self.last_downstream_en1 == new_en1 and self.last_downstream_en2s == new_en2s:
-                log("downstream_extranonce_skip_nochange", pool=pool_key,
+                log("downstream_extranonce_skip_nochange", sid=self.sid, pool=pool_key,
                     en1=new_en1, en2s=new_en2s,
                     last_en1=str(self.last_downstream_en1), last_en2s=int(self.last_downstream_en2s))
                 return
@@ -557,7 +557,7 @@ class ProxySession:
             self.last_downstream_en1 = new_en1
             self.last_downstream_en2s = new_en2s
             self.last_downstream_extranonce_pool = pool_key
-            log("downstream_extranonce_set", pool=pool_key, extranonce1=new_en1, extranonce2_size=new_en2s)
+            log("downstream_extranonce_set", sid=self.sid, pool=pool_key, extranonce1=new_en1, extranonce2_size=new_en2s)
 
     async def maybe_send_downstream_diff(self, pool_key: str, force: bool = False) -> bool:
         # If a pool is disabled by scheduler weights, never send its difficulty downstream.
@@ -576,9 +576,9 @@ class ProxySession:
             dd_sent = int(dd) if dd is not None else dd
             self.last_downstream_diff_by_pool[pool_key] = dd_sent
             DIFF_DOWNSTREAM.set(dd_sent)
-            log("downstream_send_diff", payload={"method":"mining.set_difficulty","params":[dd_sent]})
+            log("downstream_send_diff", sid=self.sid, pool=pool_key, payload={"method":"mining.set_difficulty","params":[dd_sent]})
             await write_line(self.miner_w, dumps_json({"method": "mining.set_difficulty", "params": [dd_sent]}), "downstream")
-            log("downstream_diff_set", pool=pool_key, diff=dd, diff_sent=dd_sent)
+            log("downstream_diff_set", sid=self.sid, pool=pool_key, diff=dd, diff_sent=dd_sent)
             return True
 
     async def resend_active_notify_clean(self, pool_key: str, reason: str):
@@ -604,6 +604,11 @@ class ProxySession:
                     nm["params"] = params
                 nm2 = sanitize_downstream_notification(nm)
                 log("downstream_send_notify", payload=nm2)
+                # Ensure diff context is re-asserted before resend clean notify (prevents low-diff bursts)
+                await self.maybe_send_downstream_extranonce(pool_key)
+                sent_diff = await self.maybe_send_downstream_diff(pool_key, force=True)
+                if sent_diff:
+                    await asyncio.sleep(0.25)
                 await write_line(self.miner_w, dumps_json(nm2), "downstream")
                 # Commit forwarded-job state for submit routing (resend path must mirror scheduler forward path)
                 self.last_forwarded_pool = pool_key
@@ -632,29 +637,46 @@ class ProxySession:
             if m:
                 log("miner_method", sid=self.sid, method=m)
             if m == "mining.configure":
-                # Forward mining.configure to the handshake pool and let its response flow back to the miner.
-                mid = msg.get("id")
-                params = msg.get("params") or []
-                log("configure_req", sid=self.sid, id=mid, params=params)
+                # Forward mining.configure to the handshake pool so its response goes back to the miner,
+                # BUT also send a copy to the other pool using an internal id so we can consume the reply
+                # without forwarding it downstream. This prevents Pool B "low difficulty share" rejects
+                # when the miner is version-rolling.
+                try:
+                    cfg_id = msg.get("id")
+                    if self.handshake_pool is None:
+                        # Choose handshake pool from config weights (avoid hard-wiring to A).
+                        try:
+                            wA = float(getattr(self.cfg.sched, "wA", 0))
+                            wB = float(getattr(self.cfg.sched, "wB", 0))
+                        except Exception:
+                            wA, wB = 1.0, 0.0
+                        if wA <= 0 and wB > 0:
+                            self.handshake_pool = "B"
+                        elif wB <= 0 and wA > 0:
+                            self.handshake_pool = "A"
+                        elif wB > wA:
+                            self.handshake_pool = "B"
+                        else:
+                            self.handshake_pool = "A"
+                    hp = self.handshake_pool
+                    other = "B" if hp == "A" else "A"
 
-                if self.handshake_pool is None:
-                    # Choose handshake pool from config weights (avoid hard-wiring to A).
-                    try:
-                        wA = float(getattr(self.cfg.sched, "wA", 0))
-                        wB = float(getattr(self.cfg.sched, "wB", 0))
-                    except Exception:
-                        wA, wB = 1.0, 0.0
-                    if wA <= 0 and wB > 0:
-                        self.handshake_pool = "B"
-                    elif wB <= 0 and wA > 0:
-                        self.handshake_pool = "A"
-                    elif wB > wA:
-                        self.handshake_pool = "B"
-                    else:
-                        self.handshake_pool = "A"
+                    # 1) forward original to handshake pool (reply goes to miner)
+                    await self.send_upstream(hp, msg)
 
-                await self.send_upstream(self.handshake_pool, msg)
+                    # 2) forward copy to other pool (reply is internal-only)
+                    # Reuse the existing internal-id suppression mechanism used for bootstrap.
+                    iid = self.next_internal_id()
+                    self._internal_ids.add(iid)
+                    msg2 = dict(msg)
+                    msg2["id"] = iid
+                    await self.send_upstream(other, msg2)
+
+                    log("configure_forwarded_both_pools", sid=self.sid, handshake=hp, other=other, id=cfg_id, internal_id=iid)
+                except Exception as e:
+                    log("configure_forward_both_error", sid=self.sid, err=str(e))
                 continue
+
             if m == "mining.subscribe":
                 self.subscribe_id = msg.get("id")
                 if self.handshake_pool is None:
@@ -845,7 +867,15 @@ class ProxySession:
                 if mid is not None:
                     d = self.last_downstream_diff_by_pool.get(pool)
                     # Submit-time snapshot for debugging diff mismatches (VarDiff / miner apply lag).
+                    pms = msg.get("params") or []
+                    u0 = pms[0] if len(pms) > 0 else None
+                    en2 = pms[2] if len(pms) > 2 else None
+                    ntime = pms[3] if len(pms) > 3 else None
+                    nonce = pms[4] if len(pms) > 4 else None
+                    vb = pms[5] if len(pms) > 5 else None
+
                     log("submit_snapshot", sid=self.sid, jid=jid, pool=pool, mid=mid,
+                        user=u0, extranonce2=en2, ntime=ntime, nonce=nonce, versionbits=vb,
                         active=(self.last_forwarded_pool or self.handshake_pool),
                         raw_subscribe_forwarded_pool=getattr(self, "raw_subscribe_forwarded_pool", None),
                         last_downstream_diff_snapshot=d, pool_latest_diff=self.latest_diff.get(pool),
@@ -876,6 +906,7 @@ class ProxySession:
                     if params:
                         # submit user should match pool wallet + miner worker
                         params[0] = f"{self.cfg.poolB.wallet}.{self.worker}" if self.cfg.poolB.wallet else str(params[0])
+                        # Keep versionbits if present (miners may be version-rolling).
                         out["params"] = params
                     await write_line(self.wB, dumps_json(out), "upstreamB")
                 else:
