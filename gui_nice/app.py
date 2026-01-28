@@ -194,11 +194,42 @@ def prom_value(text: str, metric: str, match_labels: Dict[str, str] | None = Non
 
 
 def restart_dpmpv2() -> tuple[bool, str]:
-    # In Umbrel (container), there is no systemd. Restart the container by terminating PID1.
+    # In Umbrel (container), there is no systemd. Restart DPMP by terminating dpmpv2;
+    # entrypoint.sh will re-launch it.
     if _in_container():
         try:
-            os.kill(1, signal.SIGTERM)
-            return True, "restart requested (container)"
+            import pathlib, time as _time
+
+            pids: list[int] = []
+            for p in pathlib.Path("/proc").glob("[0-9]*"):
+                try:
+                    cmd = (p / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "ignore")
+                except Exception:
+                    continue
+                if "/app/dpmp/dpmpv2.py" in cmd or "dpmpv2.py" in cmd:
+                    try:
+                        pids.append(int(p.name))
+                    except Exception:
+                        pass
+
+            if not pids:
+                return False, "container restart: dpmpv2 pid not found"
+
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except Exception:
+                    pass
+
+            _time.sleep(0.3)
+
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except Exception:
+                    pass
+
+            return True, f"restart requested (container): killed dpmpv2 pid(s) {pids}"
         except Exception as e:
             return False, f"container restart failed: {e}"
     # Bare-metal dev: systemd user service
@@ -272,16 +303,18 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                 ui.notify("DPMP restarted", type="positive")
             else:
                 ui.notify(f"restart failed: {msg}", type="negative")
-
-            btn_restart.on("click", lambda: do_restart())
+            
+        btn_restart.on_click(do_restart)
 
         ui.separator()
         lbl_status = ui.label("Status").classes("text-lg font-semibold").style('color: blue;')
 
+        
         with ui.row().classes("gap-6 items-center"):            
             lbl_dpmp = ui.html("<b>DPMP</b>: checking…", sanitize=False).classes("text-sm")
             lbl_pool = ui.html("Active pool: …", sanitize=False).classes("text-sm").tooltip("Which pool is currently active")
             lbl_miner = ui.html("<b>Miner(s) connected</b>: …", sanitize=False).classes("text-sm").tooltip("Whether any miners are currently connected downstream")
+            lbl_spin = ui.spinner('rings', size='lg', color='green')
 
         with ui.row().classes("gap-6 items-center"):
             lbl_acc = ui.html("<b>Accepted</b>: A … / B …", sanitize=False).classes("text-sm").tooltip("Total accepted shares per pool")
@@ -293,10 +326,16 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
         ui.separator()
         lbl_note = ui.html("<b>Note</b>: The <i>SumDiff</i> and <i>Diff Ratio</i> metrics above are the best indicators for measuring proxy performance...over time the <i>Diff Ratio</i> values should converge toward the configured pool ratio in Scheduler Settings.", sanitize=False).classes("text-sm")
 
+        ui.separator()
+        dark = ui.dark_mode()
+        ui.switch('Dark Mode').bind_value(dark)
+
+
         def update_home_status() -> None:
 
             # 1) dpmpv2 systemd state (bare-metal). In Docker this will be unavailable.
             active = False
+            dc = 0
             try:
                 active = systemd_is_active("dpmpv2")
             except Exception:
@@ -360,6 +399,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             # Final status display (works for both bare-metal and Docker)
             lbl_dpmp.content = f"<b>DPMP</b>: {'running' if active else 'stopped'}"
             lbl_status.style('color: green;' if active else 'color: red;')
+            lbl_spin.visible = active and dc >= 1
 
 
         update_home_status()
@@ -674,7 +714,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             #btn_jump   = ui.button("jump to end", icon="south")
             lbl_logs   = ui.label("").classes("text-xs text-gray-500")
 
-        log_box = ui.textarea(value="").props("rows=24 spellcheck=false").classes("w-full font-mono")
+        log_box = ui.textarea(value="").props("rows=24 spellcheck=false wrap=off").classes("w-full font-mono")
 
         def apply_ui_state():
             state.log_filter = inp_filter.value or ""
