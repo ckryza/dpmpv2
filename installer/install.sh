@@ -24,7 +24,7 @@ fi
 
 cd "${INSTALL_DIR}"
 
-PIN_COMMIT="44446eb"
+PIN_COMMIT="5910ad7"
 
 echo "Checking out pinned commit: ${PIN_COMMIT}"
 git fetch --all --tags --prune
