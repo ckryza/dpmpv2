@@ -31,7 +31,8 @@ echo "Updating deps..."
 .venv/bin/pip install -r requirements.txt
 
 echo "Restarting services..."
-systemctl --user start dpmpv2.service
-systemctl --user start dpmpv2-nicegui.service
+systemctl --user restart dpmpv2.service
+systemctl --user restart dpmpv2-nicegui.service
+
 
 echo "Done."
