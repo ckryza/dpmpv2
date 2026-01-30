@@ -4,11 +4,12 @@ import os
 import subprocess
 import time
 import re
+from datetime import date 
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 from urllib.request import urlopen, Request
 
-from nicegui import ui
+from nicegui import ui, app
 
 CONFIG_PATH = os.environ.get("DPMP_CONFIG_PATH", os.path.expanduser("~/dpmp/dpmp/config_v2.json"))
 METRICS_URL  = os.environ.get("DPMP_METRICS_URL", "http://127.0.0.1:9210/metrics")
@@ -18,6 +19,9 @@ GUI_LOG_PATH  = os.environ.get("GUI_LOG_PATH", os.path.expanduser("~/dpmp/dpmpv2
 HOST = os.environ.get("NICEGUI_HOST", "0.0.0.0")
 PORT = int(os.environ.get("NICEGUI_PORT", "8845"))
 POLL_S = float(os.environ.get("NICEGUI_POLL_S", "2.0"))
+
+
+#DARK_KEY = 'dpmp_dark_mode'
 
 ui.add_head_html("""
 <style>
@@ -29,8 +33,55 @@ ui.add_head_html("""
 .about-content h3 { font-size: 1.25rem; font-weight: 700; margin: 0.75rem 0 0.5rem 0; }
 .about-content h4 { font-size: 1.05rem; font-weight: 600; margin: 0.75rem 0 0.4rem 0; }
 .about-content hr { margin: 0.9rem 0; opacity: 0.35; }
+@media (max-width: 768px) {
+  .hide-on-mobile { display: none !important; }   
+
 </style>
+
+<script>
+
+(function () {
+  const KEY = 'dpmp_dark_mode';
+
+  function desiredIsDark() {
+    const v = localStorage.getItem(KEY);
+    return (v === '1' || v === 'true');
+  }
+
+  function applyThemeAndSwitch() {
+    try {
+      const isDark = desiredIsDark();
+
+      // Apply theme if Quasar is ready
+      if (window.Quasar && Quasar.Dark) {
+        Quasar.Dark.set(isDark);
+      }
+
+      // Sync switch state (NiceGUI/Quasar may re-render, so keep forcing it)
+      const input = document.querySelector('#dpmp_dark_switch input[type="checkbox"]');
+      if (input && input.checked !== isDark) {
+        input.checked = isDark;
+      }
+
+      // "ready" when Quasar exists AND switch input exists
+      return !!(window.Quasar && Quasar.Dark) && !!input;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Try repeatedly for a short time to survive late Quasar init + component re-renders
+  let tries = 0;
+  const timer = setInterval(() => {
+    tries++;
+    const ok = applyThemeAndSwitch();
+    if (ok || tries >= 50) clearInterval(timer); // ~5s
+  }, 100);
+})();
+</script>
 """)
+
+
 
 
 def now_utc() -> str:
@@ -269,9 +320,18 @@ def load_state() -> AppState:
 
 state = load_state()
 
+today = date.today()
 
-ui.label(f"Dual Pool Mining Proxy (DPMP)").classes("text-xl font-bold").style('color: #6E93D6')
-#ui.label("Tabs: Home, Config, Logs, About").classes("text-sm text-gray-500")
+# we are storing the icon in static/ to avoid issues with relative paths
+app.add_static_files('/static', 'gui_nice/static')
+
+# hide certain elements on small screens
+with ui.row().classes("gap-4 items-center h-10 w-full"):      
+    ui.image("/static/icond.png").classes("hide-on-mobile w-12 h-12 mb-0").style('fit: fill') # - hide this on small screens
+    ui.label(f"Dual Pool Mining Proxy (DPMP)").classes("text-xl font-bold").style('color: #6E93D6')
+    ui.space().classes("hide-on-mobile") # hide this on small screens
+    ui.label(f"{today.strftime('%Y-%m-%d')}").classes("hide-on-mobile text-xs ").style('color: #6E93D6') # hide this on small screens
+ui.separator().classes("hide-on-mobile") # hide this on small screens
 
 with ui.tabs().classes("w-full") as tabs:
     t_home = ui.tab("Home")
@@ -282,7 +342,8 @@ with ui.tabs().classes("w-full") as tabs:
 with ui.tab_panels(tabs, value=t_home).classes("w-full"):
 
     
-    with ui.tab_panel(t_home):
+    with ui.tab_panel(t_home):   
+            
         ui.label("System Paths:").classes("text-lg font-semibold")
         ui.markdown(
             f"""
@@ -292,9 +353,11 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
 **GUI log:** `{GUI_LOG_PATH}`  
 """
         )
+        
         with ui.row().classes("items-center gap-2"):
             btn_restart = ui.button("Restart DPMP", icon="restart_alt")
             lbl_restart = ui.label("").classes("text-sm")
+            
 
         def do_restart():
             ok, msg = restart_dpmpv2()
@@ -322,13 +385,52 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             lbl_jobs = ui.html("<b>Jobs</b>: A … / B …", sanitize=False).classes("text-sm").tooltip("Total jobs forwarded per pool")
             lbl_dif = ui.html("<b>SumDiff</b>: A … / B …", sanitize=False).classes("text-sm").tooltip("Sum of difficulty of accepted shares per pool")
             lbl_rat = ui.html("<b>Diff Ratio</b>: A …% / B …%", sanitize=False).classes("text-sm").tooltip("Percentage of accepted difficulty per pool")
+            
 
         ui.separator()
-        lbl_note = ui.html("<b>Note</b>: The <i>SumDiff</i> and <i>Diff Ratio</i> metrics above are the best indicators for measuring proxy performance...over time the <i>Diff Ratio</i> values should converge toward the configured pool ratio in Scheduler Settings.", sanitize=False).classes("text-sm")
+        lbl_note = ui.html("<b>Note</b>: The <i>SumDiff</i> and <i>Diff Ratio</i> metrics above are the best indicators for measuring proxy performance...over time the <i>Diff Ratio</i> values should converge toward the configured pool ratio in Scheduler Settings. See the <b>About</b> tab for more details as well as setup instructions.", sanitize=False).classes("text-sm")
 
         ui.separator()
+
+        DARK_KEY = 'dpmp_dark_mode'
+
         dark = ui.dark_mode()
-        ui.switch('Dark Mode').bind_value(dark)
+        sw_dark = ui.switch('Dark Mode').props('id=dpmp_dark_switch')
+
+        def _to_bool(v) -> bool:
+            if isinstance(v, bool):
+                return v
+            if v is None:
+                return False
+            s = str(v).strip().lower()
+            return s in ('1', 'true', 'yes', 'y', 'on')
+
+        # persist + apply immediately
+        def _persist_dark(v: bool) -> None:
+            v = bool(v)
+            dark.value = v
+            ui.run_javascript(
+                "try { localStorage.setItem(%r, %r); } catch(e) {}" % (DARK_KEY, '1' if v else '0')
+            )
+
+        sw_dark.on_value_change(lambda e: _persist_dark(_to_bool(e.value)))
+
+        # AFTER connect: load localStorage and set BOTH theme + switch value server-side
+        async def _init_dark_from_storage() -> None:
+            js = """
+        (() => {
+        try {
+            const v = localStorage.getItem('dpmp_dark_mode');
+            return (v === '1' || v === 'true') ? 1 : 0;
+        } catch (e) { return 0; }
+        })()
+        """
+            v = await ui.run_javascript(js)  # v will be 0/1
+            is_dark = bool(int(v))
+            dark.value = is_dark
+            sw_dark.value = is_dark
+
+        ui.timer(0.0, _init_dark_from_storage, once=True)
 
 
         def update_home_status() -> None:
@@ -418,6 +520,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             "downstream_extranonce_set",
             "downstream_diff_set",
             "job_forwarded",
+            "miner_method",
             "pool_notify",
             "notify_clean_forced",
         ]
@@ -488,7 +591,8 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                 cols = 3
                 rows = (len(ALL_EVENTS) + cols - 1) // cols
 
-                with ui.grid(columns=3).classes("w-full gap-6"):
+                # on desktop show 3 columns; on mobile, stack into 1 column
+                with ui.element('div').classes('grid grid-cols-1 sm:grid-cols-3 w-full gap-4 sm:gap-6'):
                     for c in range(cols):
                         with ui.column().classes("min-w-0"):
                             for r in range(rows):
@@ -496,8 +600,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                                 if idx >= len(ALL_EVENTS):
                                     break
                                 ev = ALL_EVENTS[idx]
-                                logging_event_cbs[ev] = ui.checkbox(ev, value=True).classes("text-sm")
-
+                                logging_event_cbs[ev] = ui.checkbox(ev, value=True).classes("text-xs sm:text-sm")
 
                 def _set_all_events(val: bool):
                     for cb in logging_event_cbs.values():
@@ -715,6 +818,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             lbl_logs   = ui.label("").classes("text-xs text-gray-500")
 
         log_box = ui.textarea(value="").props("rows=24 spellcheck=false wrap=off").classes("w-full font-mono")
+
 
         def apply_ui_state():
             state.log_filter = inp_filter.value or ""
