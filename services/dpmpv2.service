@@ -1,16 +1,16 @@
 [Unit]
-Description=DPMP v2 (non-docker)
+Description=DPMP v2 (non-docker runtime)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-WorkingDirectory=%h/dpmp
-Environment=DPMP_CONFIG=%h/dpmp/dpmp/config_v2.json
-ExecStart=%h/dpmp/.venv/bin/python -u %h/dpmp/dpmp/dpmpv2.py
+WorkingDirectory=%h/dpmp_runtime
+Environment=DPMP_CONFIG=%h/dpmp_runtime/dpmp/config_v2.json
+ExecStart=%h/dpmp_runtime/.venv/bin/python -u %h/dpmp_runtime/dpmp/dpmpv2.py
 Restart=always
 RestartSec=2
-StandardOutput=append:%h/dpmp/dpmpv2_run.log
-StandardError=append:%h/dpmp/dpmpv2_run.log
+StandardOutput=append:%h/dpmp_runtime/dpmpv2_run.log
+StandardError=append:%h/dpmp_runtime/dpmpv2_run.log
 
 [Install]
 WantedBy=default.target
