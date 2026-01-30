@@ -2,11 +2,18 @@
 set -euo pipefail
 
 REPO_URL="https://github.com/ckryza/dpmpv2.git"
-INSTALL_DIR="${HOME}/dpmp"
+
+# Dev checkout (optional, but we keep it for upgrades / troubleshooting)
+DEV_DIR="${HOME}/dpmp"
+
+# Runtime install (minimal, clean)
+RUNTIME_DIR="${HOME}/dpmp_runtime"
+
 SYSTEMD_DIR="${HOME}/.config/systemd/user"
 
 echo "DPMP v2 installer (non-docker)"
-echo "Install dir: ${INSTALL_DIR}"
+echo "Dev dir:     ${DEV_DIR}"
+echo "Runtime dir: ${RUNTIME_DIR}"
 
 if [ "$(id -u)" -eq 0 ]; then
   echo "ERROR: do not run as root" >&2
@@ -15,21 +22,20 @@ fi
 
 mkdir -p "${SYSTEMD_DIR}"
 
-if [ ! -d "${INSTALL_DIR}/.git" ]; then
-  echo "Cloning repo..."
-  git clone "${REPO_URL}" "${INSTALL_DIR}"
+if [ ! -d "${DEV_DIR}/.git" ]; then
+  echo "Cloning repo into dev dir..."
+  git clone "${REPO_URL}" "${DEV_DIR}"
 else
-  echo "Repo already present, skipping clone."
+  echo "Dev repo already present, skipping clone."
 fi
 
-cd "${INSTALL_DIR}"
+cd "${DEV_DIR}"
 
 PIN_COMMIT="5910ad7"
 
 echo "Checking out pinned commit: ${PIN_COMMIT}"
 git fetch --all --tags --prune
 git checkout -f "${PIN_COMMIT}"
-
 
 echo "Checking required ports (3351/9210/8855)..."
 for port in 3351 9210 8855; do
@@ -40,25 +46,30 @@ for port in 3351 9210 8855; do
   fi
 done
 
-CONFIG_DST="${INSTALL_DIR}/dpmp/config_v2.json"
-CONFIG_SRC="${INSTALL_DIR}/dpmp/config_v2_example.json"
-if [ ! -f "${CONFIG_DST}" ]; then
-  echo "Creating default config at ${CONFIG_DST} (edit Pool A/B in GUI)..."
-  cp -a "${CONFIG_SRC}" "${CONFIG_DST}"
-fi
+echo "Creating clean runtime dir..."
+rm -rf "${RUNTIME_DIR}"
+mkdir -p "${RUNTIME_DIR}/dpmp" "${RUNTIME_DIR}/gui_nice"
 
-echo "Creating venv (if missing)..."
-if [ ! -d ".venv" ]; then
-  python3 -m venv .venv
-fi
+cp -a "${DEV_DIR}/requirements.txt" "${RUNTIME_DIR}/"
+cp -a "${DEV_DIR}/dpmp/dpmpv2.py" "${RUNTIME_DIR}/dpmp/"
+cp -a "${DEV_DIR}/dpmp/config_v2_example.json" "${RUNTIME_DIR}/dpmp/"
+cp -a "${DEV_DIR}/gui_nice" "${RUNTIME_DIR}/"
+
+CONFIG_DST="${RUNTIME_DIR}/dpmp/config_v2.json"
+CONFIG_SRC="${RUNTIME_DIR}/dpmp/config_v2_example.json"
+echo "Creating default runtime config at ${CONFIG_DST} (edit Pool A/B in GUI)..."
+cp -a "${CONFIG_SRC}" "${CONFIG_DST}"
+
+echo "Creating venv in runtime dir..."
+python3 -m venv "${RUNTIME_DIR}/.venv"
 
 echo "Installing python deps..."
-.venv/bin/pip install -U pip
-.venv/bin/pip install -r requirements.txt
+"${RUNTIME_DIR}/.venv/bin/pip" install -U pip
+"${RUNTIME_DIR}/.venv/bin/pip" install -r "${RUNTIME_DIR}/requirements.txt"
 
 echo "Installing systemd user services..."
-cp -a services/dpmpv2.service "${SYSTEMD_DIR}/dpmpv2.service"
-cp -a services/dpmpv2-nicegui.service "${SYSTEMD_DIR}/dpmpv2-nicegui.service"
+cp -a "${DEV_DIR}/services/dpmpv2.service" "${SYSTEMD_DIR}/dpmpv2.service"
+cp -a "${DEV_DIR}/services/dpmpv2-nicegui.service" "${SYSTEMD_DIR}/dpmpv2-nicegui.service"
 systemctl --user daemon-reload
 
 # Hard-disable legacy FastAPI GUI so it can never auto-start again
