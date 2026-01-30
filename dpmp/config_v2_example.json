@@ -13,12 +13,13 @@
     "deny": [
       "submit_route",
       "share_result",
-      "id_response_seen",
+      "id_response_seen",      
       "downstream_extranonce_skip_raw_subscribe",
       "downstream_extranonce_skip_nochange",
       "downstream_extranonce_set",
       "downstream_diff_set",
       "job_forwarded",
+      "miner_method",
       "pool_notify",
       "notify_clean_forced"
     ],
