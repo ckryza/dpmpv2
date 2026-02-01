@@ -31,7 +31,7 @@ fi
 
 cd "${DEV_DIR}"
 
-PIN_COMMIT="2d6fc58"
+PIN_COMMIT="aff8d5c"
 
 echo "Checking out pinned commit: ${PIN_COMMIT}"
 git fetch --all --tags --prune
