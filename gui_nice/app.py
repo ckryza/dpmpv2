@@ -1,3 +1,9 @@
+"""
+DPMP - Dual-Pool Mining Proxy (Stratum v1) GUI Dashboard
+Copyright (c) 2025-2026 Christopher Kryza. Subject to the MIT License.
+Developed with NiceGUI (https://nicegui.io)
+"""
+
 import asyncio
 import json
 import os
@@ -81,18 +87,18 @@ ui.add_head_html("""
 </script>
 """)
 
-
-
-
+# timestamp in UTC format
 def now_utc() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime())
 
 import subprocess
 import signal
 
+# return True if running in a container (e.g., Docker)
 def _in_container() -> bool:
     return os.path.exists("/.dockerenv") or (os.environ.get("container") is not None)
 
+# return True if systemd unit is active
 def systemd_is_active(unit: str) -> bool:
     # returns True if systemd reports "active" (bare-metal).
     if _in_container():
@@ -108,6 +114,7 @@ def systemd_is_active(unit: str) -> bool:
     except Exception:
         return False
 
+# extract single gauge value from raw Prometheus text format
 def _prom_gauge_value(text: str, name: str, pool: str | None = None) -> float | None:
     if pool is None:
         # e.g. dpmp_downstream_connections 1.0
@@ -126,6 +133,7 @@ def _prom_gauge_value(text: str, name: str, pool: str | None = None) -> float | 
     except Exception:
         return None
 
+# extract first matching float value from parsed Prometheus metrics dict
 def prom_first_float(metrics: dict, name: str, labels: dict | None = None) -> float | None:
     """
     Expect your metrics parser to return something like:
@@ -147,8 +155,7 @@ def prom_first_float(metrics: dict, name: str, labels: dict | None = None) -> fl
     except Exception:
         return None
 
-
-
+# read text file with max size limit
 def read_text_file(path: str, max_bytes: int = 200_000) -> str:
     try:
         with open(path, "rb") as f:
@@ -161,12 +168,12 @@ def read_text_file(path: str, max_bytes: int = 200_000) -> str:
     except Exception as e:
         return f"[error reading {path}] {e}"
 
-
+# read JSON file
 def read_json(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-
+# write JSON file atomically
 def write_json_atomic(path: str, obj: Dict[str, Any]) -> None:
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -174,7 +181,7 @@ def write_json_atomic(path: str, obj: Dict[str, Any]) -> None:
         f.write("\n")
     os.replace(tmp, path)
 
-
+# HTTP GET with timeout
 def http_get_text(url: str, timeout_s: float = 3.0) -> str:
     req = Request(url, headers={"User-Agent": "dpmpv2-nicegui"})
     try:
@@ -184,8 +191,7 @@ def http_get_text(url: str, timeout_s: float = 3.0) -> str:
         # dpmpv2 restarts will temporarily drop the metrics listener (Errno 111)
         return ""
 
-
-
+# parse a single line of Prometheus text format
 def parse_prom_line(line: str) -> Optional[tuple[str, Dict[str, str], float]]:
     line = line.strip()
     if not line or line.startswith("#"):
@@ -224,7 +230,7 @@ def parse_prom_line(line: str) -> Optional[tuple[str, Dict[str, str], float]]:
         return name, labels, v
     return left, {}, v
 
-
+# extract first matching Prometheus metric value from raw text
 def prom_value(text: str, metric: str, match_labels: Dict[str, str] | None = None) -> Optional[float]:
     match_labels = match_labels or {}
     for line in text.splitlines():
@@ -243,7 +249,7 @@ def prom_value(text: str, metric: str, match_labels: Dict[str, str] | None = Non
             return v
     return None
 
-
+# restart dpmpv2 process
 def restart_dpmpv2() -> tuple[bool, str]:
     # In Umbrel (container), there is no systemd. Restart DPMP by terminating dpmpv2;
     # entrypoint.sh will re-launch it.
@@ -307,7 +313,7 @@ class AppState:
     log_filter: str = ""
     last_log_len: int = 0
 
-
+# load initial state
 def load_state() -> AppState:
     try:
         obj = read_json(CONFIG_PATH)
@@ -333,6 +339,7 @@ with ui.row().classes("gap-4 items-center h-10 w-full"):
     ui.label(f"{today.strftime('%Y-%m-%d')}").classes("hide-on-mobile text-xs ").style('color: #6E93D6') # hide this on small screens
 ui.separator().classes("hide-on-mobile") # hide this on small screens
 
+# Tabs definition
 with ui.tabs().classes("w-full") as tabs:
     t_home = ui.tab("Home")
     t_cfg  = ui.tab("Config") 
@@ -340,7 +347,6 @@ with ui.tabs().classes("w-full") as tabs:
     t_about = ui.tab("About")
 
 with ui.tab_panels(tabs, value=t_home).classes("w-full"):
-
     
     with ui.tab_panel(t_home):   
             
@@ -432,7 +438,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
 
         ui.timer(0.0, _init_dark_from_storage, once=True)
 
-
+        # periodic status update
         def update_home_status() -> None:
 
             # 1) dpmpv2 systemd state (bare-metal). In Docker this will be unavailable.
@@ -483,8 +489,11 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                 pctA = 100*difA/(total_dif or 1)
                 pctB = 100*difB/(total_dif or 1)
 
+                rejpA = 100*rejA/accA if accA > 0 else 0.0
+                rejpB = 100*rejB/accB if accB > 0 else 0.0
+
                 lbl_acc.content = f"<b>Accepted</b>: A {int(accA)} / B {int(accB)}"
-                lbl_rej.content = f"<b>Rejected</b>: A {int(rejA)} / B {int(rejB)}"
+                lbl_rej.content = f"<b>Rejected</b>: A {int(rejA)} / B {int(rejB)} ({rejpA:.2f}% / {rejpB:.2f}%)"
                 lbl_jobs.content = f"<b>Jobs</b>: A {int(jobA)} / B {int(jobB)}"
                 lbl_dif.content = f"<b>SumDiff</b>: A {int(difA)} / B {int(difB)}"
                 lbl_rat.content = f"<b>Diff Ratio</b>: A {pctA:.2f}% / B {pctB:.2f}%"
@@ -503,7 +512,6 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             lbl_status.style('color: green;' if active else 'color: red;')
             lbl_spin.visible = active and dc >= 1
 
-
         update_home_status()
         ui.timer(2.0, update_home_status)
             
@@ -512,53 +520,83 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
 
         # list of events that we generally do NOT want to log (default deny list)
         DEFAULT_DENY = [
-            "submit_route",
-            "share_result",
+            "authorize_rewrite","authorize_rewrite_other","authorize_rewrite_secondary",
+            "bootstrap_reconnect_forced","bootstrap_skipped_handshake_pool",
+            "downstream_extranonce_check","downstream_extranonce_skip_no_data",
+            "downstream_extranonce_skip_nochange","downstream_extranonce_skip_raw_subscribe",
+            "downstream_extranonce_set","downstream_diff_set",
+            "downstream_notify_flushed_after_subscribe",
+            "downstream_send_diff","downstream_send_extranonce","downstream_send_notify",
+            "downstream_send_raw","downstream_subscribe_forwarded_raw","downstream_tx",
+            "handshake_response_dropped",
             "id_response_seen",
-            "downstream_extranonce_skip_raw_subscribe",
-            "downstream_extranonce_skip_nochange",
-            "downstream_extranonce_set",
-            "downstream_diff_set",
-            "job_forwarded",
+            "job_forwarded","job_forwarded_diff_state",
             "miner_method",
-            "pool_notify",
             "notify_clean_forced",
+            "pool_notify",
+            "post_auth_downstream_sync","post_auth_push_diff","post_auth_push_extranonce",
+            "post_auth_push_notify_clean",
+            "prune_internal_ids","prune_job_owner","prune_seen_upstream_ids","prune_submit_owner",
+            "scheduler_tick",
+            "send_upstream_flush_done","send_upstream_flush_start","send_upstream_queued",
+            "share_result",
+            "submit_local_sanity","submit_route","submit_snapshot",
+            "subscribe_id_response_skipped_duplicate","subscribe_result",
+            "upstream_response_dup_observed","upstream_tx",
         ]
 
         # --- all log events (canonical list; keep in sync with dpmpv2.py log("...") calls) ---
         ALL_EVENTS = [
             "auth_result","authorize_rewrite","authorize_rewrite_other","authorize_rewrite_other_error",
-            "authorize_rewrite_secondary","authorize_secondary_send_error","config_loaded","configure_req",
-            "downstream_diff_set","downstream_extranonce_send_error","downstream_extranonce_set",
+            "authorize_rewrite_secondary","authorize_secondary_send_error","authorize_skip_zero_weight_pool",
+            "bootstrap_reconnect_forced","bootstrap_skipped_handshake_pool",
+            "clear_pool_state_reset_last_downstream_extranonce","clear_pool_state_reset_raw_subscribe_flag",
+            "config_loaded","config_safety_min_switch_clamped","config_safety_slice_clamped",
+            "configure_forward_both_error","configure_forwarded_both_pools","configure_skip_zero_weight_pool",
+            "downstream_diff_set","downstream_extranonce_check","downstream_extranonce_send_error",
+            "downstream_extranonce_set","downstream_extranonce_skip_no_data",
             "downstream_extranonce_skip_nochange","downstream_extranonce_skip_raw_subscribe",
-            "downstream_extranonce_suppressed_nonactive","downstream_notify_flushed_after_subscribe",
-            "downstream_send_diff","downstream_send_extranonce","downstream_send_extranonce_error",
-            "downstream_send_notify","downstream_send_raw","downstream_subscribe_forwarded_raw",
-            "downstream_tx","handshake_response_dropped","id_response_seen","job_forwarded",
-            "job_forwarded_diff_state","metrics_start_failed","metrics_started","miner_bad_json",
-            "miner_connected","miner_disconnected","miner_method","miner_ready_for_jobs",
-            "miner_rejected_extra_session","notify_clean_force_error","notify_clean_forced",
+            "downstream_notify_flushed_after_subscribe","downstream_send_diff","downstream_send_extranonce",
+            "downstream_send_extranonce_error","downstream_send_notify","downstream_send_raw",
+            "downstream_subscribe_forwarded_raw","downstream_tx",
+            "dpmp_listening",
+            "failover_emergency_switch","failover_weight_override","fatal_crash",
+            "handshake_response_dropped",
+            "id_response_seen",
+            "job_forwarded","job_forwarded_diff_state",
+            "metrics_start_failed","metrics_started","miner_bad_json","miner_connected",
+            "miner_disconnected","miner_method","miner_ready_for_jobs",
+            "miner_reconnect_request_failed","miner_reconnect_requested",
+            "notify_clean_force_error","notify_clean_forced",
             "pool_bootstrap_auth_result","pool_bootstrap_authorize_sent","pool_bootstrap_error",
             "pool_bootstrap_subscribe_parse_error","pool_bootstrap_subscribe_result",
-            "pool_bootstrap_subscribe_sent","pool_connected","pool_connecting","pool_diff","pool_notify",
-            "pool_switched","post_auth_downstream_sync","post_auth_downstream_sync_error",
-            "post_auth_push_diff","post_auth_push_extranonce","post_auth_push_notify_clean",
-            "post_auth_push_notify_clean_error","post_auth_push_setup_error","resend_notify_clean",
-            "resend_notify_error","resend_notify_raw","resend_notify_skipped_no_cached",
-            "send_upstream_flush_done","send_upstream_flush_start","send_upstream_queued","session_error",
-            "share_result","shutdown_begin","shutdown_cancel_tasks","shutdown_done",
+            "pool_bootstrap_subscribe_sent","pool_connected","pool_connecting","pool_diff","pool_down",
+            "pool_initial_connect_failed","pool_notify","pool_reader_error","pool_reconnect_failed",
+            "pool_reconnect_wait","pool_reconnected","pool_skipped_zero_weight","pool_state_cleared",
+            "pool_switched",
+            "post_auth_downstream_sync","post_auth_downstream_sync_error","post_auth_push_diff",
+            "post_auth_push_extranonce","post_auth_push_notify_clean","post_auth_push_notify_clean_error",
+            "post_auth_push_setup_error","process_exiting",
+            "prune_internal_ids","prune_job_owner","prune_seen_upstream_ids","prune_submit_owner",
+            "resend_notify_clean","resend_notify_error","resend_notify_raw",
+            "resend_notify_skipped_no_cached",
+            "scheduler_config_validated","scheduler_tick",
+            "send_upstream_flush_done","send_upstream_flush_start","send_upstream_queued",
+            "session_error","share_result",
+            "shutdown_begin","shutdown_cancel_tasks","shutdown_done","shutdown_keyboard_interrupt",
             "shutdown_serve_task_cancel_begin","shutdown_serve_task_cancel_done",
             "shutdown_serve_task_cancel_timeout","shutdown_serve_task_error",
             "shutdown_server_close_begin","shutdown_server_close_done","shutdown_server_close_error",
-            "shutdown_server_close_timeout","shutdown_signal","shutdown_timeout","submit_dedupe_error",
-            "submit_dropped_duplicate_fp","submit_dropped_extranonce_mismatch","submit_dropped_no_job_yet",
-            "submit_dropped_unknown_jid","submit_extranonce_mismatch_grace_forward","submit_local_sanity",
-            "submit_local_sanity_error","submit_route","submit_snapshot",
+            "shutdown_server_close_timeout","shutdown_signal","shutdown_timeout",
+            "submit_dedupe_error","submit_dropped_duplicate_fp","submit_dropped_extranonce_mismatch",
+            "submit_dropped_no_job_yet","submit_dropped_pool_dead","submit_dropped_unknown_jid",
+            "submit_extranonce_mismatch_grace_forward","submit_local_sanity","submit_local_sanity_error",
+            "submit_route","submit_snapshot",
             "subscribe_id_response_skipped_duplicate","subscribe_parse_error","subscribe_result",
-            "switch_skipped_no_cached_job","upstream_response_dup_observed","upstream_tx",
+            "switch_skipped_no_cached_job",
+            "upstream_response_dup_observed","upstream_tx",
             "weights_normalized","write_failed",
         ]
-
 
         # --- controls (created first; populated by reload_cfg) ---
 
@@ -575,7 +613,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
 
         # Logging (checkbox per event; deny[] only; allow[] left empty)
         with ui.expansion("Logging Settings:", icon="settings").classes("w-full"):
-            ui.label("Check the events that you want to log. Certain events (such as share_result, id_reponse_seen, job_forwarded, etc.) can generate a lot of log output. When in doubt, just click on the Reset to Defaults button to uncheck all noisy events.").classes("text-sm")
+            ui.label("Check the events that you want to log. Certain events, while useful for debugging purposes, can generate a lot of log output very quickly. When in doubt, just click on the Reset to Defaults button to return to standard 'maintenance-mode' logging.").classes("text-sm")
             ui.label("Warning: Logging all events can create a very large log file quickly.").classes("text-sm text-red-600")
 
             logging_event_cbs = {}  # event -> checkbox
@@ -639,7 +677,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
         # Scheduler
         with ui.expansion("Scheduler Settings:", icon="settings").classes("w-full").tooltip("Settings for the dual-pool scheduler"):
             sch_min_switch = ui.number("Min Switch Seconds", precision=0).props("step=1 min=0").classes("w-64").tooltip("Minimum time before switching pools. Recommend between 30 seconds and 60 seconds.")
-            sch_slice      = ui.number("Slice Seconds",      precision=0).props("step=1 min=0").classes("w-64").tooltip("Duration of each mining slice before switching.")
+            sch_slice      = ui.number("Slice Seconds",      precision=0).props("step=1 min=0").classes("w-64").tooltip("Duration of each mining slice before switching. Recommend you use ~60% of Min Switch Seconds.")
             sch_weightA    = ui.number("Pool A Weight",      precision=0).props("step=1 min=0").classes("w-64").tooltip("Weighting for Pool A in the scheduler.")
             sch_weightB    = ui.number("Pool B Weight",      precision=0).props("step=1 min=0").classes("w-64").tooltip("Weighting for Pool B in the scheduler.")
 

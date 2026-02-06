@@ -13,6 +13,7 @@
     "deny": [
       "submit_route",
       "share_result",
+      "scheduler_tick",
       "id_response_seen",      
       "downstream_extranonce_skip_raw_subscribe",
       "downstream_extranonce_skip_nochange",
@@ -46,7 +47,7 @@
     }
   },
   "scheduler": {
-    "min_switch_seconds": 30,
+    "min_switch_seconds": 50,
     "mode": "ratio",
     "poolA_weight": 50,
     "poolB_weight": 50,

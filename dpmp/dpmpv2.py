@@ -2,6 +2,13 @@
 """
 DPMP - Dual-Pool Mining Proxy (Stratum v1)
 Dual upstream + weighted scheduling, with correct miner handshake forwarding.
+Copyright (c) 2025-2026 Christopher Kryza. Subject to the MIT License.
+
+Max Miners
+- For high-end Umbrel box setup, ~50 miners per DPMP instance is reasonable.
+- For low-end Raspberry Pi setup, ~10 miners per DPMP instance is reasonable.
+- Upstream pool connection limits may apply (e.g., 20 connections max).
+- Docker container resources may limit max miners per instance.
 
 Key fix:
 - Forward ALL upstream responses (messages with "id") to the miner (subscribe/auth/submit responses).
@@ -47,9 +54,11 @@ JOBS_FORWARDED = Counter("dpmp_jobs_forwarded_total", "Jobs forwarded to miner",
 ACCEPTED_DIFFICULTY_SUM = Counter("dpmp_accepted_difficulty_sum", "Sum of difficulty for accepted shares", ["pool"])
 DIFF_DOWNSTREAM = Gauge("dpmp_downstream_difficulty", "Current downstream difficulty")
 ACTIVE_POOL = Gauge("dpmp_active_pool", "Active pool (1=active,0=inactive)", ["pool"])
-SWITCH_SUBMIT_GRACE_S = 0.75  # seconds to tolerate stale submits right after a pool switch
+SWITCH_SUBMIT_GRACE_S = 2.0  # seconds to tolerate stale submits right after a pool switch (was 0.75)
 MAX_CACHED_NOTIFY_AGE_S = 20.0  # don't switch into pool if cached notify older than this
+MAX_CONVERGE_DEVIATION = 0.02 # default max deviation (2%) to trigger urgent pool switch 
 
+# Get current UTC time as ISO 8601 string
 def now_utc() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
@@ -57,15 +66,16 @@ LOG_LEVEL = os.environ.get("DPMP_LOG_LEVEL", "info").strip().lower()
 LOG_ALLOW = set(x.strip() for x in os.environ.get("DPMP_LOG_ALLOW", "").split(",") if x.strip())
 LOG_DENY  = set(x.strip() for x in os.environ.get("DPMP_LOG_DENY", "").split(",") if x.strip())
 
+# Events considered "debug" level, also high-output events
 _DEBUG_EVENTS = {
     "downstream_tx", "upstream_tx", "miner_method",
     "submit_snapshot", "submit_local_sanity",
     "job_forwarded_diff_state",
     "downstream_send_notify", "downstream_send_raw",
-    "downstream_send_diff",
+    "downstream_send_diff", "scheduler_tick",
 }
 
-
+# Structured logging function
 def log(event: str, **fields: Any) -> None:
     # Allowlist/denylist first (highest priority)
     if LOG_ALLOW and event not in LOG_ALLOW:
@@ -83,11 +93,13 @@ def log(event: str, **fields: Any) -> None:
     rec = {"ts": now_utc(), "event": event, **fields}
     print(json.dumps(rec, separators=(",", ":"), ensure_ascii=False), flush=True)
 
+# JSON load/dump helpers with orjson if available
 def loads_json(b: bytes) -> Dict[str, Any]:
     if orjson is not None:
         return orjson.loads(b)
     return json.loads(b.decode("utf-8", errors="replace"))
 
+# JSON dump helper with orjson if available
 def dumps_json(obj: Dict[str, Any]) -> bytes:
     # Ensure Stratum responses include "error": null when "id" is non-null.
     # Some miners disconnect if "error" is missing from {"id":..., "result":...} responses.
@@ -98,6 +110,7 @@ def dumps_json(obj: Dict[str, Any]) -> bytes:
         return orjson.dumps(obj) + b"\n"
     return (json.dumps(obj, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
 
+# Sanitize downstream notification (remove JSON-RPC 2.0 fields)
 def sanitize_downstream_notification(msg: Dict[str, Any]) -> Dict[str, Any]:
     """
     Stratum v1 pool->miner notifications should NOT include JSON-RPC 2.0 fields.
@@ -112,6 +125,7 @@ def sanitize_downstream_notification(msg: Dict[str, Any]) -> Dict[str, Any]:
     m.pop("id", None)
     return m
 
+# Extract worker name from miner 'user' string
 def extract_worker_name(user: str) -> str:
     """
     Accepts miner 'user' strings like:
@@ -158,6 +172,7 @@ class AppCfg:
     sched: SchedulerCfg
     downstream_diff: dict
 
+# Load configuration from JSON file
 def load_config(path: str) -> AppCfg:
     global LOG_LEVEL, LOG_ALLOW, LOG_DENY
     with open(path, "rb") as f:
@@ -228,6 +243,35 @@ def load_config(path: str) -> AppCfg:
     if wA < 0 or wB < 0 or (wA == 0 and wB == 0):
         wA, wB = 50, 50
 
+    # --- Scheduler timing validation ---
+    # Parse raw values from config (defaults: 30s each)
+    raw_min_switch = int(sched.get("min_switch_seconds", 30))
+    raw_slice = int(sched.get("slice_seconds", 30))
+
+    # Safety 1: min_switch_seconds must be at least 25 seconds.
+    # Switching pools faster than this risks reject storms from context mismatches.
+    MIN_SWITCH_FLOOR = 25
+    if raw_min_switch < MIN_SWITCH_FLOOR:
+        log("config_safety_min_switch_clamped",
+            raw=raw_min_switch, corrected=MIN_SWITCH_FLOOR,
+            reason=f"min_switch_seconds must be >= {MIN_SWITCH_FLOOR}s to avoid reject storms")
+        raw_min_switch = MIN_SWITCH_FLOOR
+
+    # Safety 2: slice_seconds must be less than min_switch_seconds.
+    # If slice >= min_switch, the urgent-correction feature is effectively disabled
+    # and the safety floor adds no value. Clamp slice to min_switch - 5 (at least 1).
+    if raw_slice >= raw_min_switch:
+        corrected_slice = max(1, raw_min_switch - 5)
+        log("config_safety_slice_clamped",
+            raw_slice=raw_slice, raw_min_switch=raw_min_switch,
+            corrected=corrected_slice,
+            reason="slice_seconds must be < min_switch_seconds")
+        raw_slice = corrected_slice
+
+    log("scheduler_config_validated",
+        min_switch_seconds=raw_min_switch, slice_seconds=raw_slice,
+        wA=wA, wB=wB)
+
     return AppCfg(
         listen_host=str(listen_host),
         listen_port=int(listen_port),
@@ -236,10 +280,11 @@ def load_config(path: str) -> AppCfg:
         metrics_port=int(metrics_port),
         poolA=pool("A"),
         poolB=pool("B"),
-        sched=SchedulerCfg(wA=wA, wB=wB, min_switch_seconds=int(sched.get("min_switch_seconds", 15)), slice_seconds=int(sched.get("slice_seconds", 15))),
+        sched=SchedulerCfg(wA=wA, wB=wB, min_switch_seconds=raw_min_switch, slice_seconds=raw_slice),
         downstream_diff=dict(cfg.get("downstream_diff", {})),
     )
 
+# Async read/write helpers with Prometheus metrics
 async def iter_lines(reader: asyncio.StreamReader, side: str):
     while True:
         line = await reader.readline()
@@ -250,6 +295,7 @@ async def iter_lines(reader: asyncio.StreamReader, side: str):
         MSG_RX.labels(side=side).inc()
         yield line
 
+# 
 async def write_line(writer: asyncio.StreamWriter, data: bytes, side: str):
     try:
         # Downstream miners expect Stratum v1 notifications WITHOUT JSON-RPC 2.0 fields.
@@ -288,6 +334,8 @@ async def write_line(writer: asyncio.StreamWriter, data: bytes, side: str):
         peer = writer.get_extra_info("peername")
         log("write_failed", peer=str(peer), side=side, err=str(e))
         raise
+
+# Extract jobid from mining.notify params
 def jobid_from_notify(msg: Dict[str, Any]) -> Optional[str]:
     try:
         p = msg.get("params") or []
@@ -295,6 +343,7 @@ def jobid_from_notify(msg: Dict[str, Any]) -> Optional[str]:
     except Exception:
         return None
 
+# Extract jobid from mining.submit params
 def jobid_from_submit(msg: Dict[str, Any]) -> Optional[str]:
     try:
         p = msg.get("params") or []
@@ -302,6 +351,7 @@ def jobid_from_submit(msg: Dict[str, Any]) -> Optional[str]:
     except Exception:
         return None
 
+# Simple weighted round-robin scheduler
 class RatioScheduler:
     def __init__(self, wA: int, wB: int):
         self.wA = max(0, int(wA))
@@ -320,6 +370,7 @@ class RatioScheduler:
             return "A"
         return "B"
 
+# Proxy session handling a single miner connection and two upstream pools
 class ProxySession:
     def __init__(self, cfg: AppCfg, miner_r: asyncio.StreamReader, miner_w: asyncio.StreamWriter, sid: str):
         self.cfg = cfg
@@ -342,8 +393,6 @@ class ProxySession:
         self.configure_id: Any = None
         self.id_gen = itertools.count(1)
 
-
-
         self.latest_notify_raw: Dict[str, Optional[bytes]] = {"A": None, "B": None}
         self.latest_jobid: Dict[str, Optional[str]] = {"A": None, "B": None}
         self.notify_seq: Dict[str, int] = {"A": 0, "B": 0}
@@ -351,22 +400,29 @@ class ProxySession:
         self.extranonce1: Dict[str, Optional[str]] = {"A": None, "B": None}
         self.extranonce2_size: Dict[str, Optional[int]] = {"A": None, "B": None}
 
-
         self.latest_diff: Dict[str, Optional[float]] = {"A": None, "B": None}
         self.last_downstream_diff_by_pool: Dict[str, Optional[float]] = {"A": None, "B": None}
         self.last_downstream_extranonce: Optional[tuple[str, int]] = None
         self.downstream_setup_lock = asyncio.Lock()
         self.last_downstream_en1: Optional[str] = None
         self.last_downstream_en2s: Optional[int] = None
-        self.active_pool: str = "A"  # pool whose job we last forwarded
 
-        self.job_owner: Dict[tuple, str] = {}  # key=(sid, jobid) -> pool_key
+        # Start active on the pool with higher weight (avoids early misroutes at 0/100 or 100/0).
+        if cfg.sched.wA <= 0 and cfg.sched.wB > 0:
+            self.active_pool: str = "B"
+        elif cfg.sched.wB <= 0 and cfg.sched.wA > 0:
+            self.active_pool: str = "A"
+        elif cfg.sched.wB > cfg.sched.wA:
+            self.active_pool: str = "B"
+        else:
+            self.active_pool: str = "A"
+
+        self.job_owner: Dict[tuple, str] = {}  # key=(pool_key, jobid)
 
         self.last_forwarded_jobid: str | None = None
 
         self.last_forwarded_pool: str | None = None
         self.submit_owner: Dict[Any, str] = {}
-        self.submit_jid: Dict[Any, str] = {}  # submit id -> jobid
         # per-pool (pool_key,id) de-dupe to prevent collisions between pools
         self.seen_upstream_response_ids = set()
         self.handshake_pool: str | None = None  # selected pool for subscribe/authorize handshake responses
@@ -379,7 +435,6 @@ class ProxySession:
         self.submit_fp_max: int = 512
         self.submit_fp_ttl_s: float = 45.0
 
-
         self.sched = RatioScheduler(cfg.sched.wA, cfg.sched.wB)
         # Internal upstream bootstrap (subscribe/auth) so both pools produce notify,
         # even if the miner never sends subscribe/authorize.
@@ -388,6 +443,33 @@ class ProxySession:
         self._internal_subscribe_id: Dict[str, int] = {}   # pool_key -> id
         self._internal_authorize_id: Dict[str, int] = {}   # pool_key -> id
 
+        # ── Failover state ──────────────────────────────────────────────
+        # pool_alive: True when pool TCP connection is healthy and reading.
+        #             Set to False when pool_reader detects EOF or error.
+        #             Set back to True when reconnect succeeds.
+        self.pool_alive: Dict[str, bool] = {"A": True, "B": True}
+
+        # pool_fail_count: consecutive reconnect failures (drives exponential backoff).
+        #                  Reset to 0 on successful reconnect.
+        self.pool_fail_count: Dict[str, int] = {"A": 0, "B": 0}
+
+        # pool_last_fail_mono: monotonic timestamp of the most recent failure.
+        #                      Used to calculate "how long has this pool been down?"
+        self.pool_last_fail_mono: Dict[str, Optional[float]] = {"A": None, "B": None}
+
+        # pool_reconnect_task: handle to the background asyncio task that is
+        #                      currently trying to reconnect this pool (or None).
+        #                      Prevents launching duplicate reconnect attempts.
+        self.pool_reconnect_task: Dict[str, Optional[asyncio.Task]] = {"A": None, "B": None}
+
+        # original_weights: snapshot of the configured weights from config_v2.json.
+        #                   When a pool goes down, the scheduler temporarily acts as
+        #                   if the dead pool has weight 0. When the pool recovers,
+        #                   we restore these original values.
+        self.original_weights: tuple[int, int] = (cfg.sched.wA, cfg.sched.wB)
+        # ── End failover state ──────────────────────────────────────────
+
+    # Send JSON stratum message upstream to pool A or B
     async def send_upstream(self, pool_key: str, msg: dict) -> None:
         """Send a JSON stratum message upstream to pool A or B."""
         raw = dumps_json(msg)
@@ -400,12 +482,47 @@ class ProxySession:
             return
         await write_line(w, raw, f"upstream{pool_key}")
 
+    # Get next internal id for subscribe/authorize bootstrap
     def next_internal_id(self) -> int:
         self._internal_next_id += 1
         return self._internal_next_id
 
-    async def bootstrap_pool(self, pcfg: PoolCfg) -> None:
-        """Internal subscribe/auth to ensure pool emits notify and we can cache jobs."""
+    # Bootstrap pool connection with subscribe/authorize
+    async def bootstrap_pool(self, pcfg: PoolCfg, is_reconnect: bool = False) -> None:
+        """Internal subscribe/auth to ensure pool emits notify and we can cache jobs.
+        
+        Only bootstrap the NON-handshake pool at initial startup. The handshake
+        pool gets its subscribe/authorize from the miner directly during the
+        initial handshake.
+        
+        On RECONNECT (is_reconnect=True), always bootstrap — the miner won't
+        re-send subscribe/authorize, so we must do it ourselves.
+        """
+        if not is_reconnect:
+            # Determine which pool will be the handshake pool (same logic as in miner_to_pools)
+            try:
+                wA = float(getattr(self.cfg.sched, "wA", 0))
+                wB = float(getattr(self.cfg.sched, "wB", 0))
+            except Exception:
+                wA, wB = 1.0, 0.0
+            
+            if wA <= 0 and wB > 0:
+                handshake = "B"
+            elif wB <= 0 and wA > 0:
+                handshake = "A"
+            elif wB > wA:
+                handshake = "B"
+            else:
+                handshake = "A"
+            
+            # Only bootstrap the NON-handshake pool at initial startup
+            if pcfg.key == handshake:
+                log("bootstrap_skipped_handshake_pool", sid=self.sid, pool=pcfg.key, handshake=handshake)
+                return
+        else:
+            log("bootstrap_reconnect_forced", sid=self.sid, pool=pcfg.key,
+                reason="reconnect always bootstraps")
+
         try:
             sid_sub = self.next_internal_id()
             self._internal_ids.add(sid_sub)
@@ -424,7 +541,8 @@ class ProxySession:
         except Exception as e:
             log("pool_bootstrap_error", sid=self.sid, pool=pcfg.key, err=str(e))
 
-    async def connect_pool(self, pcfg: PoolCfg) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    # Connect to upstream pool    
+    async def connect_pool(self, pcfg: PoolCfg, is_reconnect: bool = False) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         log("pool_connecting", key=pcfg.key, pool=pcfg.name, host=pcfg.host, port=pcfg.port)
         r, w = await asyncio.open_connection(pcfg.host, pcfg.port)
         CONN_UPSTREAM.labels(pool=pcfg.key).inc()
@@ -442,10 +560,11 @@ class ProxySession:
                     await write_line(w, raw, f"upstream{pcfg.key}")
                 log("send_upstream_flush_done", sid=self.sid, pool=pcfg.key)
             self.up_q[pcfg.key] = keep
-
-        await self.bootstrap_pool(pcfg)
+        
+        await self.bootstrap_pool(pcfg, is_reconnect=is_reconnect)
         return r, w
 
+    # Rewrite authorize message to use configured wallet and extracted worker name
     def rewrite_authorize(self, pcfg: PoolCfg, msg: Dict[str, Any]) -> Dict[str, Any]:
         params = msg.get("params") or []
         miner_user = str(params[0]) if len(params) >= 1 else ""
@@ -463,6 +582,7 @@ class ProxySession:
         out["params"] = [user, pw]
         return out
 
+    # Downstream difficulty policy
     def downstream_diff_policy(self, pool_key: str) -> Optional[float]:
         d = self.latest_diff.get(pool_key)
         if d is None:
@@ -511,14 +631,8 @@ class ProxySession:
 
         return v
 
+    # Send extranonce1 and extranonce2_size downstream if changed
     async def maybe_send_downstream_extranonce(self, pool_key: str):
-        # Never send extranonce for a non-active pool; it poisons miner context and causes mass rejects.
-        ap = getattr(self, "active_pool", None)
-        if ap not in ("A", "B"):
-            ap = getattr(self, "last_forwarded_pool", None) or getattr(self, "handshake_pool", None)
-        if ap in ("A", "B") and pool_key != ap:
-            log("downstream_extranonce_suppressed_nonactive", sid=self.sid, pool=pool_key, active=ap)
-            return
         # If we already raw-forwarded the pool's subscribe result,
         # do NOT re-send extranonce (pool-agnostic safety).
         if getattr(self, "raw_subscribe_forwarded_pool", None) == pool_key and getattr(self, "last_downstream_extranonce_pool", None) == pool_key:
@@ -526,22 +640,40 @@ class ProxySession:
                 raw_subscribe_forwarded_pool=getattr(self, "raw_subscribe_forwarded_pool", None),
                 last_downstream_extranonce_pool=getattr(self, "last_downstream_extranonce_pool", None))
             return
+            
         en1 = self.extranonce1.get(pool_key)
         en2s = self.extranonce2_size.get(pool_key)
         if not en1 or en2s is None:
+            log("downstream_extranonce_skip_no_data", sid=self.sid, pool=pool_key,
+                en1=en1, en2s=en2s)
             return
 
         async with self.downstream_setup_lock:
-            # Only send extranonce when it actually changes.
             new_en1 = str(en1)
             new_en2s = int(en2s)
-            if self.last_downstream_en1 == new_en1 and self.last_downstream_en2s == new_en2s:
-                log("downstream_extranonce_skip_nochange", pool=pool_key,
+            
+            # CRITICAL FIX: Force send if this pool is NOT the handshake pool.
+            # The miner ONLY received extranonce from handshake pool during subscribe.
+            # Any other pool's extranonce MUST be explicitly sent.
+            handshake = getattr(self, "handshake_pool", None)
+            last_en_pool = getattr(self, "last_downstream_extranonce_pool", None)
+            force_send = (handshake is not None and pool_key != handshake)
+
+            # Debug logging to see why force_send might be False
+            log("downstream_extranonce_check", sid=self.sid, pool=pool_key,
+                handshake=handshake, last_en_pool=last_en_pool, force_send=force_send,
+                new_en1=new_en1, new_en2s=new_en2s,
+                last_en1=self.last_downstream_en1, last_en2s=self.last_downstream_en2s)
+            
+            # Only skip if NOT force_send AND values unchanged
+            if not force_send and self.last_downstream_en1 == new_en1 and self.last_downstream_en2s == new_en2s:
+                log("downstream_extranonce_skip_nochange", sid=self.sid, pool=pool_key,
                     en1=new_en1, en2s=new_en2s,
-                    last_en1=str(self.last_downstream_en1), last_en2s=int(self.last_downstream_en2s))
+                    last_en1=str(self.last_downstream_en1), last_en2s=str(self.last_downstream_en2s),
+                    force_send=force_send, handshake=handshake, last_en_pool=last_en_pool)
                 return
 
-            # IMPORTANT: only "commit" the downstream extranonce state if the write succeeds.
+            # Send the extranonce
             msg = {"method": "mining.set_extranonce", "params": [new_en1, new_en2s]}
             try:
                 await write_line(self.miner_w, dumps_json(msg), "downstream")
@@ -553,8 +685,10 @@ class ProxySession:
             self.last_downstream_en1 = new_en1
             self.last_downstream_en2s = new_en2s
             self.last_downstream_extranonce_pool = pool_key
-            log("downstream_extranonce_set", pool=pool_key, extranonce1=new_en1, extranonce2_size=new_en2s)
+            log("downstream_extranonce_set", sid=self.sid, pool=pool_key, extranonce1=new_en1, extranonce2_size=new_en2s,
+                force_send=force_send, handshake=handshake)
 
+    # Send downstream difficulty if changed
     async def maybe_send_downstream_diff(self, pool_key: str, force: bool = False) -> bool:
         # If a pool is disabled by scheduler weights, never send its difficulty downstream.
         # Prevents diff flips from the non-active pool (poisoning).
@@ -572,11 +706,12 @@ class ProxySession:
             dd_sent = int(dd) if dd is not None else dd
             self.last_downstream_diff_by_pool[pool_key] = dd_sent
             DIFF_DOWNSTREAM.set(dd_sent)
-            log("downstream_send_diff", payload={"method":"mining.set_difficulty","params":[dd_sent]})
+            log("downstream_send_diff", sid=self.sid, pool=pool_key, payload={"method":"mining.set_difficulty","params":[dd_sent]})
             await write_line(self.miner_w, dumps_json({"method": "mining.set_difficulty", "params": [dd_sent]}), "downstream")
-            log("downstream_diff_set", pool=pool_key, diff=dd, diff_sent=dd_sent)
+            log("downstream_diff_set", sid=self.sid, pool=pool_key, diff=dd, diff_sent=dd_sent)
             return True
 
+    # Resend latest notify as clean (isCleanJob=true)
     async def resend_active_notify_clean(self, pool_key: str, reason: str):
         """After diff/extranonce changes, immediately resend latest job as clean notify.
         Reduces mismatch windows that cause bursts of 'low difficulty share' rejects.
@@ -600,13 +735,18 @@ class ProxySession:
                     nm["params"] = params
                 nm2 = sanitize_downstream_notification(nm)
                 log("downstream_send_notify", payload=nm2)
+                # Ensure diff context is re-asserted before resend clean notify (prevents low-diff bursts)
+                await self.maybe_send_downstream_extranonce(pool_key)
+                sent_diff = await self.maybe_send_downstream_diff(pool_key, force=True)
+                if sent_diff:
+                    await asyncio.sleep(0.25)
                 await write_line(self.miner_w, dumps_json(nm2), "downstream")
                 # Commit forwarded-job state for submit routing (resend path must mirror scheduler forward path)
                 self.last_forwarded_pool = pool_key
                 self.last_forwarded_jobid = jid
                 if jid:
-                    self.job_owner[(self.sid, jid)] = pool_key
-                self.last_notify_mono = time.monotonic()
+                    self.job_owner[(pool_key, jid)] = pool_key
+                self.last_notify_mono[pool_key] = time.monotonic()
                 log("resend_notify_clean", sid=self.sid, pool=pool_key, jobid=jid, reason=reason)
                 return
         except Exception as e:
@@ -615,8 +755,11 @@ class ProxySession:
         await write_line(self.miner_w, raw, "downstream")
         log("resend_notify_raw", sid=self.sid, pool=pool_key, jobid=jid, reason=reason)
 
+    # Forward miner messages to upstream pools
     async def miner_to_pools(self):
-        assert self.wA and self.wB
+        # At 100/0 or 0/100, only one pool writer exists. That's OK.
+        assert self.wA or self.wB, "No upstream pool connections available"
+
         async for raw in iter_lines(self.miner_r, "downstream"):
             try:
                 msg = loads_json(raw)
@@ -628,29 +771,50 @@ class ProxySession:
             if m:
                 log("miner_method", sid=self.sid, method=m)
             if m == "mining.configure":
-                # Forward mining.configure to the handshake pool and let its response flow back to the miner.
-                mid = msg.get("id")
-                params = msg.get("params") or []
-                log("configure_req", sid=self.sid, id=mid, params=params)
+                # Forward mining.configure to the handshake pool so its response goes back to the miner,
+                # BUT also send a copy to the other pool using an internal id so we can consume the reply
+                # without forwarding it downstream. This prevents Pool B "low difficulty share" rejects
+                # when the miner is version-rolling.
+                try:
+                    cfg_id = msg.get("id")
+                    if self.handshake_pool is None:
+                        # Choose handshake pool from config weights (avoid hard-wiring to A).
+                        try:
+                            wA = float(getattr(self.cfg.sched, "wA", 0))
+                            wB = float(getattr(self.cfg.sched, "wB", 0))
+                        except Exception:
+                            wA, wB = 1.0, 0.0
+                        if wA <= 0 and wB > 0:
+                            self.handshake_pool = "B"
+                        elif wB <= 0 and wA > 0:
+                            self.handshake_pool = "A"
+                        elif wB > wA:
+                            self.handshake_pool = "B"
+                        else:
+                            self.handshake_pool = "A"
+                    hp = self.handshake_pool
+                    other = "B" if hp == "A" else "A"
 
-                if self.handshake_pool is None:
-                    # Choose handshake pool from config weights (avoid hard-wiring to A).
-                    try:
-                        wA = float(getattr(self.cfg.sched, "wA", 0))
-                        wB = float(getattr(self.cfg.sched, "wB", 0))
-                    except Exception:
-                        wA, wB = 1.0, 0.0
-                    if wA <= 0 and wB > 0:
-                        self.handshake_pool = "B"
-                    elif wB <= 0 and wA > 0:
-                        self.handshake_pool = "A"
-                    elif wB > wA:
-                        self.handshake_pool = "B"
+                    # 1) forward original to handshake pool (reply goes to miner)
+                    await self.send_upstream(hp, msg)
+
+                    # 2) forward copy to other pool (reply is internal-only)
+                    # Skip if the other pool has zero weight (not connected).
+                    other_w = getattr(self.cfg.sched, "wB" if other == "B" else "wA", 0)
+                    if other_w > 0:
+                        iid = self.next_internal_id()
+                        self._internal_ids.add(iid)
+                        msg2 = dict(msg)
+                        msg2["id"] = iid
+                        await self.send_upstream(other, msg2)
+                        log("configure_forwarded_both_pools", sid=self.sid, handshake=hp, other=other, id=cfg_id, internal_id=iid)
                     else:
-                        self.handshake_pool = "A"
+                        log("configure_skip_zero_weight_pool", sid=self.sid, pool=other)
 
-                await self.send_upstream(self.handshake_pool, msg)
+                except Exception as e:
+                    log("configure_forward_both_error", sid=self.sid, err=str(e))
                 continue
+
             if m == "mining.subscribe":
                 self.subscribe_id = msg.get("id")
                 if self.handshake_pool is None:
@@ -709,21 +873,26 @@ class ProxySession:
                 await self.send_upstream(primary, out_primary)
 
                 # Also authorize to the other pool so its UI shows the real worker name (not dpmp_bootstrap).
-                try:
-                    other = "B" if self.handshake_pool == "A" else "A"
-                    ocfg = self.cfg.poolB if other == "B" else self.cfg.poolA
-                    out2 = self.rewrite_authorize(ocfg, msg)
-                    log("authorize_rewrite_other", pool=other, worker=self.worker, upstream_user=out2["params"][0])
-                    await self.send_upstream(other, out2)
-                except Exception as e:
-                    log("authorize_rewrite_other_error", pool=other, worker=self.worker, err=str(e))
+                # Skip if the other pool has zero weight (not connected).
+                other = "B" if self.handshake_pool == "A" else "A"
+                other_w = getattr(self.cfg.sched, "wB" if other == "B" else "wA", 0)
+                if other_w > 0:
+                    try:
+                        ocfg = self.cfg.poolB if other == "B" else self.cfg.poolA
+                        out2 = self.rewrite_authorize(ocfg, msg)
+                        log("authorize_rewrite_other", pool=other, worker=self.worker, upstream_user=out2["params"][0])
+                        await self.send_upstream(other, out2)
+                    except Exception as e:
+                        log("authorize_rewrite_other_error", pool=other, worker=self.worker, err=str(e))
 
-                # Ensure pools that key UI on authorize see the real miner worker name.
-                try:
-                    log("authorize_rewrite_secondary", pool=secondary, worker=self.worker, upstream_user=out_secondary["params"][0])
-                    await self.send_upstream(secondary, out_secondary)
-                except Exception as e:
-                    log("authorize_secondary_send_error", sid=self.sid, pool=secondary, err=str(e))
+                    # Ensure pools that key UI on authorize see the real miner worker name.
+                    try:
+                        log("authorize_rewrite_secondary", pool=secondary, worker=self.worker, upstream_user=out_secondary["params"][0])
+                        await self.send_upstream(secondary, out_secondary)
+                    except Exception as e:
+                        log("authorize_secondary_send_error", sid=self.sid, pool=secondary, err=str(e))
+                else:
+                    log("authorize_skip_zero_weight_pool", sid=self.sid, pool=other)
 
                 self.miner_ready.set()
                 log("miner_ready_for_jobs", sid=self.sid, worker=self.worker, handshake_pool=self.handshake_pool)
@@ -757,7 +926,7 @@ class ProxySession:
                         reason = "no_jid_fallback"
                 else:
                     # Prefer stable job->pool mapping first (critical during pool switching).
-                    pool_map = self.job_owner.get((self.sid, jid))
+                    pool_map = self.job_owner.get(("A", jid)) or self.job_owner.get(("B", jid))
                     if pool_map in ("A","B"):
                         pool = pool_map
                         reason = "job_owner_map"
@@ -837,12 +1006,20 @@ class ProxySession:
                         continue
 
                 self.submit_owner[msg.get("id")] = pool
-                self.submit_jid[msg.get("id")] = jid
                 mid = msg.get("id")
                 if mid is not None:
                     d = self.last_downstream_diff_by_pool.get(pool)
                     # Submit-time snapshot for debugging diff mismatches (VarDiff / miner apply lag).
+                    pms = msg.get("params") or []
+                    u0 = pms[0] if len(pms) > 0 else None
+                    en2 = pms[2] if len(pms) > 2 else None
+                    ntime = pms[3] if len(pms) > 3 else None
+                    nonce = pms[4] if len(pms) > 4 else None
+                    # versionbits is optional (only for version-rolling miners)
+                    vb = pms[5] if len(pms) > 5 else None
+
                     log("submit_snapshot", sid=self.sid, jid=jid, pool=pool, mid=mid,
+                        user=u0, extranonce2=en2, ntime=ntime, nonce=nonce, versionbits=vb,
                         active=(self.last_forwarded_pool or self.handshake_pool),
                         raw_subscribe_forwarded_pool=getattr(self, "raw_subscribe_forwarded_pool", None),
                         last_downstream_diff_snapshot=d, pool_latest_diff=self.latest_diff.get(pool),
@@ -867,26 +1044,48 @@ class ProxySession:
                     if d is None:
                         d = self.latest_diff.get(pool)
                     self.submit_diff[mid] = float(d or 0.0)
+
+                # ── Failover guard: reject submit if target pool is dead ──
+                # If the pool that owns this job just died, we can't forward
+                # the share.  Send the miner a clean rejection instead of
+                # crashing on a None writer.
+                if not self.pool_alive.get(pool, False):
+                    log("submit_dropped_pool_dead", sid=self.sid, mid=msg.get("id"),
+                        jid=jid, pool=pool)
+                    self.submit_owner.pop(msg.get("id"), None)
+                    self.submit_diff.pop(msg.get("id"), None)
+                    await write_line(self.miner_w, dumps_json({
+                        "id": msg.get("id"), "result": False,
+                        "error": {"code": 21, "message": "pool unavailable", "data": None}
+                    }), "downstream")
+                    continue
+
                 if pool == "B":
                     out = dict(msg)
                     params = list(out.get("params") or [])
                     if params:
                         # submit user should match pool wallet + miner worker
                         params[0] = f"{self.cfg.poolB.wallet}.{self.worker}" if self.cfg.poolB.wallet else str(params[0])
+                        # Keep versionbits if present (miners may be version-rolling).
                         out["params"] = params
                     await write_line(self.wB, dumps_json(out), "upstreamB")
                 else:
                     out = dict(msg)
                     params = list(out.get("params") or [])
                     if params:
+                        # submit user should match pool wallet + miner worker
                         params[0] = f"{self.cfg.poolA.wallet}.{self.worker}" if self.cfg.poolA.wallet else str(params[0])
+                        # Keep versionbits if present (miners may be version-rolling).
                         out["params"] = params
                     await write_line(self.wA, dumps_json(out), "upstreamA")
                 continue
 
-            await write_line(self.wA, raw, "upstreamA")
-            await write_line(self.wB, raw, "upstreamB")
+            if self.wA is not None:
+                await write_line(self.wA, raw, "upstreamA")
+            if self.wB is not None:
+                await write_line(self.wB, raw, "upstreamB")
 
+    # Read from upstream pool
     async def pool_reader(self, pool_key: str, reader: asyncio.StreamReader):
         side = "upstreamA" if pool_key == "A" else "upstreamB"
         async for raw in iter_lines(reader, side):
@@ -897,7 +1096,6 @@ class ProxySession:
 
             method = msg.get("method")
 
-
             mid = msg.get("id")
 
             if mid is not None and method is None:
@@ -906,7 +1104,6 @@ class ProxySession:
 
                     log("upstream_response_dup_observed", sid=self.sid, pool=pool_key, id=mid)
                     continue
-
 
                 self.seen_upstream_response_ids.add((pool_key, mid))
 
@@ -922,43 +1119,13 @@ class ProxySession:
                 continue
 
             if method == "mining.notify":
-                # Cache notify, and if this is the active pool, forward it to the miner.
-                # Without this, miners will keep submitting stale jobids and pools reject with code 21 (job not found).
+                # Cache notify; scheduler is the ONLY code path that forwards notify downstream
+                # (it forces clean_jobs=True and sends extranonce/diff first).
                 self.latest_notify_raw[pool_key] = raw
                 jid = jobid_from_notify(msg)
                 self.latest_jobid[pool_key] = jid
                 self.notify_seq[pool_key] += 1
                 log("pool_notify", sid=self.sid, pool=pool_key, jobid=jid, seq=self.notify_seq[pool_key])
-
-                active = self.last_forwarded_pool or self.handshake_pool
-                if active == pool_key and self.raw_subscribe_forwarded_pool == pool_key:
-                    try:
-                        # Ensure downstream context is up to date before notify
-                        await self.maybe_send_downstream_extranonce(pool_key)
-                        await self.maybe_send_downstream_diff(pool_key)
-
-                        nm2 = sanitize_downstream_notification(msg)
-                        params = nm2.get("params") or []
-                        # Force clean_jobs=True (Stratum notify param[-1])
-                        if len(params) >= 9:
-                            params[-1] = True
-                        else:
-                            while len(params) < 9:
-                                params.append(None)
-                            params[-1] = True
-                        nm2["params"] = params
-
-                        log("downstream_send_notify", payload=nm2)
-                        await write_line(self.miner_w, dumps_json(nm2), "downstream")
-
-                        # Keep submit routing consistent with forwarded jobs
-                        self.last_forwarded_pool = pool_key
-                        self.last_forwarded_jobid = jid
-                        if jid:
-                            self.job_owner[(self.sid, jid)] = pool_key
-                        self.last_notify_mono = time.monotonic()
-                    except Exception as e:
-                        log("downstream_send_notify_error", sid=self.sid, pool=pool_key, jobid=jid, err=str(e))
                 continue
 
             if "id" in msg and msg.get("method") is None:
@@ -1034,7 +1201,10 @@ class ProxySession:
 
                     # Step A: after authorize OK (handshake pool), immediately push setup context in correct order:
                     # set_extranonce -> set_difficulty -> notify(clean_jobs=true)
-                    if ok_auth and (self.handshake_pool is not None) and (pool_key == self.handshake_pool):
+                    # BUT skip if scheduler already switched to the other pool (don't overwrite Pool A's context)
+                    last_en_pool = getattr(self, "last_downstream_extranonce_pool", None)
+                    already_switched_away = (last_en_pool is not None and last_en_pool != pool_key)
+                    if ok_auth and (self.handshake_pool is not None) and (pool_key == self.handshake_pool) and (not already_switched_away):
                         try:
                             # Extranonce (if known)
                             en1 = self.extranonce1.get(pool_key)
@@ -1044,8 +1214,12 @@ class ProxySession:
                                 log("post_auth_push_extranonce", sid=self.sid, pool=pool_key, extranonce1=str(en1), extranonce2_size=int(en2s))
                                 await write_line(self.miner_w, dumps_json(en_msg), "downstream")
 
-                            # Difficulty (use downstream policy: clamp + integerize)
-                            diff = self.downstream_diff_policy(pool_key)
+                            # Difficulty (prefer latest pool diff if we have it)
+                            diff = None
+                            try:
+                                diff = float(self.latest_diff.get(pool_key))
+                            except Exception:
+                                diff = None
                             if diff is not None and diff > 0:
                                 dmsg = {"method": "mining.set_difficulty", "params": [int(diff)]}
                                 log("post_auth_push_diff", sid=self.sid, pool=pool_key, diff=diff, diff_sent=int(diff))
@@ -1072,8 +1246,8 @@ class ProxySession:
                                         self.last_forwarded_pool = pool_key
                                         self.last_forwarded_jobid = jid
                                         if jid:
-                                            self.job_owner[(self.sid, jid)] = pool_key
-                                        self.last_notify_mono = time.monotonic()
+                                            self.job_owner[(pool_key, jid)] = pool_key
+                                        self.last_notify_mono[pool_key] = time.monotonic()
                                 except Exception as e:
                                     log("post_auth_push_notify_clean_error", sid=self.sid, pool=pool_key, err=str(e))
                         except Exception as e:
@@ -1094,7 +1268,6 @@ class ProxySession:
 
                 if mid in self.submit_owner:
                     p = self.submit_owner.pop(mid)
-                    self.submit_jid.pop(mid, None)
                     d = float(self.submit_diff.pop(mid, 0.0))
                     ok = bool(msg.get("result"))
                     if ok:
@@ -1105,19 +1278,6 @@ class ProxySession:
                     else:
                         SHARES_REJECTED.labels(pool=p).inc()
                         log("share_result", sid=self.sid, pool=p, accepted=False, error=msg.get("error"))
-                        # If upstream says job not found (code 21), drop our (sid,jobid)->pool mapping
-                        # so we don't keep routing future submits for that jid to a dead mapping.
-                        try:
-                            err = msg.get("error") or {}
-                            code = err.get("code") if isinstance(err, dict) else None
-                            if code == 21:
-                                jid = self.submit_jid.get(mid)
-                                if jid is not None:
-                                    if (self.sid, jid) in self.job_owner:
-                                        del self.job_owner[(self.sid, jid)]
-                                        log("job_owner_purged_on_jobnotfound", sid=self.sid, jid=jid, pool=p)
-                        except Exception as e:
-                            log("job_owner_purge_on_jobnotfound_error", sid=self.sid, err=str(e))
                 await write_line(self.miner_w, dumps_json(msg), "downstream")
                 continue
 
@@ -1126,6 +1286,239 @@ class ProxySession:
             if pool_key == primary and method is not None:
                 await write_line(self.miner_w, raw, "downstream")
 
+    # Pool Failover: clear stale state for a dead pool
+    def clear_pool_state(self, pool_key: str):
+        """Wipe cached data for a pool that just disconnected.
+
+        Why each field is cleared:
+        - latest_notify_raw / latest_jobid: The old job belongs to a now-dead
+          TCP session.  If the scheduler forwarded it, the miner would submit
+          shares that the pool can never accept (session is gone).
+        - latest_diff: The difficulty was for the old session; the pool will
+          send a new one after reconnect.
+        - extranonce1 / extranonce2_size: Same — session-scoped values that
+          become invalid when the TCP connection drops.
+        - pool_w entry: The old writer is broken; remove it so send_upstream()
+          queues messages instead of writing to a dead socket.
+        - CONN_UPSTREAM gauge: Decrement so Prometheus reflects reality.
+        - raw_subscribe_forwarded_pool: Must be cleared so that after reconnect,
+          maybe_send_downstream_extranonce() is NOT blocked by the stale
+          "already sent via raw subscribe" guard.  Without this, the miner
+          never receives the new pool's extranonce and every share is rejected
+          as "low difficulty".
+        """
+        self.latest_notify_raw[pool_key] = None
+        self.latest_jobid[pool_key] = None
+        self.latest_diff[pool_key] = None
+
+        self.extranonce1[pool_key] = None
+        self.extranonce2_size[pool_key] = None
+
+        # ── Clear "last sent" tracking so reconnect WILL send the new extranonce ──
+        # Without this, the bootstrap response updates extranonce1[pool_key] and
+        # maybe_send_downstream_extranonce() sees new==last and skips sending.
+        if getattr(self, "last_downstream_extranonce_pool", None) == pool_key:
+            self.last_downstream_en1 = None
+            self.last_downstream_en2s = None
+            self.last_downstream_extranonce_pool = None
+            log("clear_pool_state_reset_last_downstream_extranonce", sid=self.sid, pool=pool_key)
+
+        # ── NEW: clear the raw-subscribe guard so reconnect can send extranonce ──
+        if getattr(self, "raw_subscribe_forwarded_pool", None) == pool_key:
+            self.raw_subscribe_forwarded_pool = None
+            log("clear_pool_state_reset_raw_subscribe_flag", sid=self.sid, pool=pool_key)
+
+        # Remove the dead writer so send_upstream() will queue, not crash.
+        old_w = self.pool_w.pop(pool_key, None)
+        if old_w is not None:
+            try:
+                old_w.close()
+            except Exception:
+                pass
+
+        # Clear the reader/writer instance attributes too.
+        if pool_key == "A":
+            self.rA = None
+            self.wA = None
+        else:
+            self.rB = None
+            self.wB = None
+
+        CONN_UPSTREAM.labels(pool=pool_key).dec()
+        log("pool_state_cleared", sid=self.sid, pool=pool_key)
+
+
+    # ── Periodic state pruning ──────────────────────────────────────
+    # Several dicts/sets grow with every job or upstream response but
+    # are never trimmed.  Over weeks of runtime this leaks memory.
+    # This method is called every ~60 seconds from forward_jobs().
+    def prune_stale_state(self):
+        """Remove entries older than 5 minutes from structures that grow unbounded."""
+        now = time.monotonic()
+        max_age = 300.0  # 5 minutes — no job/response older than this is useful
+
+        # 1) job_owner: keyed by (pool_key, jobid).
+        #    Keep only the last ~200 entries.  Jobs older than that are
+        #    long expired; no miner will submit against them.
+        max_jobs = 200
+        if len(self.job_owner) > max_jobs:
+            # We can't age these (no timestamp), so just keep the most recent N.
+            # Since Python 3.7+ dicts preserve insertion order, drop from the front.
+            excess = len(self.job_owner) - max_jobs
+            keys_to_drop = list(self.job_owner.keys())[:excess]
+            for k in keys_to_drop:
+                del self.job_owner[k]
+            log("prune_job_owner", sid=self.sid, dropped=excess,
+                remaining=len(self.job_owner))
+
+        # 2) seen_upstream_response_ids: grows with every upstream response.
+        #    These are (pool_key, msg_id) tuples used to de-dupe.
+        #    After a few minutes, no duplicate will arrive.  Cap at 500.
+        max_seen = 500
+        if len(self.seen_upstream_response_ids) > max_seen:
+            # set() has no insertion order, so just clear and start fresh.
+            # The worst that can happen is a duplicate response gets forwarded
+            # once — harmless, the miner ignores unexpected responses.
+            excess = len(self.seen_upstream_response_ids)
+            self.seen_upstream_response_ids.clear()
+            log("prune_seen_upstream_ids", sid=self.sid, cleared=excess)
+
+        # 3) _internal_ids: bootstrap request IDs.  Grows on each reconnect.
+        #    Only a handful are "active" at any time.  Keep only the last 50.
+        max_internal = 50
+        if len(self._internal_ids) > max_internal:
+            # These are ints; keep the highest (most recent) N.
+            sorted_ids = sorted(self._internal_ids)
+            to_remove = sorted_ids[:len(sorted_ids) - max_internal]
+            for i in to_remove:
+                self._internal_ids.discard(i)
+            log("prune_internal_ids", sid=self.sid, dropped=len(to_remove),
+                remaining=len(self._internal_ids))
+
+        # 4) submit_owner / submit_diff: keyed by message id.
+        #    Normally pop'd when the pool responds, but orphaned entries
+        #    can accumulate if a pool never responds.  Cap at 200.
+        max_submit = 200
+        if len(self.submit_owner) > max_submit:
+            excess = len(self.submit_owner) - max_submit
+            keys_to_drop = list(self.submit_owner.keys())[:excess]
+            for k in keys_to_drop:
+                self.submit_owner.pop(k, None)
+                self.submit_diff.pop(k, None)
+            log("prune_submit_owner", sid=self.sid, dropped=excess,
+                remaining=len(self.submit_owner))
+
+    # ── End periodic state pruning ──────────────────────────────────
+
+
+    # Pool Failover: reconnecting wrapper around pool_reader 
+    async def pool_reader_with_reconnect(self, pool_key: str, reader: asyncio.StreamReader):
+        """Wrap pool_reader in a reconnect loop.
+
+        Normal flow:
+          1. pool_reader() runs, processing messages until EOF or error.
+          2. When pool_reader() returns (pool disconnected), we land here.
+          3. Mark the pool dead, clear stale state.
+          4. Sleep with exponential backoff (5s, 10s, 20s, 40s … capped at 60s).
+          5. Try to reconnect (connect_pool).
+          6. If reconnect succeeds → reset fail counter, loop back to step 1.
+          7. If reconnect fails → increment fail counter, loop back to step 4.
+
+        This method runs forever (until the miner session itself ends),
+        so the asyncio.wait(FIRST_COMPLETED) in run() is no longer
+        triggered by a pool going down.
+        """
+        pcfg = self.cfg.poolA if pool_key == "A" else self.cfg.poolB
+
+        while True:
+            # ── Phase 1: read from pool until it disconnects ────────
+            try:
+                await self.pool_reader(pool_key, reader)
+            except asyncio.CancelledError:
+                # Session is shutting down — don't reconnect, just exit.
+                raise
+            except Exception as e:
+                log("pool_reader_error", sid=self.sid, pool=pool_key, err=str(e))
+
+            # If we get here, pool_reader returned (EOF) or raised.
+            # That means the pool's TCP connection is dead.
+
+            # ── Phase 2: mark dead + clear stale state ──────────────
+            self.pool_alive[pool_key] = False
+            self.pool_last_fail_mono[pool_key] = time.monotonic()
+            self.clear_pool_state(pool_key)
+            log("pool_down", sid=self.sid, pool=pool_key,
+                fail_count=self.pool_fail_count[pool_key],
+                other_alive=self.pool_alive["B" if pool_key == "A" else "A"])
+
+            # ── Phase 3: reconnect loop with backoff ────────────────
+            while True:
+                # Exponential backoff: 5, 10, 20, 40, 60, 60, 60 …
+                base_delay = 5.0
+                max_delay = 60.0
+                delay = min(base_delay * (2 ** self.pool_fail_count[pool_key]), max_delay)
+                log("pool_reconnect_wait", sid=self.sid, pool=pool_key,
+                    delay_s=round(delay, 1),
+                    fail_count=self.pool_fail_count[pool_key])
+
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    raise
+
+                # Attempt reconnect
+                try:
+                    r, w = await asyncio.wait_for(
+                        self.connect_pool(pcfg, is_reconnect=True),
+                        timeout=15.0  # don't hang forever on a dead host 
+                   )
+
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self.pool_fail_count[pool_key] += 1
+                    self.pool_last_fail_mono[pool_key] = time.monotonic()
+                    log("pool_reconnect_failed", sid=self.sid, pool=pool_key,
+                        err=str(e), fail_count=self.pool_fail_count[pool_key])
+                    continue  # back to top of reconnect loop (sleep again)
+
+                # ── Phase 4: reconnect succeeded! ───────────────────
+                self.pool_alive[pool_key] = True
+                self.pool_fail_count[pool_key] = 0
+                self.pool_last_fail_mono[pool_key] = None
+
+                # Update reader/writer instance attributes.
+                if pool_key == "A":
+                    self.rA = r
+                    self.wA = w
+                else:
+                    self.rB = r
+                    self.wB = w
+
+                reader = r  # use the new reader for the next pool_reader() call
+                log("pool_reconnected", sid=self.sid, pool=pool_key,
+                    other_alive=self.pool_alive["B" if pool_key == "A" else "A"])
+
+                # ── CRITICAL: Force miner reconnect ───────────────────
+                # When a pool reconnects, it issues a NEW extranonce1.
+                # Most miners don't support mining.set_extranonce, so they
+                # ignore the new extranonce and keep using the old one.
+                # This causes 100% rejects ("low difficulty share").
+                #
+                # The only reliable fix is to tell the miner to reconnect
+                # so it goes through the full subscribe handshake again.
+                try:
+                    reconnect_msg = {"method": "client.reconnect", "params": []}
+                    await write_line(self.miner_w, dumps_json(reconnect_msg), "downstream")
+                    log("miner_reconnect_requested", sid=self.sid, pool=pool_key,
+                        reason="pool_reconnected_new_extranonce")
+                except Exception as e:
+                    log("miner_reconnect_request_failed", sid=self.sid, pool=pool_key, err=str(e))
+
+                break  # exit reconnect loop → back to Phase 1 (pool_reader)
+
+
+    # Scheduler: forward jobs to miner based on configured weights
     async def forward_jobs(self):
         await self.miner_ready.wait()
         last_seen = {"A": 0, "B": 0}
@@ -1135,21 +1528,66 @@ class ProxySession:
         last_switch_ts = time.monotonic()
         min_switch = max(0, int(self.cfg.sched.min_switch_seconds))
 
-
         last_sent_seq = {"A": 0, "B": 0}
+        last_prune_mono = time.monotonic()
 
         while True:
+            # ── Periodic cleanup (every 60s) ──
+            if time.monotonic() - last_prune_mono >= 60.0:
+                self.prune_stale_state()
+                last_prune_mono = time.monotonic()
             now = time.monotonic()
             slice_s = max(1, int(self.cfg.sched.slice_seconds))
             min_switch = max(0, int(self.cfg.sched.min_switch_seconds))
             switched_this_tick = False  # force-forward cached notify immediately after a switch
 
+            # ── Failover: emergency switch if current pool is dead ──────
+            # If the pool we're currently forwarding from just died, don't
+            # wait for the normal min_switch_seconds timer — switch immediately
+            # to the other pool if it's alive.  Without this, the miner would
+            # sit idle (no new jobs) until the next scheduler tick.
+            if not self.pool_alive.get(current_pool, False):
+                other = "B" if current_pool == "A" else "A"
+                if self.pool_alive.get(other, False) and self.latest_notify_raw.get(other) is not None:
+                    log("failover_emergency_switch", sid=self.sid,
+                        dead_pool=current_pool, switching_to=other)
+                    self.active_pool = other
+                    ACTIVE_POOL.labels(pool="A").set(1 if other == "A" else 0)
+                    ACTIVE_POOL.labels(pool="B").set(1 if other == "B" else 0)
+                    current_pool = other
+                    last_switch_ts = now
+                    self.last_switch_mono = now
+                    switched_this_tick = True
+                    await self.resend_active_notify_clean(other, reason="failover_emergency")
+                elif not self.pool_alive.get(other, False):
+                    # Both pools dead — nothing to do, just wait.
+                    await asyncio.sleep(0.10)
+                    continue
+
+            # ── Normal scheduling logic ──────────────────────────────
             # Time-slice switching (ratio by time), not by notify frequency.
-            # Time-slice switching (ratio by time), not by notify frequency.
-            if (now - last_switch_ts) >= slice_s and (now - last_switch_ts) >= min_switch:
+            if (now - last_switch_ts) >= min_switch:
                 # Choose the pool that is behind in accepted difficulty share vs target.
+                # BUT if one or more pool has failed....
+                # Read configured weights, then override dead pools to 0.
+                # This is the core failover mechanism: when a pool is down,
+                # the scheduler acts as if it has zero weight (all hashrate
+                # goes to the surviving pool).  When the pool recovers,
+                # pool_alive flips back to True and the original weight applies.
                 wA = max(0, int(getattr(self.cfg.sched, "wA", getattr(self.cfg.sched, "poolA_weight", 0))))
                 wB = max(0, int(getattr(self.cfg.sched, "wB", getattr(self.cfg.sched, "poolB_weight", 0))))
+
+                if not self.pool_alive.get("A", False):
+                    if wA > 0:
+                        log("failover_weight_override", sid=self.sid, pool="A",
+                            configured_weight=wA, effective_weight=0, reason="pool_dead")
+                    wA = 0
+                if not self.pool_alive.get("B", False):
+                    if wB > 0:
+                        log("failover_weight_override", sid=self.sid, pool="B",
+                            configured_weight=wB, effective_weight=0, reason="pool_dead")
+                    wB = 0
+
                 totw = wA + wB
 
                 reason = "hold_current"
@@ -1166,25 +1604,41 @@ class ProxySession:
                     shareA = (diffA / tot) if tot > 0 else targetA
                     shareB = (diffB / tot) if tot > 0 else targetB
 
-                    if tot <= 0:
-                        prefer = "B" if targetB > 0.5 else "A"
-                        reason = "startup_weight"
+                    # How far off-target is the current pool? (positive = over-target)
+                    if current_pool == "A":
+                        current_deviation = shareA - targetA
                     else:
-                        if tot <= 0:
-                            prefer = "B" if targetB > 0.5 else "A"
-                        else:
-                            prefer = "B" if shareB < targetB else "A"
+                        current_deviation = shareB - targetB
+
+                    # Only consider switching if:
+                    #   1) We've been on this pool at least slice_seconds (normal cadence), OR
+                    #   2) The current pool is MORE than MAX_CONVERGE_DEVIATION over its target (urgent correction)
+                    #   3) MAX_CONVERGE_DEVIATION can be configured to adjust the urgency threshold (default 2%).
+                    time_on_pool = now - last_switch_ts
+                    urgent = current_deviation > MAX_CONVERGE_DEVIATION
+                    if time_on_pool < slice_s and not urgent:
+                        # Not enough time elapsed and not urgently over-target; skip this tick
+                        pick = current_pool
+                        reason = "hold_current_not_due"
+                    else:
+                        prefer = "B" if shareB < targetB else "A"
                         reason = "behind_target"
 
-                    # If only one pool is enabled, force it.
-                    if wA == 0 and wB > 0:
-                        prefer = "B"
-                        reason = "force_B_only"
-                    elif wB == 0 and wA > 0:
-                        prefer = "A"
-                        reason = "force_A_only"
+                        # If only one pool is enabled, force it.
+                        if wA == 0 and wB > 0:
+                            prefer = "B"
+                            reason = "force_B_only"
+                        elif wB == 0 and wA > 0:
+                            prefer = "A"
+                            reason = "force_A_only"
 
-                    pick = prefer
+                        pick = prefer
+
+                    log("scheduler_tick", sid=self.sid, current=current_pool, pick=pick,
+                        reason=reason, shareA=round(shareA, 4), shareB=round(shareB, 4),
+                        targetA=round(targetA, 4), targetB=round(targetB, 4),
+                        deviation=round(current_deviation, 4), time_on_pool=round(time_on_pool, 1),
+                        urgent=urgent)
 
                 # Don't switch into a pool until we have a cached job for it.
                 if pick != current_pool:
@@ -1198,49 +1652,14 @@ class ProxySession:
                         last_switch_ts = now
                         log("pool_switched", sid=self.sid, to_pool=pick)
                         switched_this_tick = True
-                        self.last_switch_mono = time.monotonic()
+                        self.last_switch_mono = time.monotonic()                      
 
-                        # keep downstream sync in lockstep with scheduler switches
-                        self.last_forwarded_pool = pick
-                        # Immediately sync extranonce+diff and resend clean notify after switch
-                        await self.maybe_send_downstream_extranonce(pick)
-                        await self.maybe_send_downstream_diff(pick, force=True)
+                        # Immediately sync extranonce+diff and resend clean notify after switch.
+                        # resend_active_notify_clean() handles extranonce+diff+notify internally,
+                        # so we don't need separate calls here (avoids duplicate sends).
                         await self.resend_active_notify_clean(pick, reason="switch")
-                        await self.resend_active_notify_clean(pick, reason="switch")                
+
                     pick = current_pool
-                else:
-                    targetB = (wB / totw)
-                    diffA = float(self.accepted_diff_sum.get("A", 0.0))
-                    diffB = float(self.accepted_diff_sum.get("B", 0.0))
-                    tot = diffA + diffB
-                    shareB = (diffB / tot) if tot > 0 else targetB
-
-                    prefer = "B" if shareB < targetB else "A"
-                    # If only one pool is enabled, force it.
-                    if wA == 0 and wB > 0:
-                        prefer = "B"
-                    elif wB == 0 and wA > 0:
-                        prefer = "A"
-                    pick = prefer
-
-                # Don't switch into a pool until we have a cached job for it.
-                if pick != current_pool and self.latest_notify_raw.get(pick) is not None:
-                    self.active_pool = pick
-                    ACTIVE_POOL.labels(pool="A").set(1 if pick == "A" else 0)
-                    ACTIVE_POOL.labels(pool="B").set(1 if pick == "B" else 0)
-                    current_pool = pick
-                    last_switch_ts = now
-                    log("pool_switched", sid=self.sid, to_pool=pick)
-                    switched_this_tick = True
-                    self.last_switch_mono = time.monotonic()
-
-                    # keep downstream sync in lockstep with scheduler switches
-                    self.last_forwarded_pool = pick
-
-                    # Immediately sync extranonce+diff and resend clean notify after switch
-                    await self.maybe_send_downstream_extranonce(pick)
-                    await self.maybe_send_downstream_diff(pick, force=True)
-                    await self.resend_active_notify_clean(pick, reason="switch")
 
             pick = current_pool
             raw = self.latest_notify_raw.get(pick)
@@ -1248,9 +1667,18 @@ class ProxySession:
             if raw is not None:
                 seq = int(self.notify_seq.get(pick, 0))
 
-                # Forward only when there's a new notify for this pool,
-                # or immediately after a switch (seq will differ).
-                if (seq > last_sent_seq.get(pick, 0)) or switched_this_tick:
+                # Skip if we already sent everything during the switch block above.
+                # resend_active_notify_clean() already sent extranonce+diff+notify.
+                if switched_this_tick:
+                    last_sent_seq[pick] = seq
+                    JOBS_FORWARDED.labels(pool=pick).inc()
+                    self.last_forwarded_jobid = jid
+                    self.last_forwarded_pool = pick
+                    if jid:
+                        self.job_owner[(pick, jid)] = pick
+                    log("job_forwarded", sid=self.sid, pool=pick, jobid=jid, seq=seq)
+                    log("job_forwarded_diff_state", sid=self.sid, pool=pick, jobid=jid, latest_diff=self.latest_diff.get(pick), last_dd=self.last_downstream_diff_by_pool.get(pick))
+                elif seq > last_sent_seq.get(pick, 0):
                     # Metrics truth: whichever pool we actually forward is 'active'.
                     self.active_pool = pick
                     ACTIVE_POOL.labels(pool="A").set(1 if pick == "A" else 0)
@@ -1259,7 +1687,7 @@ class ProxySession:
                     await self.maybe_send_downstream_extranonce(pick)
                     await self.maybe_send_downstream_diff(pick)
                     if jid:
-                        self.job_owner[(self.sid, jid)] = pick
+                        self.job_owner[(pick, jid)] = pick
 
                     # Force clean_jobs=True on downstream notify to avoid miners hashing stale jobs.
                     try:
@@ -1310,16 +1738,58 @@ class ProxySession:
 
             await asyncio.sleep(0.10)
 
+    # Main session runner
     async def run(self):
-        self.rA, self.wA = await self.connect_pool(self.cfg.poolA)
-        self.rB, self.wB = await self.connect_pool(self.cfg.poolB)
+        tasks = set()
 
-        tA = asyncio.create_task(self.pool_reader("A", self.rA))
-        tB = asyncio.create_task(self.pool_reader("B", self.rB))
-        tM = asyncio.create_task(self.miner_to_pools())
-        tF = asyncio.create_task(self.forward_jobs())
+        # Only connect to pools that have weight > 0.
+        # At 100/0, skip Pool B entirely (avoids crash if Pool B is unreachable).
+        # At 0/100, skip Pool A entirely.
+        if self.cfg.sched.wA > 0:
+            try:
+                self.rA, self.wA = await asyncio.wait_for(
+                    self.connect_pool(self.cfg.poolA), timeout=15.0)
+                self.pool_alive["A"] = True
+            except Exception as e:
+                # Pool A unreachable at startup — not fatal.
+                # Mark dead and let the reconnect wrapper handle recovery.
+                log("pool_initial_connect_failed", sid=self.sid, pool="A", err=str(e))
+                self.pool_alive["A"] = False
+                self.pool_fail_count["A"] = 1
+                self.pool_last_fail_mono["A"] = time.monotonic()
+                # Create a dummy reader so pool_reader_with_reconnect
+                # skips straight to its reconnect loop.
+                self.rA = asyncio.StreamReader()
+                self.rA.feed_eof()  # immediately signals "disconnected"
+            tasks.add(asyncio.create_task(
+                self.pool_reader_with_reconnect("A", self.rA)))
+        else:
+            self.pool_alive["A"] = False
+            log("pool_skipped_zero_weight", pool="A", wA=self.cfg.sched.wA)
 
-        done, pending = await asyncio.wait({tA, tB, tM, tF}, return_when=asyncio.FIRST_COMPLETED)
+        if self.cfg.sched.wB > 0:
+            try:
+                self.rB, self.wB = await asyncio.wait_for(
+                    self.connect_pool(self.cfg.poolB), timeout=15.0)
+                self.pool_alive["B"] = True
+            except Exception as e:
+                log("pool_initial_connect_failed", sid=self.sid, pool="B", err=str(e))
+                self.pool_alive["B"] = False
+                self.pool_fail_count["B"] = 1
+                self.pool_last_fail_mono["B"] = time.monotonic()
+                self.rB = asyncio.StreamReader()
+                self.rB.feed_eof()
+            tasks.add(asyncio.create_task(
+                self.pool_reader_with_reconnect("B", self.rB)))
+        else:
+            self.pool_alive["B"] = False
+            log("pool_skipped_zero_weight", pool="B", wB=self.cfg.sched.wB)
+
+        tasks.add(asyncio.create_task(self.miner_to_pools()))
+        tasks.add(asyncio.create_task(self.forward_jobs()))
+
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
         for t in pending:
             t.cancel()
         for t in done:
@@ -1328,6 +1798,7 @@ class ProxySession:
                 if exc:
                     raise exc
 
+    # Close all connections
     async def close(self):
         try:
             self.miner_w.close()
@@ -1342,6 +1813,7 @@ class ProxySession:
                 except Exception:
                     pass
 
+# Handle incoming miner connection
 async def handle_miner(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, cfg: AppCfg):
     peer = writer.get_extra_info("peername")
 
@@ -1372,20 +1844,9 @@ async def handle_miner(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         await sess.close()
         log("miner_disconnected", peer=str(peer))
 
-        # Cleanup per-session job_owner entries (key=(sid, jobid) -> pool)
-        try:
-            sid = getattr(sess, "sid", None)
-            jo = getattr(sess, "job_owner", None)
-            if sid is not None and isinstance(jo, dict):
-                keys = [k for k in list(jo.keys()) if isinstance(k, tuple) and len(k) >= 2 and k[0] == sid]
-                for k in keys:
-                    jo.pop(k, None)
-                log("job_owner_purged_on_disconnect", sid=str(sid), n=len(keys))
-        except Exception as e:
-            log("job_owner_purge_error", err=str(e))
-
+# Main entry point
 async def main():
-    cfg_path = os.environ.get("DPMP_CONFIG", os.path.join(os.path.dirname(__file__), "config.json"))
+    cfg_path = os.environ.get("DPMP_CONFIG", os.path.join(os.path.dirname(__file__), "config_v2.json"))
     cfg = load_config(cfg_path)
 
     # Log normalized scheduler targets (weights need not sum to 100; they are relative ratios).
@@ -1407,6 +1868,7 @@ async def main():
     log("weights_normalized", wA=wA, wB=wB, weights_raw=f"{getattr(cfg.sched, 'wA', None)}:{getattr(cfg.sched, 'wB', None)}", targetA=targetA, targetB=targetB)
     log("config_loaded", config=cfg_path, listen_host=cfg.listen_host, listen_port=cfg.listen_port, metrics_enabled=cfg.metrics_enabled, metrics_host=cfg.metrics_host, metrics_port=cfg.metrics_port)
 
+    # Start metrics server
     if cfg.metrics_enabled:
         try:
             start_http_server(cfg.metrics_port, addr=cfg.metrics_host)
@@ -1414,7 +1876,10 @@ async def main():
         except OSError as e:
             # Do not crash the proxy if metrics port is already in use.
             log("metrics_start_failed", host=cfg.metrics_host, port=cfg.metrics_port, err=str(e))
+
+    # Start listening for miners
     server = await asyncio.start_server(lambda r, w: handle_miner(r, w, cfg), cfg.listen_host, cfg.listen_port)
+    # Log listening addresses
     addrs = ", ".join(str(sock.getsockname()) for sock in (server.sockets or []))
     log(
         "dpmp_listening",
@@ -1437,7 +1902,7 @@ async def main():
             loop.add_signal_handler(s, _stop)
         except NotImplementedError:
             pass
-
+    # Keep running until stopped
     serve_task = asyncio.create_task(server.serve_forever())
     try:
         await stop.wait()
@@ -1483,4 +1948,14 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log("shutdown_keyboard_interrupt")
+    except Exception as e:
+        log("fatal_crash", err=str(e), err_type=type(e).__name__)
+        import traceback
+        traceback.print_exc()
+        raise
+    finally:
+        log("process_exiting")
