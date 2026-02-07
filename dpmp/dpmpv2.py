@@ -635,12 +635,31 @@ class ProxySession:
     async def maybe_send_downstream_extranonce(self, pool_key: str):
         # If we already raw-forwarded the pool's subscribe result,
         # do NOT re-send extranonce (pool-agnostic safety).
-        if getattr(self, "raw_subscribe_forwarded_pool", None) == pool_key and getattr(self, "last_downstream_extranonce_pool", None) == pool_key:
-            log("downstream_extranonce_skip_raw_subscribe", pool=pool_key,
-                raw_subscribe_forwarded_pool=getattr(self, "raw_subscribe_forwarded_pool", None),
-                last_downstream_extranonce_pool=getattr(self, "last_downstream_extranonce_pool", None))
-            return
-            
+        # The miner already received the extranonce inside the subscribe response.
+        # Sending mining.set_extranonce to miners that don't support it
+        # (NerdAxe, NerdMiner, etc.) causes disconnect/reboot loops.
+        if getattr(self, "raw_subscribe_forwarded_pool", None) == pool_key:
+            # Only safe to skip if no OTHER pool's extranonce has been sent yet.
+            # Once we send mining.set_extranonce for Pool B, the miner loses
+            # Pool A's subscribe extranonce.  Switching back to A requires an
+            # explicit send even though A was the raw-subscribe pool.
+            last_en_pool = getattr(self, "last_downstream_extranonce_pool", None)
+            if last_en_pool is not None and last_en_pool != pool_key:
+                # Miner currently has a DIFFERENT pool's extranonce — must send.
+                # Fall through to the normal send path below.
+                pass
+            else:
+                # Miner still has the subscribe extranonce — safe to skip.
+                en1 = self.extranonce1.get(pool_key)
+                en2s = self.extranonce2_size.get(pool_key)
+                if en1 is not None and en2s is not None:
+                    self.last_downstream_en1 = str(en1)
+                    self.last_downstream_en2s = int(en2s)
+                    self.last_downstream_extranonce_pool = pool_key
+                log("downstream_extranonce_skip_raw_subscribe", pool=pool_key,
+                    raw_subscribe_forwarded_pool=getattr(self, "raw_subscribe_forwarded_pool", None),
+                    last_downstream_extranonce_pool=getattr(self, "last_downstream_extranonce_pool", None))
+                return
         en1 = self.extranonce1.get(pool_key)
         en2s = self.extranonce2_size.get(pool_key)
         if not en1 or en2s is None:
@@ -652,12 +671,14 @@ class ProxySession:
             new_en1 = str(en1)
             new_en2s = int(en2s)
             
-            # CRITICAL FIX: Force send if this pool is NOT the handshake pool.
-            # The miner ONLY received extranonce from handshake pool during subscribe.
-            # Any other pool's extranonce MUST be explicitly sent.
+            # Force send if the miner's current extranonce context is for a
+            # DIFFERENT pool than the one we're switching to.  This is the only
+            # time we truly need to send mining.set_extranonce.
+            # When the same non-handshake pool sends a new notify with the same
+            # extranonce, we skip (no redundant sends that would crash NerdAxe).
             handshake = getattr(self, "handshake_pool", None)
             last_en_pool = getattr(self, "last_downstream_extranonce_pool", None)
-            force_send = (handshake is not None and pool_key != handshake)
+            force_send = (last_en_pool is not None and last_en_pool != pool_key)
 
             # Debug logging to see why force_send might be False
             log("downstream_extranonce_check", sid=self.sid, pool=pool_key,
@@ -898,8 +919,13 @@ class ProxySession:
                 log("miner_ready_for_jobs", sid=self.sid, worker=self.worker, handshake_pool=self.handshake_pool)
 
                 # Immediately push extranonce+diff so the miner has correct targets before submitting.
+                # Skip extranonce if the miner already received it via raw subscribe response
+                # (avoids mining.set_extranonce to miners that don't support it like NerdAxe).
                 try:
-                    await self.maybe_send_downstream_extranonce(self.handshake_pool)
+                    if getattr(self, "raw_subscribe_forwarded_pool", None) != self.handshake_pool:
+                        await self.maybe_send_downstream_extranonce(self.handshake_pool)
+                    else:
+                        log("post_auth_extranonce_skip_raw_subscribe", sid=self.sid, pool=self.handshake_pool)
                     await self.maybe_send_downstream_diff(self.handshake_pool)
                     log("post_auth_downstream_sync", sid=self.sid, pool=self.handshake_pool)
                 except Exception as e:
@@ -1183,15 +1209,25 @@ class ProxySession:
                             if en2s is not None:
                                 self.extranonce2_size[pool_key] = int(en2s)
                             log("subscribe_result", pool=pool_key, extranonce1=self.extranonce1[pool_key], extranonce2_size=self.extranonce2_size[pool_key])
+
                             # Immediately provide extranonce context to the miner for the active pool.
+                            # BUT skip if we just raw-forwarded the subscribe response — the miner
+                            # already has the extranonce from that response.  Sending mining.set_extranonce
+                            # to miners that don't support it (NerdAxe, NerdMiner, etc.) causes them
+                            # to disconnect or reboot in a loop.
                             try:
                                 active = self.last_forwarded_pool or self.handshake_pool
                                 if active == pool_key and self.extranonce1.get(pool_key) is not None and self.extranonce2_size.get(pool_key) is not None:
-                                    en_msg = {"method": "mining.set_extranonce", "params": [self.extranonce1[pool_key], int(self.extranonce2_size[pool_key])]}
-                                    log("downstream_send_extranonce", sid=self.sid, pool=pool_key, extranonce1=self.extranonce1[pool_key], extranonce2_size=int(self.extranonce2_size[pool_key]))
-                                    await write_line(self.miner_w, dumps_json(en_msg), "downstream")
+                                    if getattr(self, "raw_subscribe_forwarded_pool", None) == pool_key:
+                                        log("downstream_extranonce_skip_already_in_subscribe", sid=self.sid, pool=pool_key,
+                                            extranonce1=self.extranonce1[pool_key], extranonce2_size=int(self.extranonce2_size[pool_key]))
+                                    else:
+                                        en_msg = {"method": "mining.set_extranonce", "params": [self.extranonce1[pool_key], int(self.extranonce2_size[pool_key])]}
+                                        log("downstream_send_extranonce", sid=self.sid, pool=pool_key, extranonce1=self.extranonce1[pool_key], extranonce2_size=int(self.extranonce2_size[pool_key]))
+                                        await write_line(self.miner_w, dumps_json(en_msg), "downstream")
                             except Exception as e:
                                 log("downstream_send_extranonce_error", sid=self.sid, pool=pool_key, err=str(e))
+
                     except Exception as e:
                         log("subscribe_parse_error", pool=pool_key, err=str(e))
 
@@ -1207,13 +1243,20 @@ class ProxySession:
                     if ok_auth and (self.handshake_pool is not None) and (pool_key == self.handshake_pool) and (not already_switched_away):
                         try:
                             # Extranonce (if known)
+                            # Skip if we already raw-forwarded the subscribe response for this pool —
+                            # the miner already has the extranonce.  Sending mining.set_extranonce
+                            # to miners that don't support it (NerdAxe, NerdMiner, etc.) causes
+                            # disconnect/reboot loops.
                             en1 = self.extranonce1.get(pool_key)
                             en2s = self.extranonce2_size.get(pool_key)
                             if en1 is not None and en2s is not None:
-                                en_msg = {"method": "mining.set_extranonce", "params": [str(en1), int(en2s)]}
-                                log("post_auth_push_extranonce", sid=self.sid, pool=pool_key, extranonce1=str(en1), extranonce2_size=int(en2s))
-                                await write_line(self.miner_w, dumps_json(en_msg), "downstream")
-
+                                if getattr(self, "raw_subscribe_forwarded_pool", None) == pool_key:
+                                    log("post_auth_extranonce_skip_already_in_subscribe", sid=self.sid, pool=pool_key,
+                                        extranonce1=str(en1), extranonce2_size=int(en2s))
+                                else:
+                                    en_msg = {"method": "mining.set_extranonce", "params": [str(en1), int(en2s)]}
+                                    log("post_auth_push_extranonce", sid=self.sid, pool=pool_key, extranonce1=str(en1), extranonce2_size=int(en2s))
+                                    await write_line(self.miner_w, dumps_json(en_msg), "downstream")
                             # Difficulty (prefer latest pool diff if we have it)
                             diff = None
                             try:
@@ -1499,24 +1542,28 @@ class ProxySession:
                 log("pool_reconnected", sid=self.sid, pool=pool_key,
                     other_alive=self.pool_alive["B" if pool_key == "A" else "A"])
 
-                # ── CRITICAL: Force miner reconnect ───────────────────
+                # ── Force miner to re-handshake after pool reconnect ──────
                 # When a pool reconnects, it issues a NEW extranonce1.
-                # Most miners don't support mining.set_extranonce, so they
-                # ignore the new extranonce and keep using the old one.
-                # This causes 100% rejects ("low difficulty share").
+                # The miner must pick up this new extranonce or every share
+                # will be rejected ("low difficulty share").
                 #
-                # The only reliable fix is to tell the miner to reconnect
-                # so it goes through the full subscribe handshake again.
+                # We can't rely on mining.set_extranonce (NerdAxe, Nano3S,
+                # AvalonQ don't support it) or client.reconnect (NerdAxe/
+                # NerdMiner don't support it either).
+                #
+                # The most universally compatible approach: close the miner's
+                # TCP connection.  Every miner handles a dropped connection
+                # by reconnecting and doing a fresh subscribe handshake,
+                # which picks up the new extranonce naturally.
                 try:
-                    reconnect_msg = {"method": "client.reconnect", "params": []}
-                    await write_line(self.miner_w, dumps_json(reconnect_msg), "downstream")
-                    log("miner_reconnect_requested", sid=self.sid, pool=pool_key,
+                    log("miner_disconnect_for_reconnect", sid=self.sid, pool=pool_key,
                         reason="pool_reconnected_new_extranonce")
+                    self.miner_w.close()
+                    await self.miner_w.wait_closed()
                 except Exception as e:
-                    log("miner_reconnect_request_failed", sid=self.sid, pool=pool_key, err=str(e))
+                    log("miner_disconnect_for_reconnect_failed", sid=self.sid, pool=pool_key, err=str(e))
 
                 break  # exit reconnect loop → back to Phase 1 (pool_reader)
-
 
     # Scheduler: forward jobs to miner based on configured weights
     async def forward_jobs(self):
