@@ -26,7 +26,7 @@ rotate_if_needed() {
       if [ -f "${f}.${i}" ]; then mv -f "${f}.${i}" "${f}.${j}"; fi
       i=$((i - 1))
     done
-    mv -f "$f" "${f}.1"
+    cp -f "$f" "${f}.1"
     : > "$f"
   fi
 }

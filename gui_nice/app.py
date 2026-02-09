@@ -5,11 +5,14 @@ Developed with NiceGUI (https://nicegui.io)
 """
 
 import asyncio
+import io
 import json
 import os
 import subprocess
 import time
 import re
+import zipfile
+
 from datetime import date 
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -21,6 +24,7 @@ CONFIG_PATH = os.environ.get("DPMP_CONFIG_PATH", os.path.expanduser("~/dpmp/dpmp
 METRICS_URL  = os.environ.get("DPMP_METRICS_URL", "http://127.0.0.1:9210/metrics")
 DPMP_LOG_PATH = os.environ.get("DPMP_LOG_PATH", os.path.expanduser("~/dpmp/dpmpv2_run.log"))
 GUI_LOG_PATH  = os.environ.get("GUI_LOG_PATH", os.path.expanduser("~/dpmp/dpmpv2_gui.log"))
+WEIGHTS_OVERRIDE_PATH = os.path.join(os.path.dirname(os.environ.get("DPMP_CONFIG_PATH", os.path.expanduser("~/dpmp/dpmp/config_v2.json"))), "weights_override.json")
 
 HOST = os.environ.get("NICEGUI_HOST", "0.0.0.0")
 PORT = int(os.environ.get("NICEGUI_PORT", "8845"))
@@ -172,6 +176,33 @@ def read_text_file(path: str, max_bytes: int = 200_000) -> str:
 def read_json(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+# read weight defaults from config_v2.json
+def get_config_weights() -> tuple[int, int]:
+    """Read Pool A / Pool B weights from config_v2.json. Returns (wA, wB)."""
+    try:
+        cfg = read_json(CONFIG_PATH)
+        sched = cfg.get("scheduler", {})
+        wA = int(sched.get("poolA_weight", 50))
+        wB = int(sched.get("poolB_weight", 50))
+        return (wA, wB)
+    except Exception:
+        return (50, 50)
+
+# write weight override file (or delete it to revert to config defaults)
+def write_weight_override(wA: int, wB: int) -> None:
+    """Write weights_override.json so DPMP picks up the new weights on its next tick."""
+    obj = {"poolA_weight": int(wA), "poolB_weight": int(wB)}
+    write_json_atomic(WEIGHTS_OVERRIDE_PATH, obj)
+
+def delete_weight_override() -> None:
+    """Remove weights_override.json so DPMP reverts to config_v2.json defaults."""
+    try:
+        os.remove(WEIGHTS_OVERRIDE_PATH)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
 
 # write JSON file atomically
 def write_json_atomic(path: str, obj: Dict[str, Any]) -> None:
@@ -350,32 +381,146 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
     
     with ui.tab_panel(t_home):   
             
-        ui.label("System Paths:").classes("text-lg font-semibold")
-        ui.markdown(
-            f"""
+# ── Two-column layout: System Paths (left) + Weight Slider (right) ──
+        # On mobile, flex-wrap causes the slider card to stack below.
+        with ui.row().classes("w-full flex-wrap gap-6 items-stretch"):
+
+            # ── Left column: System Paths + Restart ──
+            with ui.card().classes("min-w-[280px]"):
+            #with ui.column().classes("flex-1 min-w-[280px]"):
+                ui.label("System Paths:").classes("text-lg font-semibold")
+                ui.markdown(
+                    f"""
 **Config:** `{CONFIG_PATH}`  
 **Metrics:** `{METRICS_URL}`  
 **DPMP log:** `{DPMP_LOG_PATH}`  
 **GUI log:** `{GUI_LOG_PATH}`  
 """
-        )
-        
-        with ui.row().classes("items-center gap-2"):
-            btn_restart = ui.button("Restart DPMP", icon="restart_alt")
-            lbl_restart = ui.label("").classes("text-sm")
-            
+                )
+
+                with ui.row().classes("items-center gap-2"):
+                    btn_restart = ui.button("Restart DPMP", icon="restart_alt")
+                    lbl_restart = ui.label("").classes("text-sm")
+
+            # ── Right column: Hashrate Allocation Slider ──
+            # Only show the slider if BOTH pools have weight > 0 in config.
+            # At 0/100 or 100/0, one pool is never connected — sliding toward it would break things.
+            cfg_wA, cfg_wB = get_config_weights()
+            cfg_total = cfg_wA + cfg_wB
+            cfg_slider_default = round((cfg_wA / cfg_total) * 100 / 5) * 5 if cfg_total > 0 else 50
+
+            # Clamp slider default to the 5-95 range
+            cfg_slider_default = max(5, min(95, cfg_slider_default))
+
+            # Mutable container so nested functions can update these values
+            _cfg = {"wA": cfg_wA, "wB": cfg_wB, "slider_default": cfg_slider_default}
+
+            if cfg_wA > 0 and cfg_wB > 0:
+                # If an override file exists (slider was moved), start there instead of config defaults
+                try:
+                    ov = read_json(WEIGHTS_OVERRIDE_PATH)
+                    ov_wA = int(ov.get("poolA_weight", -1))
+                    ov_wB = int(ov.get("poolB_weight", -1))
+                    ov_total = ov_wA + ov_wB
+                    if ov_wA >= 0 and ov_wB >= 0 and ov_total > 0:
+                        slider_initial = round((ov_wA / ov_total) * 100 / 5) * 5
+                        slider_initial = max(5, min(95, slider_initial))
+                    else:
+                        slider_initial = cfg_slider_default
+                except Exception:
+                    slider_initial = cfg_slider_default
+
+                with ui.card().classes("flex-1 min-w-[320px] max-w-[480px]"):
+                    ui.label("⚖ Hashrate Allocation").classes("text-base font-semibold").style("color: #6E93D6")
+
+                    with ui.row().classes("w-full items-center gap-3"):
+                        ui.label("Pool A").classes("text-sm font-semibold").style("color: #22d3ee")
+                        weight_slider = ui.slider(min=5, max=95, step=5, value=slider_initial).classes("flex-1")
+                        ui.label("Pool B").classes("text-sm font-semibold").style("color: #f59e0b")
+
+                    lbl_weight_pct = ui.html("", sanitize=False).classes("text-sm font-mono text-center w-full")
+                    lbl_weight_status = ui.html("", sanitize=False).classes("text-xs text-center w-full")
+
+                    with ui.row().classes("w-full justify-center"):
+                        btn_weight_reset = ui.button("↩ Reset to Config Defaults", icon="restart_alt").props("dense outline size=sm").classes("text-xs")
+
+        # Define slider functions outside the if-block so do_restart() can reference them safely
+        weight_slider_ref = weight_slider if (cfg_wA > 0 and cfg_wB > 0) else None
+
+        def _update_weight_display():
+            """Update the percentage label and status badge based on current slider value."""
+            if weight_slider_ref is None:
+                return
+            val = int(weight_slider_ref.value)
+            bval = 100 - val
+            lbl_weight_pct.content = (
+                f'<span style="color:#22d3ee">Pool A: {val}%</span>'
+                f' <span style="color:#555">/</span> '
+                f'<span style="color:#f59e0b">Pool B: {bval}%</span>'
+            )
+            if val == _cfg["slider_default"]:
+                lbl_weight_status.content = (
+                    f'<span style="color:#888">Using config defaults ({cfg_wA}/{cfg_wB})</span>'
+                )
+            else:
+                lbl_weight_status.content = (
+                    f'<span style="color:#f59e0b">● Live override active — DPMP is using these weights</span>'
+                )
+
+        def _on_slider_change(e):
+            """Called when the slider value changes — write override file immediately."""
+            val = int(e.value)
+            bval = 100 - val
+            _update_weight_display()
+            # Always write the override file, even if at config defaults.
+            # Only explicit Reset or Restart DPMP should delete the override.
+            # This prevents a second browser session from accidentally nuking
+            # an active override when its slider initializes.
+            write_weight_override(val, bval)
+
+        def _reset_weights():
+            """Reset slider to config defaults and remove override file."""
+            if weight_slider_ref is None:
+                return
+            weight_slider_ref.value = cfg_slider_default
+            delete_weight_override()
+            _update_weight_display()
+            ui.notify("Weights reset to config defaults", type="info")
+
+        if weight_slider_ref is not None:
+            weight_slider_ref.on_value_change(_on_slider_change)
+            btn_weight_reset.on_click(_reset_weights)
+            _update_weight_display()
+
 
         def do_restart():
+            # Delete weight override so DPMP starts fresh with config defaults
+            delete_weight_override()
+            # Reset slider back to current config defaults (recompute in case config changed)
+            if weight_slider_ref is not None:
+                _cfg["wA"], _cfg["wB"] = get_config_weights()
+                cfg_total = _cfg["wA"] + _cfg["wB"]
+                if cfg_total > 0:
+                    _cfg["slider_default"] = round((_cfg["wA"] / cfg_total) * 100 / 5) * 5
+                    _cfg["slider_default"] = max(5, min(95, _cfg["slider_default"]))
+                else:
+                    _cfg["slider_default"] = 50
+                weight_slider_ref.value = _cfg["slider_default"]
+                _update_weight_display()
+
+
             ok, msg = restart_dpmpv2()
             lbl_restart.text = f"[{now_utc()}] {msg}"
             if ok:
                 ui.notify("DPMP restarted", type="positive")
             else:
                 ui.notify(f"restart failed: {msg}", type="negative")
-            
+
         btn_restart.on_click(do_restart)
 
         ui.separator()
+
+
         lbl_status = ui.label("Status").classes("text-lg font-semibold").style('color: blue;')
 
         
@@ -390,11 +535,14 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             lbl_rej = ui.html("<b>Rejected</b>: A … / B …", sanitize=False).classes("text-sm").tooltip("Total rejected shares per pool")
             lbl_jobs = ui.html("<b>Jobs</b>: A … / B …", sanitize=False).classes("text-sm").tooltip("Total jobs forwarded per pool")
             lbl_dif = ui.html("<b>SumDiff</b>: A … / B …", sanitize=False).classes("text-sm").tooltip("Sum of difficulty of accepted shares per pool")
-            lbl_rat = ui.html("<b>Diff Ratio</b>: A …% / B …%", sanitize=False).classes("text-sm").tooltip("Percentage of accepted difficulty per pool")
+            lbl_rat = ui.html("<b>Diff Ratio</b>: A …% / B …%", sanitize=False).classes("text-sm").tooltip("Percentage of accepted difficulty per pool (all-time since last restart)")
+
+        with ui.row().classes("gap-6 items-center"):
+            lbl_recent_rat = ui.html("<b>Recent Ratio (2min)</b>: waiting for data…", sanitize=False).classes("text-sm font-semibold").tooltip("Rolling 2-minute hashrate allocation ratio — reacts to slider changes within minutes").style("color: #6E93D6")
             
 
         ui.separator()
-        lbl_note = ui.html("<b>Note</b>: The <i>SumDiff</i> and <i>Diff Ratio</i> metrics above are the best indicators for measuring proxy performance...over time the <i>Diff Ratio</i> values should converge toward the configured pool ratio in Scheduler Settings. See the <b>About</b> tab for more details as well as setup instructions.", sanitize=False).classes("text-sm")
+        lbl_note = ui.html("<b>Note</b>: The <b>Recent Ratio</b> above is the best indicator for real-time hashrate allocation — it shows what DPMP is doing <i>right now</i>. The all-time <i>Diff Ratio</i> reflects cumulative history since the last restart and may take a long time to shift after a weight change. See the <b>About</b> tab for more details.", sanitize=False).classes("text-sm")
 
         ui.separator()
 
@@ -437,6 +585,11 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             sw_dark.value = is_dark
 
         ui.timer(0.0, _init_dark_from_storage, once=True)
+
+        # Rolling window for "Recent Ratio" — stores (timestamp, difA, difB) snapshots.
+        # We keep ~2 minutes of history (at 2s poll interval, that's ~60 samples).
+        _recent_dif_history: list[tuple[float, float, float]] = []
+        _RECENT_WINDOW_S = 300.0  # 5-minute rolling window
 
         # periodic status update
         def update_home_status() -> None:
@@ -484,8 +637,6 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                 difB = _prom_gauge_value(raw, "dpmp_accepted_difficulty_sum_total", pool="B") or 0.0
 
                 total_dif = difA + difB
-                ratioA = (difA / total_dif * 100.0) if total_dif > 0.0 else 0.0
-                ratioB = (difB / total_dif * 100.0) if total_dif > 0.0 else 0.0
                 pctA = 100*difA/(total_dif or 1)
                 pctB = 100*difB/(total_dif or 1)
 
@@ -496,7 +647,36 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                 lbl_rej.content = f"<b>Rejected</b>: A {int(rejA)} / B {int(rejB)} ({rejpA:.2f}% / {rejpB:.2f}%)"
                 lbl_jobs.content = f"<b>Jobs</b>: A {int(jobA)} / B {int(jobB)}"
                 lbl_dif.content = f"<b>SumDiff</b>: A {int(difA)} / B {int(difB)}"
-                lbl_rat.content = f"<b>Diff Ratio</b>: A {pctA:.2f}% / B {pctB:.2f}%"
+                lbl_rat.content = f"<b>Diff Ratio (all-time)</b>: A {pctA:.2f}% / B {pctB:.2f}%"
+
+                # ── Rolling 2-minute ratio ──────────────────────────────
+                now_mono = time.monotonic()
+                _recent_dif_history.append((now_mono, difA, difB))
+
+                # Trim entries older than the window
+                cutoff = now_mono - _RECENT_WINDOW_S
+                while _recent_dif_history and _recent_dif_history[0][0] < cutoff:
+                    _recent_dif_history.pop(0)
+
+                if len(_recent_dif_history) >= 2:
+                    oldest_ts, oldest_A, oldest_B = _recent_dif_history[0]
+                    delta_A = difA - oldest_A
+                    delta_B = difB - oldest_B
+                    delta_total = delta_A + delta_B
+                    if delta_total > 0:
+                        rpctA = 100.0 * delta_A / delta_total
+                        rpctB = 100.0 * delta_B / delta_total
+                        window_s = now_mono - oldest_ts
+                        lbl_recent_rat.content = (
+                            f'<b>Recent Ratio ({int(window_s)}s)</b>: '
+                            f'<span style="color:#22d3ee">A {rpctA:.1f}%</span>'
+                            f' / '
+                            f'<span style="color:#f59e0b">B {rpctB:.1f}%</span>'
+                        )
+                    else:
+                        lbl_recent_rat.content = "<b>Recent Ratio (2min)</b>: no new shares yet…"
+                else:
+                    lbl_recent_rat.content = "<b>Recent Ratio (2min)</b>: collecting data…"
 
             except Exception as e:
                 lbl_pool.content = "<b>Active pool</b>: error"
@@ -834,7 +1014,24 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                 ui.notify(f"write failed: {e}", type="negative")
                 return
 
+            # Delete weight override so DPMP starts fresh with config defaults
+            delete_weight_override()
+            # Reset slider back to NEW config defaults (recompute from saved config)
+            if weight_slider_ref is not None:
+                new_wA = _to_int(sch_weightA.value, 50)
+                new_wB = _to_int(sch_weightB.value, 50)
+                new_total = new_wA + new_wB
+                if new_total > 0:
+                    _cfg["slider_default"] = round((new_wA / new_total) * 100 / 5) * 5
+                    _cfg["slider_default"] = max(5, min(95, _cfg["slider_default"]))
+                else:
+                    _cfg["slider_default"] = 50
+                weight_slider_ref.value = _cfg["slider_default"]
+                _update_weight_display()
+
             ok, msg = restart_dpmpv2()
+
+
             lbl_cfg.text = f"[{now_utc()}] saved; {msg}"
             ui.notify("saved + restarted" if ok else f"saved; restart failed: {msg}",
                     type=("positive" if ok else "warning"))
@@ -855,8 +1052,59 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             #btn_jump   = ui.button("jump to end", icon="south")
             lbl_logs   = ui.label("").classes("text-xs text-gray-500")
 
-        log_box = ui.textarea(value="").props("rows=24 spellcheck=false wrap=off").classes("w-full font-mono")
+        with ui.row().classes("items-center gap-3"):
+            chk_redact = ui.checkbox("Redact Wallet Addresses").tooltip(
+                "Replace BTC/BCH wallet addresses with [REDACTED] before downloading")
+            btn_download = ui.button("Download Log (.zip)", icon="download").props("outline dense")
 
+        def _redact_wallets(text: str) -> str:
+            """Replace BTC and BCH wallet addresses with [REDACTED].
+
+            Patterns matched:
+              - BTC bech32:  bc1q... / bc1p...  (42-62 chars)
+              - BCH cashaddr: bitcoincash:q... / bitcoincash:p...
+              - BCH short:    q + 41 hex chars  (common in logs)
+              - Legacy P2PKH: 1 + 25-34 base58 chars
+              - Legacy P2SH:  3 + 25-34 base58 chars
+            """
+            # BTC bech32 (mainnet)
+            text = re.sub(r'\bbc1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{38,58}\b', '[REDACTED]', text)
+            # BCH cashaddr (with prefix)
+            text = re.sub(r'\bbitcoincash:[qp][a-z0-9]{41,}\b', '[REDACTED]', text)
+            # BCH short cashaddr (no prefix — starts with q or p + 41 alnum)
+            text = re.sub(r'\b[qp][a-z0-9]{41,55}\b', '[REDACTED]', text)
+            # Legacy addresses (1... or 3...)
+            text = re.sub(r'\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b', '[REDACTED]', text)
+            return text
+
+        def _do_download():
+            """Read the full log, optionally redact wallets, zip it, trigger browser download."""
+            try:
+                # Read the FULL log (not truncated like the display)
+                log_text = read_text_file(DPMP_LOG_PATH, max_bytes=100_000_000)  # up to ~100 MB
+
+                if chk_redact.value:
+                    log_text = _redact_wallets(log_text)
+
+                # Build zip in memory
+                buf = io.BytesIO()
+                with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                    zf.writestr("dpmpv2_run.log", log_text)
+                buf.seek(0)
+                zip_bytes = buf.getvalue()
+
+                # Generate filename with timestamp
+                ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+                filename = f"dpmpv2_log_{ts}.zip"
+
+                ui.download(zip_bytes, filename=filename, media_type="application/zip")
+                ui.notify(f"Downloading {filename} ({len(zip_bytes)//1024} KB)", type="positive")
+            except Exception as e:
+                ui.notify(f"Download failed: {e}", type="negative")
+
+        btn_download.on_click(_do_download)
+
+        log_box = ui.textarea(value="").props("rows=24 spellcheck=false wrap=off").classes("w-full font-mono")
 
         def apply_ui_state():
             state.log_filter = inp_filter.value or ""
