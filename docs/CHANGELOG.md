@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.2 - 2026-02-09
+- Fixes for ck-type pools and bootstrap sequence
+- Add realtime hashrate allocation slider to GUI
+
 ## 2.0.1 - 2026-02-07
 - Fixed mining.set_extranonce and client.reconnect issues for NerdAxe Gamma
 - Fixed Braiins BM-101 initialization and handshake issues

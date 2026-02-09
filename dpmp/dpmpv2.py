@@ -54,9 +54,30 @@ JOBS_FORWARDED = Counter("dpmp_jobs_forwarded_total", "Jobs forwarded to miner",
 ACCEPTED_DIFFICULTY_SUM = Counter("dpmp_accepted_difficulty_sum", "Sum of difficulty for accepted shares", ["pool"])
 DIFF_DOWNSTREAM = Gauge("dpmp_downstream_difficulty", "Current downstream difficulty")
 ACTIVE_POOL = Gauge("dpmp_active_pool", "Active pool (1=active,0=inactive)", ["pool"])
-SWITCH_SUBMIT_GRACE_S = 2.0  # seconds to tolerate stale submits right after a pool switch (was 0.75)
+SWITCH_SUBMIT_GRACE_S = 4.0  # seconds to tolerate stale submits right after a pool switch (was 0.75)
+# Path to optional weights override file (written by GUI slider, polled by scheduler)
+WEIGHTS_OVERRIDE_PATH = None  # set in main() from config path
 MAX_CACHED_NOTIFY_AGE_S = 20.0  # don't switch into pool if cached notify older than this
-MAX_CONVERGE_DEVIATION = 0.02 # default max deviation (2%) to trigger urgent pool switch 
+MAX_CONVERGE_DEVIATION = 0.05 # default max deviation (5%) to trigger urgent pool switch
+
+# Read weight override file if it exists (written by GUI slider)
+def read_weight_override() -> tuple[int, int] | None:
+    """Return (wA, wB) from weights_override.json, or None if file missing/invalid."""
+    if WEIGHTS_OVERRIDE_PATH is None:
+        return None
+    try:
+        with open(WEIGHTS_OVERRIDE_PATH, "rb") as f:
+            obj = json.loads(f.read())
+        wA = int(obj.get("poolA_weight", -1))
+        wB = int(obj.get("poolB_weight", -1))
+        if wA < 0 or wB < 0 or (wA == 0 and wB == 0):
+            return None
+        return (wA, wB)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
 
 # Get current UTC time as ISO 8601 string
 def now_utc() -> str:
@@ -531,13 +552,16 @@ class ProxySession:
             await self.send_upstream(pcfg.key, sub)
             log("pool_bootstrap_subscribe_sent", sid=self.sid, pool=pcfg.key, id=sid_sub)
 
-            aid = self.next_internal_id()
-            self._internal_ids.add(aid)
-            self._internal_authorize_id[pcfg.key] = aid
-            user = f"{pcfg.wallet}.dpmp_bootstrap" if pcfg.wallet else "dpmp_bootstrap"
-            auth = {"id": aid, "method": "mining.authorize", "params": [user, "x"]}
-            await self.send_upstream(pcfg.key, auth)
-            log("pool_bootstrap_authorize_sent", sid=self.sid, pool=pcfg.key, id=aid, user=user)
+            # remove the initial bootstrap as it does not play well with ckpool (Bassin), we
+            # were getting "Worker Mismatch" from Bassin.
+            # so instead of bootstrap then subscribe, we just subscribe which seems to be enough 
+            #aid = self.next_internal_id()
+            #self._internal_ids.add(aid)
+            #self._internal_authorize_id[pcfg.key] = aid
+            #user = f"{pcfg.wallet}.dpmp_bootstrap" if pcfg.wallet else "dpmp_bootstrap"
+            #auth = {"id": aid, "method": "mining.authorize", "params": [user, "x"]}
+            #await self.send_upstream(pcfg.key, auth)
+            #log("pool_bootstrap_authorize_sent", sid=self.sid, pool=pcfg.key, id=aid, user=user)
         except Exception as e:
             log("pool_bootstrap_error", sid=self.sid, pool=pcfg.key, err=str(e))
 
@@ -1313,11 +1337,22 @@ class ProxySession:
                     p = self.submit_owner.pop(mid)
                     d = float(self.submit_diff.pop(mid, 0.0))
                     ok = bool(msg.get("result"))
+
                     if ok:
                         SHARES_ACCEPTED.labels(pool=p).inc()
                         ACCEPTED_DIFFICULTY_SUM.labels(pool=p).inc(d)
-                        self.accepted_diff_sum[p] = self.accepted_diff_sum.get(p, 0.0) + d
-                        log("share_result", sid=self.sid, pool=p, accepted=True)
+                        # Cap the difficulty credited to the scheduler counters.
+                        # Without this, a single high-diff share on the minority
+                        # pool can swing the ratio 30+ points (e.g., 80/20 → 50/50),
+                        # causing a multi-minute recovery on the majority pool.
+                        # Cap: one share can move the ratio by at most ~5%.
+                        _total = self.accepted_diff_sum.get("A", 0.0) + self.accepted_diff_sum.get("B", 0.0)
+                        _max_credit = _total * 0.10 if _total > 0 else d
+                        _credit = min(d, _max_credit) if _max_credit > 0 else d
+                        self.accepted_diff_sum[p] = self.accepted_diff_sum.get(p, 0.0) + _credit
+                        log("share_result", sid=self.sid, pool=p, accepted=True,
+                            diff=d, credit=round(_credit, 1), capped=(d != _credit))
+
                     else:
                         SHARES_REJECTED.labels(pool=p).inc()
                         log("share_result", sid=self.sid, pool=p, accepted=False, error=msg.get("error"))
@@ -1611,9 +1646,31 @@ class ProxySession:
                     await asyncio.sleep(0.10)
                     continue
 
-            # ── Normal scheduling logic ──────────────────────────────
-            # Time-slice switching (ratio by time), not by notify frequency.
-            if (now - last_switch_ts) >= min_switch:
+            # ── Normal scheduling logic ──────────────────────────────────
+            # Read weights early so we can scale the min-switch time.
+            _override = read_weight_override()
+            if _override is not None:
+                wA, wB = _override
+            else:
+                wA = max(0, int(getattr(self.cfg.sched, "wA", getattr(self.cfg.sched, "poolA_weight", 0))))
+                wB = max(0, int(getattr(self.cfg.sched, "wB", getattr(self.cfg.sched, "poolB_weight", 0))))
+            totw = wA + wB
+
+            # Scale min_switch by the active pool's target weight.
+            # At 15/85, a full 50s slice on Pool A massively overshoots
+            # (the miner should only spend ~15% of time on A).
+            # Formula: effective_min = min_switch × (2 × active_weight_fraction)
+            # At 50/50: 50 × (2×0.50) = 50s (unchanged)
+            # At 15/85 on A: 50 × (2×0.15) = 15s
+            # At 15/85 on B: 50 × (2×0.85) = 50s (capped at min_switch)
+            # Floor of 10s prevents sub-second thrashing.
+            if totw > 0:
+                _active_frac = (wA / totw) if current_pool == "A" else (wB / totw)
+            else:
+                _active_frac = 0.5
+            _effective_min_switch = max(float(slice_s), min(float(min_switch), float(min_switch) * _active_frac * 2.0))
+
+            if (now - last_switch_ts) >= _effective_min_switch:
                 # Choose the pool that is behind in accepted difficulty share vs target.
                 # BUT if one or more pool has failed....
                 # Read configured weights, then override dead pools to 0.
@@ -1621,8 +1678,34 @@ class ProxySession:
                 # the scheduler acts as if it has zero weight (all hashrate
                 # goes to the surviving pool).  When the pool recovers,
                 # pool_alive flips back to True and the original weight applies.
-                wA = max(0, int(getattr(self.cfg.sched, "wA", getattr(self.cfg.sched, "poolA_weight", 0))))
-                wB = max(0, int(getattr(self.cfg.sched, "wB", getattr(self.cfg.sched, "poolB_weight", 0))))
+
+
+                # Log when weights change (slider moved or override removed)
+                _prev = getattr(self, "_last_effective_weights", None)
+                _curr = (wA, wB)
+                if _prev != _curr:
+                    # Reseed accepted difficulty counters to match the NEW target ratio.
+                    # Why not reset to 0/0? Because after a reset, the very first share
+                    # creates a massive deviation (e.g., 100%/0%) and triggers urgent
+                    # oscillation. Instead, keep the total difficulty but redistribute
+                    # it to match the new targets, so the scheduler starts balanced.
+                    old_diffA = self.accepted_diff_sum.get("A", 0.0)
+                    old_diffB = self.accepted_diff_sum.get("B", 0.0)
+                    old_total = old_diffA + old_diffB
+                    new_total = wA + wB
+                    if old_total > 0 and new_total > 0:
+                        self.accepted_diff_sum["A"] = old_total * (wA / new_total)
+                        self.accepted_diff_sum["B"] = old_total * (wB / new_total)
+                    else:
+                        self.accepted_diff_sum["A"] = 0.0
+                        self.accepted_diff_sum["B"] = 0.0
+                    log("weights_override_changed", sid=self.sid,
+                        wA=wA, wB=wB, prev=_prev,
+                        source="slider" if _override is not None else "config",
+                        old_diffA=round(old_diffA, 1), old_diffB=round(old_diffB, 1),
+                        new_diffA=round(self.accepted_diff_sum["A"], 1),
+                        new_diffB=round(self.accepted_diff_sum["B"], 1))
+                    self._last_effective_weights = _curr
 
                 if not self.pool_alive.get("A", False):
                     if wA > 0:
@@ -1635,7 +1718,7 @@ class ProxySession:
                             configured_weight=wB, effective_weight=0, reason="pool_dead")
                     wB = 0
 
-                totw = wA + wB
+                totw = wA + wB 
 
                 reason = "hold_current"
                 pick = current_pool
@@ -1643,6 +1726,22 @@ class ProxySession:
                 if totw > 0:
                     targetA = (wA / totw)
                     targetB = (wB / totw)
+
+                    # Decay accepted difficulty so old history doesn't dominate.
+                    # But use a VERY gentle decay (0.9995) to avoid making the
+                    # counters volatile — especially for the minority pool at
+                    # lopsided ratios (e.g., 80/20) where a single share can
+                    # swing the ratio by 20+ points if the baseline is too small.
+                    #
+                    # 0.9995 per tick means effective memory of ~2000 ticks.
+                    # At 30s ticks that's ~16 hours before old data fades to 50%.
+                    # The weight-change reseed handles the "slider moved" case,
+                    # so decay only needs to handle very long-term drift.
+
+                    _decay = 0.9995
+                    self.accepted_diff_sum["A"] = self.accepted_diff_sum.get("A", 0.0) * _decay
+                    self.accepted_diff_sum["B"] = self.accepted_diff_sum.get("B", 0.0) * _decay
+
 
                     diffA = float(self.accepted_diff_sum.get("A", 0.0))
                     diffB = float(self.accepted_diff_sum.get("B", 0.0))
@@ -1662,7 +1761,17 @@ class ProxySession:
                     #   2) The current pool is MORE than MAX_CONVERGE_DEVIATION over its target (urgent correction)
                     #   3) MAX_CONVERGE_DEVIATION can be configured to adjust the urgency threshold (default 2%).
                     time_on_pool = now - last_switch_ts
-                    urgent = current_deviation > MAX_CONVERGE_DEVIATION
+
+                    # Compute minority_frac early — needed by both urgency and hysteresis checks.
+                    minority_frac = min(targetA, targetB)
+
+                    # Scale urgency threshold by minority pool fraction.
+                    # At 50/50: threshold = max(0.05, 0.50) = 0.50 → urgent almost never fires
+                    # At 80/20: threshold = max(0.05, 0.20) = 0.20 → only truly large deviations
+                    # At 95/5:  threshold = max(0.05, 0.05) = 0.05 → tighter at extreme ratios
+                    _urgency_threshold = max(MAX_CONVERGE_DEVIATION, minority_frac)
+                    urgent = current_deviation > _urgency_threshold
+
                     if time_on_pool < slice_s and not urgent:
                         # Not enough time elapsed and not urgently over-target; skip this tick
                         pick = current_pool
@@ -1679,13 +1788,33 @@ class ProxySession:
                             prefer = "A"
                             reason = "force_A_only"
 
+                        # Hysteresis: don't switch to the minority pool for tiny
+                        # deviations. A 30s slice on the minority pool creates a
+                        # large overshoot; only switch when the deficit is big
+                        # enough to justify that slice.
+                        # At 15/85 on B: minority_frac=0.15, threshold=0.0375
+                        #   → only switch B→A when shareA < 0.1125 (meaningfully behind)
+                        # At 50/50: minority_frac=0.50, threshold=0.125
+                        #   → rarely triggers (deviation seldom that large at 50/50)
+
+                        if prefer != current_pool and not urgent:
+                            hysteresis = minority_frac / 4.0
+                            if abs(current_deviation) < hysteresis:
+                                prefer = current_pool
+                                reason = "hold_current_hysteresis"
+
                         pick = prefer
 
-                    log("scheduler_tick", sid=self.sid, current=current_pool, pick=pick,
-                        reason=reason, shareA=round(shareA, 4), shareB=round(shareB, 4),
-                        targetA=round(targetA, 4), targetB=round(targetB, 4),
-                        deviation=round(current_deviation, 4), time_on_pool=round(time_on_pool, 1),
-                        urgent=urgent)
+                    # Throttle scheduler_tick: only log on switch decisions or every 60s as heartbeat
+                    _now_mono = time.monotonic()
+                    _last_tick_log = getattr(self, "_last_scheduler_tick_log", 0.0)
+                    if pick != current_pool or urgent or (_now_mono - _last_tick_log) >= 60.0:
+                        log("scheduler_tick", sid=self.sid, current=current_pool, pick=pick,
+                            reason=reason, shareA=round(shareA, 4), shareB=round(shareB, 4),
+                            targetA=round(targetA, 4), targetB=round(targetB, 4),
+                            deviation=round(current_deviation, 4), time_on_pool=round(time_on_pool, 1),
+                            urgent=urgent)
+                        self._last_scheduler_tick_log = _now_mono
 
                 # Don't switch into a pool until we have a cached job for it.
                 if pick != current_pool:
@@ -1893,7 +2022,9 @@ async def handle_miner(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
 
 # Main entry point
 async def main():
+    global WEIGHTS_OVERRIDE_PATH
     cfg_path = os.environ.get("DPMP_CONFIG", os.path.join(os.path.dirname(__file__), "config_v2.json"))
+    WEIGHTS_OVERRIDE_PATH = os.path.join(os.path.dirname(cfg_path), "weights_override.json")
     cfg = load_config(cfg_path)
 
     # Log normalized scheduler targets (weights need not sum to 100; they are relative ratios).
