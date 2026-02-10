@@ -1,21 +1,22 @@
 [Unit]
-Description=DPMP v2 NiceGUI (non-docker runtime)
+Description=DPMP v2 NiceGUI (non-docker)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-WorkingDirectory=%h/dpmp_runtime
-Environment=DPMP_CONFIG_PATH=%h/dpmp_runtime/dpmp/config_v2.json
+WorkingDirectory=%h/dpmp
+Environment=DPMP_CONFIG_PATH=%h/dpmp/dpmp/config_v2.json
 Environment=DPMP_METRICS_URL=http://127.0.0.1:9210/metrics
-Environment=DPMP_LOG_PATH=%h/dpmp_runtime/dpmpv2_run.log
-Environment=GUI_LOG_PATH=%h/dpmp_runtime/dpmpv2_gui.log
+Environment=DPMP_LOG_PATH=%h/dpmp/dpmpv2_run.log
+Environment=GUI_LOG_PATH=%h/dpmp/dpmpv2_gui.log
 Environment=NICEGUI_HOST=0.0.0.0
 Environment=NICEGUI_PORT=8855
-ExecStart=%h/dpmp_runtime/.venv/bin/python -u %h/dpmp_runtime/gui_nice/app.py
+ExecStart=%h/dpmp/.venv/bin/python -u %h/dpmp/gui_nice/app.py
 Restart=always
 RestartSec=2
-StandardOutput=append:%h/dpmp_runtime/dpmpv2_gui.log
-StandardError=append:%h/dpmp_runtime/dpmpv2_gui.log
+StandardOutput=append:%h/dpmp/dpmpv2_gui.log
+StandardError=append:%h/dpmp/dpmpv2_gui.log
 
 [Install]
 WantedBy=default.target
+
