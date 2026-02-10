@@ -81,17 +81,21 @@ then
   exit 1
 fi
 
-
 # ----------------------------------------------------------------------
 # Python virtual environment
 # ----------------------------------------------------------------------
 echo "Setting up Python virtual environment..."
-if [ ! -d ".venv" ]; then
+
+if [ ! -x ".venv/bin/python" ]; then
+  echo "Creating Python virtual environment..."
+  run rm -rf .venv
   run python3 -m venv .venv
 fi
 
+echo "Installing Python dependencies..."
 run .venv/bin/pip install -U pip
 run .venv/bin/pip install -r requirements.txt
+
 
 # ----------------------------------------------------------------------
 # Default config (only if missing)
