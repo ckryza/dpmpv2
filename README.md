@@ -107,7 +107,6 @@ The proxy is intentionally **transparent**: miners and pools do not need to be m
 ### 🖥 Web UI
 - **NiceGUI-based interface** (primary)
 - Live config editing, view logs, and status
-- Legacy FastAPI GUI is deprecated and disabled by default
 
 ---
 
@@ -137,8 +136,9 @@ The design emphasizes:
 - ✅ Stable for long-running operation
 - 🔧 Configuration, install, and GUI documentation intentionally evolving
 - 🚧 Future work planned around:
-  - richer GUI (NiceGUI)
-  - improved dashboards
+  - testing with additional miners to confirm compatibility
+  - testing with additional pools to confirm compatibility
+  - richer GUI (using NiceGUI)
   - additional scheduling strategies
 
 ---

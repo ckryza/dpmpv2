@@ -6,8 +6,10 @@
   },
   "listen": {
     "host": "0.0.0.0",
-    "port": 3351
+    "port": 3359
   },
+  "listen_host": "0.0.0.0",
+  "listen_port": 3359,
   "logging": {
     "allow": [],
     "deny": [
@@ -19,6 +21,7 @@
       "downstream_extranonce_set",
       "downstream_diff_set",
       "job_forwarded",
+      "miner_method",
       "pool_notify",
       "notify_clean_forced"
     ],
@@ -28,20 +31,23 @@
   "metrics": {
     "enabled": true,
     "host": "0.0.0.0",
-    "port": 9210
+    "port": 9221
   },
+  "metrics_enabled": true,
+  "metrics_host": "0.0.0.0",
+  "metrics_port": 9221,
   "pools": {
     "A": {
-      "host": "192.168.0.25",
-      "name": "BCH",
+      "host": "POOL_A_HOST",
+      "name": "POOL_A",
       "port": 3333,
-      "wallet": "bitcoincash:qqlldmmc978u5u7uzas8cakxgfftraquxvjhcc8a3q"
+      "wallet": "POOL_A_WALLET"
     },
     "B": {
-      "host": "127.0.0.1",
-      "name": "BTC",
-      "port": 2018,
-      "wallet": "bc1q9qrn7lsdnpy8w33dsdnu6cr4jdpg53zexgxh59"
+      "host": "POOL_B_HOST",
+      "name": "POOL_B",
+      "port": 3333,
+      "wallet": "POOL_B_WALLET"
     }
   },
   "scheduler": {
