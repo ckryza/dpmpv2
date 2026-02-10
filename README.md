@@ -8,7 +8,7 @@ This repository contains the **v2 architecture**, which is a ground-up redesign 
 
 ---
 
-## Quick Install (Non-Docker, UmbrelOS)
+## Quick Install (Non-Docker)
 
 ```bash
 git clone https://github.com/ckryza/dpmpv2.git ~/dpmp
@@ -19,12 +19,27 @@ cd ~/dpmp
 After install:
 - **Stratum**: `:3351`
 - **Metrics**: `:9210/metrics`
-- **Dashboard**: `http://<umbrel-ip>:8855/`
+- **Dashboard**: `http://<dpmp-proxy-ip>:8855/`
+
+### Dry-run (no changes)
+
+You can preview what the installer would do without making any changes:
+
+```bash
+cd ~/dpmp
+./installer/install.sh --check
+```
 
 ### Upgrade
 ```bash
 cd ~/dpmp
 ./installer/upgrade.sh
+```
+### Dry-run upgrade (no changes)
+
+```bash
+cd ~/dpmp
+./installer/upgrade.sh --check
 ```
 
 ### Uninstall (keeps config/logs)
@@ -52,8 +67,18 @@ What it **does NOT** do:
 - Does not require root
 
 ⚠️ **After first launch**:
-Open the **DPMP** GUI interface `(e.g., browse to '<ip-of-box-DPMP-is-running-on>:8855/')`, click on the **Config** tab, and **update Pool A and Pool B settings** (host, port, name, wallet) before mining. Pay special attention to the wallet addresses and make sure the wallet address you add is correct for the pool you are adding it to.
+Open the **DPMP** GUI interface `(e.g., browse to '<dpmp-proxy-ip>:8855/')`, click on the **Config** tab, and **update Pool A and Pool B settings** (host, port, name, wallet) before mining. Pay special attention to the wallet addresses and make sure the wallet address you add is correct for the pool you are adding it to.
 
+## Error Reporting
+
+If you encounter errors associated either with a particular miner or a particular pool:
+
+- Please make sure that all events are being logged on the Config tab
+- Click APPLY + RESTART to restart DPMP and recreate the error
+- Click on the Download Log button on the Logs tab
+- Send a description of the problem (i.e., miner-related or pool-related and identify the miner or pool) to dpmp.project@gmail.com and attach the log file.
+
+We have tested DPMP with a number of different miners and pools but it is by no means an exhaustive list. The log data you provide will help us to expand the list of supported miners and pools.
 
 ## What DPMP v2 Does
 
@@ -78,6 +103,7 @@ The proxy is intentionally **transparent**: miners and pools do not need to be m
 ### 🔀 Dual-Pool Scheduling
 - Simultaneous connections to Pool **A** and Pool **B**
 - Weight-based scheduling (e.g. `50:50`, `70:30`)
+- Realtime weighting adjustments via GUI slider
 - Time-sliced switching with stickiness controls
 - Safe handling of pool transitions to avoid stale or invalid submits
 
