@@ -5,6 +5,23 @@ REPO_URL="https://github.com/ckryza/dpmpv2.git"
 INSTALL_DIR="${HOME}/dpmp"
 SYSTEMD_DIR="${HOME}/.config/systemd/user"
 
+# -------------------------
+# Dry-run support
+# -------------------------
+DRY_RUN=0
+if [ "${1:-}" = "--check" ]; then
+  DRY_RUN=1
+  echo "DRY-RUN MODE (--check): no changes will be made"
+fi
+
+run() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[check] $*"
+  else
+    "$@"
+  fi
+}
+
 echo "DPMP v2 installer (non-docker)"
 echo "Install dir: ${INSTALL_DIR}"
 
@@ -19,26 +36,33 @@ mkdir -p "${SYSTEMD_DIR}"
 # Clone or update repo
 # ----------------------------------------------------------------------
 if [ ! -d "${INSTALL_DIR}/.git" ]; then
-  echo "Cloning repo..."
-  git clone "${REPO_URL}" "${INSTALL_DIR}"
+  echo "Repo not found, cloning..."
+  run git clone "${REPO_URL}" "${INSTALL_DIR}"
+else
+  echo "Repo already present, updating..."
 fi
 
 cd "${INSTALL_DIR}"
 
-git fetch --all --tags --prune
-git checkout -B main origin/main
-git pull --ff-only
+run git fetch --all --tags --prune
+run git checkout -B main origin/main
+run git pull --ff-only
 
 # ----------------------------------------------------------------------
-# Port sanity check BEFORE starting anything
+# Port sanity check (always real)
 # ----------------------------------------------------------------------
 echo "Checking required ports (3351/9210/8855)..."
 for port in 3351 9210 8855; do
-  if ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${port}$"; then
+if ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${port}$"; then
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[check] WARNING: port ${port} is already in use"
+    ss -ltnp | grep ":${port}" || true
+  else
     echo "ERROR: port ${port} already in use." >&2
     ss -ltnp | grep ":${port}" || true
     exit 1
   fi
+fi
 done
 
 # ----------------------------------------------------------------------
@@ -46,39 +70,39 @@ done
 # ----------------------------------------------------------------------
 echo "Setting up Python virtual environment..."
 if [ ! -d ".venv" ]; then
-  python3 -m venv .venv
+  run python3 -m venv .venv
 fi
 
-.venv/bin/pip install -U pip
-.venv/bin/pip install -r requirements.txt
+run .venv/bin/pip install -U pip
+run .venv/bin/pip install -r requirements.txt
 
 # ----------------------------------------------------------------------
 # Default config (only if missing)
 # ----------------------------------------------------------------------
 if [ ! -f dpmp/config_v2.json ]; then
   echo "Creating default config at dpmp/config_v2.json"
-  cp dpmp/config_v2_example.json dpmp/config_v2.json
+  run cp dpmp/config_v2_example.json dpmp/config_v2.json
 fi
 
 # ----------------------------------------------------------------------
 # Install systemd user services
 # ----------------------------------------------------------------------
 echo "Installing systemd user services..."
-cp services/dpmpv2.service "${SYSTEMD_DIR}/dpmpv2.service"
-cp services/dpmpv2-nicegui.service "${SYSTEMD_DIR}/dpmpv2-nicegui.service"
-systemctl --user daemon-reload
+run cp services/dpmpv2.service "${SYSTEMD_DIR}/dpmpv2.service"
+run cp services/dpmpv2-nicegui.service "${SYSTEMD_DIR}/dpmpv2-nicegui.service"
+run systemctl --user daemon-reload
 
 # Hard-disable legacy FastAPI GUI forever
-systemctl --user disable --now dpmpv2-gui.service 2>/dev/null || true
-ln -sf /dev/null "${SYSTEMD_DIR}/dpmpv2-gui.service"
+run systemctl --user disable --now dpmpv2-gui.service 2>/dev/null || true
+run ln -sf /dev/null "${SYSTEMD_DIR}/dpmpv2-gui.service"
 
 # ----------------------------------------------------------------------
 # Enable linger + start services
 # ----------------------------------------------------------------------
-loginctl enable-linger "${USER}" >/dev/null 2>&1 || true
+run loginctl enable-linger "${USER}" >/dev/null 2>&1 || true
 
-systemctl --user enable --now dpmpv2.service
-systemctl --user enable --now dpmpv2-nicegui.service
+run systemctl --user enable --now dpmpv2.service
+run systemctl --user enable --now dpmpv2-nicegui.service
 
 echo "Done."
 echo "NiceGUI: http://$(hostname -I | awk '{print $1}'):8855/"
