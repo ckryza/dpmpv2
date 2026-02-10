@@ -1,13 +1,46 @@
+# =====================================================================
+# DPMP v2 NiceGUI — EXAMPLE systemd user service
+#
+# ⚠️ IMPORTANT:
+# - This file is NOT used by the installer.
+# - The installer installs and manages:
+#     ~/.config/systemd/user/dpmpv2-nicegui.service
+# - This file exists only as a reference for advanced/manual setups.
+#
+# NiceGUI is the CURRENT supported GUI for DPMP v2.
+# The legacy FastAPI/Uvicorn GUI is deprecated and not supported.
+# =====================================================================
+
 [Unit]
-Description=DPMP v2 GUI (non-docker)
+Description=DPMP v2 NiceGUI (non-docker, example)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
+Type=simple
 WorkingDirectory=%h/dpmp
-ExecStart=%h/dpmp/.venv/bin/python -m uvicorn gui.app:app --host 0.0.0.0 --port 8844
+
+# ---------------------------------------------------------------------
+# Runtime configuration
+# ---------------------------------------------------------------------
+Environment=DPMP_CONFIG_PATH=%h/dpmp/dpmp/config_v2.json
+Environment=DPMP_METRICS_URL=http://127.0.0.1:9210/metrics
+Environment=DPMP_LOG_PATH=%h/dpmp/dpmpv2_run.log
+Environment=GUI_LOG_PATH=%h/dpmp/dpmpv2_gui.log
+
+# NiceGUI network binding
+Environment=NICEGUI_HOST=0.0.0.0
+Environment=NICEGUI_PORT=8855
+
+# ---------------------------------------------------------------------
+# Start NiceGUI
+# ---------------------------------------------------------------------
+ExecStart=%h/dpmp/.venv/bin/python -u %h/dpmp/gui_nice/app.py
+
 Restart=always
 RestartSec=2
+
+# Log handling (append mode, user-owned)
 StandardOutput=append:%h/dpmp/dpmpv2_gui.log
 StandardError=append:%h/dpmp/dpmpv2_gui.log
 

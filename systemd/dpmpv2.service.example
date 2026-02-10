@@ -1,14 +1,42 @@
+# Example systemd *user* service for DPMP v2 (non-docker)
+#
+# This file is provided as a REFERENCE ONLY.
+# The recommended way to install DPMP v2 is via:
+#   installer/install.sh
+#
+# This example is useful for:
+# - Manual systemd setups
+# - Advanced users
+# - Distributions without the installer workflow
+#
+# NOTE:
+# - This service runs the core DPMP proxy only.
+# - The NiceGUI dashboard is started separately via dpmpv2-nicegui.service.
+
 [Unit]
-Description=DPMP v2 (non-docker)
+Description=DPMP v2 (Stratum proxy, non-docker)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
+Type=simple
+
+# Base install directory (single-dir layout)
 WorkingDirectory=%h/dpmp
+
+# Primary DPMP configuration file
 Environment=DPMP_CONFIG=%h/dpmp/dpmp/config_v2.json
+
+# Optional: metrics endpoint (used by GUI / exporters)
+Environment=DPMP_METRICS_URL=http://127.0.0.1:9210/metrics
+
+# Start DPMP
 ExecStart=%h/dpmp/.venv/bin/python -u %h/dpmp/dpmp/dpmpv2.py
+
 Restart=always
 RestartSec=2
+
+# Logs are written locally for easy inspection
 StandardOutput=append:%h/dpmp/dpmpv2_run.log
 StandardError=append:%h/dpmp/dpmpv2_run.log
 
