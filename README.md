@@ -8,7 +8,18 @@ This repository contains the **v2 architecture**, which is a ground-up redesign 
 
 ---
 
+
+
 ## Quick Install (Non-Docker)
+
+### Prerequisites (Non-Docker)
+- Python 3.10+
+- `python3-venv` package installed
+
+```bash
+sudo apt install -y python3-venv
+```
+Install:
 
 ```bash
 git clone https://github.com/ckryza/dpmpv2.git ~/dpmp
