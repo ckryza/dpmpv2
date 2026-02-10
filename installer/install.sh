@@ -66,6 +66,23 @@ fi
 done
 
 # ----------------------------------------------------------------------
+# Check python venv support
+# ----------------------------------------------------------------------
+if ! python3 - <<'EOF' >/dev/null 2>&1
+import ensurepip
+EOF
+then
+  echo "ERROR: python3-venv is not installed."
+  echo
+  echo "Please install it with:"
+  echo "  sudo apt update"
+  echo "  sudo apt install -y python3-venv"
+  echo
+  exit 1
+fi
+
+
+# ----------------------------------------------------------------------
 # Python virtual environment
 # ----------------------------------------------------------------------
 echo "Setting up Python virtual environment..."
