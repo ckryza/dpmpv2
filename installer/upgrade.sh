@@ -63,6 +63,11 @@ echo "Updating Python dependencies..."
 run .venv/bin/pip install -U pip
 run .venv/bin/pip install -r requirements.txt
 
+#-------------------------------------------------------------------------------------
+# Merge any new default fields into existing config (safe, non-destructive)
+#-------------------------------------------------------------------------------------
+run .venv/bin/python dpmp/merge_config.py dpmp/config_v2_example.json dpmp/config_v2.json
+
 echo "Restarting services..."
 run systemctl --user restart dpmpv2.service
 run systemctl --user restart dpmpv2-nicegui.service

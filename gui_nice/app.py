@@ -25,11 +25,10 @@ METRICS_URL  = os.environ.get("DPMP_METRICS_URL", "http://127.0.0.1:9210/metrics
 DPMP_LOG_PATH = os.environ.get("DPMP_LOG_PATH", os.path.expanduser("~/dpmp/dpmpv2_run.log"))
 GUI_LOG_PATH  = os.environ.get("GUI_LOG_PATH", os.path.expanduser("~/dpmp/dpmpv2_gui.log"))
 WEIGHTS_OVERRIDE_PATH = os.path.join(os.path.dirname(os.environ.get("DPMP_CONFIG_PATH", os.path.expanduser("~/dpmp/dpmp/config_v2.json"))), "weights_override.json")
-
+ORACLE_CHART_HISTORY_PATH = os.path.join(os.path.dirname(os.environ.get("DPMP_CONFIG_PATH", os.path.expanduser("~/dpmp/dpmp/config_v2.json"))), "oracle_chart_history.json")
 HOST = os.environ.get("NICEGUI_HOST", "0.0.0.0")
 PORT = int(os.environ.get("NICEGUI_PORT", "8845"))
 POLL_S = float(os.environ.get("NICEGUI_POLL_S", "2.0"))
-
 
 #DARK_KEY = 'dpmp_dark_mode'
 
@@ -139,11 +138,6 @@ def _prom_gauge_value(text: str, name: str, pool: str | None = None) -> float | 
 
 # extract first matching float value from parsed Prometheus metrics dict
 def prom_first_float(metrics: dict, name: str, labels: dict | None = None) -> float | None:
-    """
-    Expect your metrics parser to return something like:
-      metrics[name] = list of {"labels": {...}, "value": float}
-    Adjust this if your internal representation differs.
-    """
     rows = metrics.get(name) or []
     if labels:
         for row in rows:
@@ -153,7 +147,7 @@ def prom_first_float(metrics: dict, name: str, labels: dict | None = None) -> fl
                 except Exception:
                     return None
         return None
-    # no label filter → first value
+    # no label filter â†’ first value
     try:
         return float(rows[0].get("value"))
     except Exception:
@@ -189,6 +183,33 @@ def get_config_weights() -> tuple[int, int]:
     except Exception:
         return (50, 50)
 
+def get_auto_balance_config() -> dict:
+    """Read auto-balance and chain config from config_v2.json.
+    
+    Returns dict with keys:
+      auto_balance (bool), max_deviation (int),
+      oracle_url (str), oracle_poll_seconds (int),
+      poolA_chain (str), poolB_chain (str)
+    """
+    try:
+        cfg = read_json(CONFIG_PATH)
+        sched = cfg.get("scheduler", {})
+        pools = cfg.get("pools", {})
+        return {
+            "auto_balance": bool(sched.get("auto_balance", False)),
+            "max_deviation": int(sched.get("auto_balance_max_deviation", 20)),
+            "oracle_url": str(sched.get("oracle_url", "")),
+            "oracle_poll_seconds": int(sched.get("oracle_poll_seconds", 600)),
+            "poolA_chain": str(pools.get("A", {}).get("chain", "BTC")).upper(),
+            "poolB_chain": str(pools.get("B", {}).get("chain", "BCH")).upper(),
+        }
+    except Exception:
+        return {
+            "auto_balance": False, "max_deviation": 20,
+            "oracle_url": "", "oracle_poll_seconds": 600,
+            "poolA_chain": "BTC", "poolB_chain": "BCH",
+        }
+
 # write weight override file (or delete it to revert to config defaults)
 def write_weight_override(wA: int, wB: int) -> None:
     """Write weights_override.json so DPMP picks up the new weights on its next tick."""
@@ -211,6 +232,49 @@ def write_json_atomic(path: str, obj: Dict[str, Any]) -> None:
         json.dump(obj, f, indent=2, sort_keys=False)
         f.write("\n")
     os.replace(tmp, path)
+
+# Save oracle chart history to disk (survives browser refresh)
+def save_oracle_chart_history(history: list, poll_seconds: int) -> None:
+    """Write chart history + metadata so a browser refresh can restore the charts."""
+    try:
+        obj = {
+            "poll_seconds": poll_seconds,
+            "saved_at": time.time(),
+            "points": history,
+        }
+        write_json_atomic(ORACLE_CHART_HISTORY_PATH, obj)
+    except Exception:
+        pass  # non-critical, don't crash the GUI
+
+# Load oracle chart history from disk (if fresh enough)
+def load_oracle_chart_history(poll_seconds: int) -> list:
+    """Load saved chart history if the most recent point is within poll_seconds of now."""
+    try:
+        if not os.path.isfile(ORACLE_CHART_HISTORY_PATH):
+            return []
+        with open(ORACLE_CHART_HISTORY_PATH, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        points = obj.get("points", [])
+        saved_at = obj.get("saved_at", 0)
+        if not points:
+            return []
+        # If saved_at is older than 2x poll interval, data is stale — discard
+        age = time.time() - saved_at
+        if age > poll_seconds * 2:
+            return []
+        # Return up to 8 most recent points
+        return points[-8:]
+    except Exception:
+        return []
+
+# Delete oracle chart history file (called on DPMP restart)
+def clear_oracle_chart_history() -> None:
+    """Remove the chart history file so charts start fresh after restart."""
+    try:
+        if os.path.isfile(ORACLE_CHART_HISTORY_PATH):
+            os.remove(ORACLE_CHART_HISTORY_PATH)
+    except Exception:
+        pass
 
 # HTTP GET with timeout
 def http_get_text(url: str, timeout_s: float = 3.0) -> str:
@@ -381,11 +445,11 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
     
     with ui.tab_panel(t_home):   
             
-# ── Two-column layout: System Paths (left) + Weight Slider (right) ──
+        # Two-column layout: System Paths (left) + Weight Slider (right) 
         # On mobile, flex-wrap causes the slider card to stack below.
         with ui.row().classes("w-full flex-wrap gap-6 items-stretch"):
 
-            # ── Left column: System Paths + Restart ──
+            # Left column: System Paths + Restart 
             with ui.card().classes("min-w-[280px]"):
             #with ui.column().classes("flex-1 min-w-[280px]"):
                 ui.label("System Paths:").classes("text-lg font-semibold")
@@ -402,9 +466,9 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                     btn_restart = ui.button("Restart DPMP", icon="restart_alt")
                     lbl_restart = ui.label("").classes("text-sm")
 
-            # ── Right column: Hashrate Allocation Slider ──
+            # Right column: Hashrate Allocation Slider
             # Only show the slider if BOTH pools have weight > 0 in config.
-            # At 0/100 or 100/0, one pool is never connected — sliding toward it would break things.
+            # At 0/100 or 100/0, one pool is never connected ... sliding toward it would break things.
             cfg_wA, cfg_wB = get_config_weights()
             cfg_total = cfg_wA + cfg_wB
             cfg_slider_default = round((cfg_wA / cfg_total) * 100 / 5) * 5 if cfg_total > 0 else 50
@@ -415,7 +479,13 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             # Mutable container so nested functions can update these values
             _cfg = {"wA": cfg_wA, "wB": cfg_wB, "slider_default": cfg_slider_default}
 
-            if cfg_wA > 0 and cfg_wB > 0:
+            ab_cfg = get_auto_balance_config()
+            _auto_balance_enabled = ab_cfg["auto_balance"]
+
+            # ---- MANUAL MODE: show slider ----
+            weight_slider_ref = None  # default; set below only if slider is shown
+
+            if not _auto_balance_enabled and cfg_wA > 0 and cfg_wB > 0:
                 # If an override file exists (slider was moved), start there instead of config defaults
                 try:
                     ov = read_json(WEIGHTS_OVERRIDE_PATH)
@@ -431,7 +501,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                     slider_initial = cfg_slider_default
 
                 with ui.card().classes("flex-1 min-w-[320px] max-w-[480px]"):
-                    ui.label("⚖ Hashrate Allocation").classes("text-base font-semibold").style("color: #6E93D6")
+                    ui.label("Hashrate Allocation").classes("text-base font-semibold").style("color: #6E93D6")
 
                     with ui.row().classes("w-full items-center gap-3"):
                         ui.label("Pool A").classes("text-sm font-semibold").style("color: #22d3ee")
@@ -442,10 +512,372 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                     lbl_weight_status = ui.html("", sanitize=False).classes("text-xs text-center w-full")
 
                     with ui.row().classes("w-full justify-center"):
-                        btn_weight_reset = ui.button("↩ Reset to Config Defaults", icon="restart_alt").props("dense outline size=sm").classes("text-xs")
+                        btn_weight_reset = ui.button("Reset to Config Defaults", icon="restart_alt").props("dense outline size=sm").classes("text-xs")
 
-        # Define slider functions outside the if-block so do_restart() can reference them safely
-        weight_slider_ref = weight_slider if (cfg_wA > 0 and cfg_wB > 0) else None
+                weight_slider_ref = weight_slider
+
+            # ---- AUTO-BALANCE MODE: show oracle panel ----
+            _oracle_ui = {}  # holds references to oracle UI elements for the update timer
+
+            if _auto_balance_enabled:
+                # Determine chart order: left chart = Pool A's chain, right chart = Pool B's chain
+                _chain_left = ab_cfg["poolA_chain"]   # e.g. "BCH"
+                _chain_right = ab_cfg["poolB_chain"]   # e.g. "BTC"
+
+                with ui.card().classes("flex-1 min-w-[280px] max-w-[540px]"):
+                    with ui.row().classes("w-full items-center justify-between"):
+                        ui.label("Oracle Auto-Balance").classes("text-base font-semibold").style("color: #6E93D6")
+                        # Health indicator
+                        with ui.row().classes("items-center gap-1"):
+                            oracle_health_dot = ui.icon("circle", size="xs")
+                            oracle_health_lbl = ui.label("starting...").classes("text-xs")
+                    _oracle_ui["health_dot"] = oracle_health_dot
+                    _oracle_ui["health_lbl"] = oracle_health_lbl
+
+                    # Charts row: one per chain
+                    with ui.row().classes("w-full gap-x-2 gap-y-4 flex-wrap"):
+                        # Left chart (Pool A's chain)
+                        with ui.column().classes("flex-1 items-center min-w-[220px]"):
+                            ui.label(f"Pool A ({_chain_left})").classes("text-xs font-semibold").style("color: #22d3ee")
+                            oracle_chart_left = ui.echart({
+                                "tooltip": {"trigger": "axis"},
+                                "legend": {"data": ["Short (6 blk)", "Baseline (72 blk)"],
+                                           "textStyle": {"fontSize": 10, "color": "#888888"}, "top": 0},
+                                "grid": {"top": 25, "right": 5, "bottom": 25, "left": 40},
+                                "xAxis": {"type": "category",
+                                          "data": ["", "", "", "", "", "", "", ""],
+                                          "axisLabel": {"fontSize": 9, "color": "#888888", "interval": 0},
+                                          "axisTick": {"show": True, "alignWithLabel": True, "lineStyle": {"color": "#888888"}},
+                                          "axisLine": {"lineStyle": {"color": "#888888"}},
+                                          "splitLine": {"show": False}},
+                                "yAxis": {"type": "value",
+                                          "min": 0, "axisLabel": {"formatter": "{value}", "color": "#888888"},
+                                          "axisLine": {"show": True, "lineStyle": {"color": "#888888"}},
+                                          "axisTick": {"show": True, "lineStyle": {"color": "#888888"}}},
+                                "series": [
+                                    {"name": "Short (6 blk)", "type": "line", "smooth": False,
+                                     "showSymbol": True, "symbolSize": 6, "data": [None]*8,
+                                     "lineStyle": {"color": "#22d3ee"}, "itemStyle": {"color": "#22d3ee"}},
+                                    {"name": "Baseline (72 blk)", "type": "line", "smooth": False,
+                                     "showSymbol": True, "symbolSize": 6, "data": [None]*8,
+                                     "lineStyle": {"color": "#e879f9"},
+                                     "itemStyle": {"color": "#e879f9"}},
+                                ],
+                            }).classes("w-full").style("height: 160px")
+                            oracle_caption_left = ui.label("--").classes("text-xs font-mono")
+                        _oracle_ui["chart_left"] = oracle_chart_left
+                        _oracle_ui["caption_left"] = oracle_caption_left
+                        _oracle_ui["chain_left"] = _chain_left
+
+                        # Right chart (Pool B's chain)
+                        with ui.column().classes("flex-1 items-center min-w-[220px]"):
+                            ui.label(f"Pool B ({_chain_right})").classes("text-xs font-semibold").style("color: #f59e0b")
+                            oracle_chart_right = ui.echart({
+                                "tooltip": {"trigger": "axis"},
+                                "legend": {"data": ["Short (6 blk)", "Baseline (72 blk)"],
+                                           "textStyle": {"fontSize": 10, "color": "#888888"}, "top": 0},
+                                "grid": {"top": 25, "right": 5, "bottom": 25, "left": 40},
+                                "xAxis": {"type": "category",
+                                          "data": ["", "", "", "", "", "", "", ""],
+                                          "axisLabel": {"fontSize": 9, "color": "#888888", "interval": 0},
+                                          "axisTick": {"show": True, "alignWithLabel": True, "lineStyle": {"color": "#888888"}},
+                                          "axisLine": {"lineStyle": {"color": "#888888"}},
+                                          "splitLine": {"show": False}},
+                                "yAxis": {"type": "value",
+                                          "min": 0, "axisLabel": {"formatter": "{value}", "color": "#888888"},
+                                          "axisLine": {"show": True, "lineStyle": {"color": "#888888"}},
+                                          "axisTick": {"show": True, "lineStyle": {"color": "#888888"}}},
+                                "series": [
+                                    {"name": "Short (6 blk)", "type": "line", "smooth": False,
+                                     "showSymbol": True, "symbolSize": 6, "data": [None]*8,
+                                     "lineStyle": {"color": "#f59e0b"}, "itemStyle": {"color": "#f59e0b"}},
+                                    {"name": "Baseline (72 blk)", "type": "line", "smooth": False,
+                                     "showSymbol": True, "symbolSize": 6, "data": [None]*8,
+                                     "lineStyle": {"color": "#e879f9"},
+                                     "itemStyle": {"color": "#e879f9"}},
+                                ],
+                            }).classes("w-full").style("height: 160px")
+                            oracle_caption_right = ui.label("--").classes("text-xs font-mono")
+                        _oracle_ui["chart_right"] = oracle_chart_right
+                        _oracle_ui["caption_right"] = oracle_caption_right
+                        _oracle_ui["chain_right"] = _chain_right
+
+                    ui.separator().classes("my-1")
+
+                    # Ratio + countdown row
+                    with ui.row().classes("w-full items-center justify-between"):
+                        oracle_ratio_lbl = ui.html("", sanitize=False).classes("text-sm font-mono")
+                        oracle_countdown_lbl = ui.label("waiting for data...").classes("text-xs").style("color: #888")
+                    _oracle_ui["ratio_lbl"] = oracle_ratio_lbl
+                    _oracle_ui["countdown_lbl"] = oracle_countdown_lbl
+
+                # List of oracle echart references for dark mode sync
+                _oracle_charts = []
+                if _auto_balance_enabled:
+                    _oracle_charts = [_oracle_ui.get("chart_left"), _oracle_ui.get("chart_right")]
+
+                # Oracle UI update timer (reads Prometheus metrics)
+
+                _CHART_MAX_POINTS = 8
+                _oracle_poll_interval = ab_cfg["oracle_poll_seconds"]
+
+                # Try to restore chart history from disk (survives browser refresh)
+                _restored_history = load_oracle_chart_history(_oracle_poll_interval)
+
+                _oracle_state = {
+                    "has_data": len(_restored_history) > 0,
+                    "last_data_age": None,       # previous data_age to detect new polls
+                    "last_hashrates": None,      # (ehs_short_l, ehs_long_l, ehs_short_r, ehs_long_r) to detect value changes
+                    # Chart history: list of dicts, max 8 entries
+                    # Each entry: {"time_label": "HH:MM", "left_short": float, "left_long": float,
+                    #              "right_short": float, "right_long": float}
+                    "chart_history": _restored_history,
+                }
+
+                # If we restored history, pre-populate the charts immediately
+                if _restored_history:
+                    n_real = len(_restored_history)
+                    labels = [h["time_label"] for h in _restored_history]
+                    if n_real < _CHART_MAX_POINTS:
+                        last_label = labels[-1]
+                        try:
+                            parts = last_label.split(":")
+                            last_min_total = int(parts[0]) * 60 + int(parts[1])
+                        except Exception:
+                            last_min_total = 0
+                        poll_min = max(1, _oracle_poll_interval // 60)
+                        for i in range(1, _CHART_MAX_POINTS - n_real + 1):
+                            proj_min = last_min_total + (i * poll_min)
+                            hh = (proj_min // 60) % 24
+                            mm = proj_min % 60
+                            labels.append(f"{hh:02d}:{mm:02d}")
+
+                    left_short_data = [h["left_short"] for h in _restored_history] + [None] * (_CHART_MAX_POINTS - n_real)
+                    left_long_data = [h["left_long"] for h in _restored_history] + [None] * (_CHART_MAX_POINTS - n_real)
+                    right_short_data = [h["right_short"] for h in _restored_history] + [None] * (_CHART_MAX_POINTS - n_real)
+                    right_long_data = [h["right_long"] for h in _restored_history] + [None] * (_CHART_MAX_POINTS - n_real)
+
+                    ch_l = _oracle_ui["chart_left"]
+                    ch_l.options["xAxis"]["data"] = labels
+                    ch_l.options["series"][0]["data"] = left_short_data
+                    ch_l.options["series"][1]["data"] = left_long_data
+                    ch_l.update()
+
+                    ch_r = _oracle_ui["chart_right"]
+                    ch_r.options["xAxis"]["data"] = labels
+                    ch_r.options["series"][0]["data"] = right_short_data
+                    ch_r.options["series"][1]["data"] = right_long_data
+                    ch_r.update()
+
+                    # Seed detection state so the first poll cycle doesn't add a duplicate.
+                    # Read current Prometheus values to properly initialize both methods.
+                    last_pt = _restored_history[-1]
+                    _oracle_state["last_hashrates"] = (
+                        last_pt["left_short"], last_pt["left_long"],
+                        last_pt["right_short"], last_pt["right_long"],
+                    )
+                    try:
+                        _init_raw = http_get_text(METRICS_URL)
+                        _init_age = _prom_gauge_value(_init_raw, "dpmp_oracle_data_age_seconds")
+                        if _init_age is not None:
+                            _oracle_state["last_data_age"] = _init_age
+                    except Exception:
+                        pass
+
+                    # Restore "Last updated" label from the most recent point
+                    _oracle_ui["countdown_lbl"].text = f"Last updated: {last_pt['time_label']} UTC"
+
+                def _oracle_metric_from_raw(raw_text, name, labels_dict):
+                    """Extract oracle metric with arbitrary labels from raw Prometheus text."""
+                    for line in raw_text.splitlines():
+                        parsed = parse_prom_line(line)
+                        if not parsed:
+                            continue
+                        n, lbls, v = parsed
+                        if n != name:
+                            continue
+                        match = True
+                        for k, vv in labels_dict.items():
+                            if lbls.get(k) != vv:
+                                match = False
+                                break
+                        if match:
+                            return v
+                    return None
+
+                def _update_oracle_panel():
+                    """Called every 2 seconds to refresh oracle panel from Prometheus metrics."""
+                    try:
+                        raw = http_get_text(METRICS_URL)
+                        if not raw or not raw.strip():
+                            _oracle_ui["health_dot"].style("color: red")
+                            _oracle_ui["health_lbl"].text = "offline"
+                            _oracle_ui["ratio_lbl"].content = (
+                                '<span style="color:#22d3ee">Pool A: 50%</span>'
+                                ' <span style="color:#555">/</span> '
+                                '<span style="color:#f59e0b">Pool B: 50%</span>'
+                                ' <span style="color:#888">(fallback)</span>'
+                            )
+                            _oracle_ui["countdown_lbl"].text = "waiting for data..."
+                            return
+
+                        status = _prom_gauge_value(raw, "dpmp_oracle_status")
+                        data_age = _prom_gauge_value(raw, "dpmp_oracle_data_age_seconds")
+                        is_healthy = (status is not None and status >= 0.5)
+
+                        # Distinguish three states:
+                        # 1. Healthy (oracle has polled successfully)
+                        # 2. Warming up (DPMP running but oracle hasn't polled yet — all gauges zero)
+                        # 3. Offline (oracle polled but returned error)
+                        if is_healthy:
+                            _oracle_ui["health_dot"].style("color: limegreen")
+                            _oracle_ui["health_lbl"].text = "connected"
+                            _oracle_state["has_data"] = True
+                        elif status is not None and status == 0.0 and not _oracle_state["has_data"]:
+                            # Gauges exist but are zero = oracle hasn't polled yet (60s startup delay)
+                            _oracle_ui["health_dot"].style("color: orange")
+                            _oracle_ui["health_lbl"].text = "warming up..."
+                        else:
+                            _oracle_ui["health_dot"].style("color: red")
+                            _oracle_ui["health_lbl"].text = "offline"
+
+                        chain_l = _oracle_ui["chain_left"]
+                        chain_r = _oracle_ui["chain_right"]
+
+                        hr_short_l = _oracle_metric_from_raw(raw, "dpmp_oracle_hashrate",
+                                                              {"chain": chain_l, "window": "short"})
+                        hr_long_l = _oracle_metric_from_raw(raw, "dpmp_oracle_hashrate",
+                                                             {"chain": chain_l, "window": "long"})
+                        hr_short_r = _oracle_metric_from_raw(raw, "dpmp_oracle_hashrate",
+                                                              {"chain": chain_r, "window": "short"})
+                        hr_long_r = _oracle_metric_from_raw(raw, "dpmp_oracle_hashrate",
+                                                             {"chain": chain_r, "window": "long"})
+
+                        def _to_ehs(v):
+                            return round(v / 1e18, 2) if v is not None and v > 0 else 0.0
+
+                        ehs_short_l = _to_ehs(hr_short_l)
+                        ehs_long_l = _to_ehs(hr_long_l)
+                        ehs_short_r = _to_ehs(hr_short_r)
+                        ehs_long_r = _to_ehs(hr_long_r)
+
+                        _oracle_ui["caption_left"].text = f"{ehs_short_l:.2f} EH/s / {ehs_long_l:.2f} EH/s (avg)"
+                        _oracle_ui["caption_right"].text = f"{ehs_short_r:.2f} EH/s / {ehs_long_r:.2f} EH/s (avg)"
+
+                        # --- Chart update: only add a point when oracle actually polls ---
+                        # Detect new poll by EITHER:
+                        #   a) data_age metric changed (Prometheus gauge updated by oracle), OR
+                        #   b) any of the 4 hashrate values changed
+                        # This dual approach should work even if one detection method has quirks.
+                        is_new_poll = False
+                        if is_healthy:
+                            current_hashrates = (ehs_short_l, ehs_long_l, ehs_short_r, ehs_long_r)
+                            any_nonzero = any(v > 0 for v in current_hashrates)
+
+                            # Method A: data_age changed
+                            age_changed = False
+                            if data_age is not None:
+                                prev_age = _oracle_state["last_data_age"]
+                                if prev_age is None or abs(data_age - prev_age) > 1.0:
+                                    age_changed = True
+
+                            # Method B: hashrate values changed
+                            values_changed = False
+                            prev_hr = _oracle_state["last_hashrates"]
+                            if prev_hr is None:
+                                values_changed = any_nonzero  # first reading with data
+                            elif current_hashrates != prev_hr:
+                                values_changed = True
+
+                            if (age_changed or values_changed) and any_nonzero:
+                                is_new_poll = True
+                                _oracle_state["last_data_age"] = data_age
+                                _oracle_state["last_hashrates"] = current_hashrates
+                                # Stamp "Last Updated"
+                                updated_ts = time.strftime("%H:%M:%S", time.gmtime())
+                                _oracle_ui["countdown_lbl"].text = f"Last updated: {updated_ts} UTC"
+
+                        if is_new_poll:
+                            # Add new data point to history
+                            now_label = time.strftime("%H:%M", time.gmtime())
+                            history = _oracle_state["chart_history"]
+                            history.append({
+                                "time_label": now_label,
+                                "left_short": ehs_short_l, "left_long": ehs_long_l,
+                                "right_short": ehs_short_r, "right_long": ehs_long_r,
+                            })
+
+                            # Keep max 8 points
+                            if len(history) > _CHART_MAX_POINTS:
+                                _oracle_state["chart_history"] = history[-_CHART_MAX_POINTS:]
+                                history = _oracle_state["chart_history"]
+
+                            # Persist to disk so browser refresh can restore charts
+                            save_oracle_chart_history(history, _oracle_poll_interval)
+
+                            # Build x-axis labels: real times + projected future times
+                            n_real = len(history)
+                            labels = [h["time_label"] for h in history]
+                            # Fill remaining slots with projected timestamps
+                            if n_real < _CHART_MAX_POINTS:
+                                # Parse last real time to project forward
+                                last_label = labels[-1]
+                                try:
+                                    parts = last_label.split(":")
+                                    last_min_total = int(parts[0]) * 60 + int(parts[1])
+                                except Exception:
+                                    last_min_total = 0
+                                poll_min = max(1, _oracle_poll_interval // 60)
+                                for i in range(1, _CHART_MAX_POINTS - n_real + 1):
+                                    proj_min = last_min_total + (i * poll_min)
+                                    hh = (proj_min // 60) % 24
+                                    mm = proj_min % 60
+                                    labels.append(f"{hh:02d}:{mm:02d}")
+
+                            # Build series data arrays (None for empty slots)
+                            left_short_data = [h["left_short"] for h in history] + [None] * (_CHART_MAX_POINTS - n_real)
+                            left_long_data = [h["left_long"] for h in history] + [None] * (_CHART_MAX_POINTS - n_real)
+                            right_short_data = [h["right_short"] for h in history] + [None] * (_CHART_MAX_POINTS - n_real)
+                            right_long_data = [h["right_long"] for h in history] + [None] * (_CHART_MAX_POINTS - n_real)
+
+                            # Update left chart
+                            ch_l = _oracle_ui["chart_left"]
+                            ch_l.options["xAxis"]["data"] = labels
+                            ch_l.options["series"][0]["data"] = left_short_data
+                            ch_l.options["series"][1]["data"] = left_long_data
+                            ch_l.update()
+
+                            # Update right chart
+                            ch_r = _oracle_ui["chart_right"]
+                            ch_r.options["xAxis"]["data"] = labels
+                            ch_r.options["series"][0]["data"] = right_short_data
+                            ch_r.options["series"][1]["data"] = right_long_data
+                            ch_r.update()
+
+                        wA = _oracle_metric_from_raw(raw, "dpmp_oracle_weight", {"pool": "A"})
+                        wB = _oracle_metric_from_raw(raw, "dpmp_oracle_weight", {"pool": "B"})
+
+                        if wA is not None and wB is not None:
+                            _oracle_ui["ratio_lbl"].content = (
+                                f'<span style="color:#22d3ee">Pool A: {int(wA)}%</span>'
+                                f' <span style="color:#555">/</span> '
+                                f'<span style="color:#f59e0b">Pool B: {int(wB)}%</span>'
+                            )
+                        elif not is_healthy:
+                            _oracle_ui["ratio_lbl"].content = (
+                                '<span style="color:#22d3ee">Pool A: 50%</span>'
+                                ' <span style="color:#555">/</span> '
+                                '<span style="color:#f59e0b">Pool B: 50%</span>'
+                                ' <span style="color:#888">(fallback)</span>'
+                            )
+
+                        if not is_healthy and not _oracle_state["has_data"]:
+                            _oracle_ui["countdown_lbl"].text = "waiting for data..."
+
+                    except Exception:
+                        pass
+
+                ui.timer(2.0, _update_oracle_panel)
 
         def _update_weight_display():
             """Update the percentage label and status badge based on current slider value."""
@@ -464,11 +896,11 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                 )
             else:
                 lbl_weight_status.content = (
-                    f'<span style="color:#f59e0b">● Live override active — DPMP is using these weights</span>'
+                    f'<span style="color:#f59e0b">â— Live override active ... DPMP is using these weights</span>'
                 )
 
         def _on_slider_change(e):
-            """Called when the slider value changes — write override file immediately."""
+            """Called when the slider value changes ... write override file immediately."""
             val = int(e.value)
             bval = 100 - val
             _update_weight_display()
@@ -496,6 +928,15 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
         def do_restart():
             # Delete weight override so DPMP starts fresh with config defaults
             delete_weight_override()
+
+            # Clear chart history so charts start fresh after DPMP restart
+            # (also cleared on GUI startup, but clear here too for immediate effect)
+            clear_oracle_chart_history()
+            _oracle_state["chart_history"] = []
+            _oracle_state["has_data"] = False
+            _oracle_state["last_data_age"] = None
+            _oracle_state["last_hashrates"] = None
+
             # Reset slider back to current config defaults (recompute in case config changed)
             if weight_slider_ref is not None:
                 _cfg["wA"], _cfg["wB"] = get_config_weights()
@@ -525,24 +966,24 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
 
         
         with ui.row().classes("gap-6 items-center"):            
-            lbl_dpmp = ui.html("<b>DPMP</b>: checking…", sanitize=False).classes("text-sm")
-            lbl_pool = ui.html("Active pool: …", sanitize=False).classes("text-sm").tooltip("Which pool is currently active")
-            lbl_miner = ui.html("<b>Miner(s) connected</b>: …", sanitize=False).classes("text-sm").tooltip("Whether any miners are currently connected downstream")
+            lbl_dpmp = ui.html("<b>DPMP</b>: checking...", sanitize=False).classes("text-sm")
+            lbl_pool = ui.html("Active pool: ...", sanitize=False).classes("text-sm").tooltip("Which pool is currently active")
+            lbl_miner = ui.html("<b>Miner(s) connected</b>: ...", sanitize=False).classes("text-sm").tooltip("Whether any miners are currently connected downstream")
             lbl_spin = ui.spinner('rings', size='lg', color='green')
 
         with ui.row().classes("gap-6 items-center"):
-            lbl_acc = ui.html("<b>Accepted</b>: A … / B …", sanitize=False).classes("text-sm").tooltip("Total accepted shares per pool")
-            lbl_rej = ui.html("<b>Rejected</b>: A … / B …", sanitize=False).classes("text-sm").tooltip("Total rejected shares per pool")
-            lbl_jobs = ui.html("<b>Jobs</b>: A … / B …", sanitize=False).classes("text-sm").tooltip("Total jobs forwarded per pool")
-            lbl_dif = ui.html("<b>SumDiff</b>: A … / B …", sanitize=False).classes("text-sm").tooltip("Sum of difficulty of accepted shares per pool")
-            lbl_rat = ui.html("<b>Diff Ratio</b>: A …% / B …%", sanitize=False).classes("text-sm").tooltip("Percentage of accepted difficulty per pool (all-time since last restart)")
+            lbl_acc = ui.html("<b>Accepted</b>: A ... / B ...", sanitize=False).classes("text-sm").tooltip("Total accepted shares per pool")
+            lbl_rej = ui.html("<b>Rejected</b>: A ... / B ...", sanitize=False).classes("text-sm").tooltip("Total rejected shares per pool")
+            lbl_jobs = ui.html("<b>Jobs</b>: A ... / B ...", sanitize=False).classes("text-sm").tooltip("Total jobs forwarded per pool")
+            lbl_dif = ui.html("<b>SumDiff</b>: A ... / B ...", sanitize=False).classes("text-sm").tooltip("Sum of difficulty of accepted shares per pool")
+            lbl_rat = ui.html("<b>Diff Ratio</b>: A ...% / B ...%", sanitize=False).classes("text-sm").tooltip("Percentage of accepted difficulty per pool (all-time since last restart)")
 
         with ui.row().classes("gap-6 items-center"):
-            lbl_recent_rat = ui.html("<b>Recent Ratio (2min)</b>: waiting for data…", sanitize=False).classes("text-sm font-semibold").tooltip("Rolling 2-minute hashrate allocation ratio — reacts to slider changes within minutes").style("color: #6E93D6")
+            lbl_recent_rat = ui.html("<b>Recent Ratio (2min)</b>: waiting for data...", sanitize=False).classes("text-sm font-semibold").tooltip("Rolling 2-minute hashrate allocation ratio ... reacts to slider changes within minutes").style("color: #6E93D6")
             
 
         ui.separator()
-        lbl_note = ui.html("<b>Note</b>: The <b>Recent Ratio</b> above is the best indicator for real-time hashrate allocation — it shows what DPMP is doing <i>right now</i>. The all-time <i>Diff Ratio</i> reflects cumulative history since the last restart and may take a long time to shift after a weight change. See the <b>About</b> tab for more details.", sanitize=False).classes("text-sm")
+        lbl_note = ui.html("<b>Note</b>: The <b>Recent Ratio</b> above is the best indicator for real-time hashrate allocation as it shows what DPMP is doing <i>right now</i>. The all-time <i>Diff Ratio</i> reflects cumulative history since the last restart and may take a long time to shift after a weight change. See the <b>About</b> tab for more details.", sanitize=False).classes("text-sm")
 
         ui.separator()
 
@@ -566,6 +1007,28 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             ui.run_javascript(
                 "try { localStorage.setItem(%r, %r); } catch(e) {}" % (DARK_KEY, '1' if v else '0')
             )
+            # Sync oracle chart text colors with dark mode
+            _sync_chart_dark_mode(v)
+
+        def _sync_chart_dark_mode(is_dark: bool) -> None:
+            """Set explicit text colors on oracle charts for dark/light mode."""
+            text_color = "#ffffff" if is_dark else "#888888"
+            for ch in _oracle_charts:
+                if ch is None:
+                    continue
+                try:
+                    ch.options["legend"]["textStyle"]["color"] = text_color
+                    # X-axis: labels, tick marks, axis line
+                    ch.options["xAxis"]["axisLabel"]["color"] = text_color
+                    ch.options["xAxis"]["axisTick"]["lineStyle"]["color"] = text_color
+                    ch.options["xAxis"]["axisLine"]["lineStyle"]["color"] = text_color
+                    # Y-axis: labels, tick marks, axis line
+                    ch.options["yAxis"]["axisLabel"]["color"] = text_color
+                    ch.options["yAxis"]["axisTick"]["lineStyle"]["color"] = text_color
+                    ch.options["yAxis"]["axisLine"]["lineStyle"]["color"] = text_color
+                    ch.update()
+                except Exception:
+                    pass
 
         sw_dark.on_value_change(lambda e: _persist_dark(_to_bool(e.value)))
 
@@ -583,10 +1046,12 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             is_dark = bool(int(v))
             dark.value = is_dark
             sw_dark.value = is_dark
+            # Sync oracle chart text colors with initial dark mode state
+            _sync_chart_dark_mode(is_dark)
 
         ui.timer(0.0, _init_dark_from_storage, once=True)
 
-        # Rolling window for "Recent Ratio" — stores (timestamp, difA, difB) snapshots.
+        # Rolling window for "Recent Ratio" ... stores (timestamp, difA, difB) snapshots.
         # We keep ~2 minutes of history (at 2s poll interval, that's ~60 samples).
         _recent_dif_history: list[tuple[float, float, float]] = []
         _RECENT_WINDOW_S = 300.0  # 5-minute rolling window
@@ -649,7 +1114,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                 lbl_dif.content = f"<b>SumDiff</b>: A {int(difA)} / B {int(difB)}"
                 lbl_rat.content = f"<b>Diff Ratio (all-time)</b>: A {pctA:.2f}% / B {pctB:.2f}%"
 
-                # ── Rolling 2-minute ratio ──────────────────────────────
+                # Rolling 2-minute ratio 
                 now_mono = time.monotonic()
                 _recent_dif_history.append((now_mono, difA, difB))
 
@@ -674,9 +1139,9 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                             f'<span style="color:#f59e0b">B {rpctB:.1f}%</span>'
                         )
                     else:
-                        lbl_recent_rat.content = "<b>Recent Ratio (2min)</b>: no new shares yet…"
+                        lbl_recent_rat.content = "<b>Recent Ratio (2min)</b>: no new shares yet..."
                 else:
-                    lbl_recent_rat.content = "<b>Recent Ratio (2min)</b>: collecting data…"
+                    lbl_recent_rat.content = "<b>Recent Ratio (2min)</b>: collecting data..."
 
             except Exception as e:
                 lbl_pool.content = "<b>Active pool</b>: error"
@@ -702,7 +1167,8 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
         DEFAULT_DENY = [
             "authorize_rewrite","authorize_rewrite_other","authorize_rewrite_secondary",
             "bootstrap_reconnect_forced","bootstrap_skipped_handshake_pool",
-            "downstream_extranonce_check","downstream_extranonce_skip_no_data",
+            "downstream_extranonce_check","downstream_extranonce_skip_already_in_subscribe",
+            "downstream_extranonce_skip_no_data",
             "downstream_extranonce_skip_nochange","downstream_extranonce_skip_raw_subscribe",
             "downstream_extranonce_set","downstream_diff_set",
             "downstream_notify_flushed_after_subscribe",
@@ -713,8 +1179,12 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             "job_forwarded","job_forwarded_diff_state",
             "miner_method",
             "notify_clean_forced",
+            "oracle_calc_result","oracle_data_age","oracle_next_poll",
+            "oracle_override_written","oracle_poll_start","oracle_weights_applied",
             "pool_notify",
-            "post_auth_downstream_sync","post_auth_push_diff","post_auth_push_extranonce",
+            "post_auth_downstream_sync","post_auth_extranonce_skip_already_in_subscribe",
+            "post_auth_extranonce_skip_raw_subscribe",
+            "post_auth_push_diff","post_auth_push_extranonce",
             "post_auth_push_notify_clean",
             "prune_internal_ids","prune_job_owner","prune_seen_upstream_ids","prune_submit_owner",
             "scheduler_tick",
@@ -723,6 +1193,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             "submit_local_sanity","submit_route","submit_snapshot",
             "subscribe_id_response_skipped_duplicate","subscribe_result",
             "upstream_response_dup_observed","upstream_tx",
+            "weights_override_changed",
         ]
 
         # --- all log events (canonical list; keep in sync with dpmpv2.py log("...") calls) ---
@@ -731,10 +1202,12 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             "authorize_rewrite_secondary","authorize_secondary_send_error","authorize_skip_zero_weight_pool",
             "bootstrap_reconnect_forced","bootstrap_skipped_handshake_pool",
             "clear_pool_state_reset_last_downstream_extranonce","clear_pool_state_reset_raw_subscribe_flag",
-            "config_loaded","config_safety_min_switch_clamped","config_safety_slice_clamped",
+            "config_loaded","config_safety_max_deviation_clamped","config_safety_min_switch_clamped",
+            "config_safety_oracle_poll_clamped","config_safety_slice_clamped",
             "configure_forward_both_error","configure_forwarded_both_pools","configure_skip_zero_weight_pool",
             "downstream_diff_set","downstream_extranonce_check","downstream_extranonce_send_error",
-            "downstream_extranonce_set","downstream_extranonce_skip_no_data",
+            "downstream_extranonce_set","downstream_extranonce_skip_already_in_subscribe",
+            "downstream_extranonce_skip_no_data",
             "downstream_extranonce_skip_nochange","downstream_extranonce_skip_raw_subscribe",
             "downstream_notify_flushed_after_subscribe","downstream_send_diff","downstream_send_extranonce",
             "downstream_send_extranonce_error","downstream_send_notify","downstream_send_raw",
@@ -745,16 +1218,24 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             "id_response_seen",
             "job_forwarded","job_forwarded_diff_state",
             "metrics_start_failed","metrics_started","miner_bad_json","miner_connected",
+            "miner_disconnect_for_reconnect","miner_disconnect_for_reconnect_failed",
             "miner_disconnected","miner_method","miner_ready_for_jobs",
-            "miner_reconnect_request_failed","miner_reconnect_requested",
             "notify_clean_force_error","notify_clean_forced",
+            "oracle_bad_timestamps","oracle_calc_result","oracle_cancelled","oracle_config",
+            "oracle_data_age","oracle_disabled","oracle_disabled_bad_chain_config",
+            "oracle_fallback_50_50","oracle_next_poll","oracle_override_write_error",
+            "oracle_override_written","oracle_poll_error","oracle_poll_start",
+            "oracle_starting","oracle_startup_delay","oracle_task_cancelled",
+            "oracle_task_started","oracle_ts_parse_warning","oracle_weights_applied",
             "pool_bootstrap_auth_result","pool_bootstrap_authorize_sent","pool_bootstrap_error",
             "pool_bootstrap_subscribe_parse_error","pool_bootstrap_subscribe_result",
             "pool_bootstrap_subscribe_sent","pool_connected","pool_connecting","pool_diff","pool_down",
             "pool_initial_connect_failed","pool_notify","pool_reader_error","pool_reconnect_failed",
             "pool_reconnect_wait","pool_reconnected","pool_skipped_zero_weight","pool_state_cleared",
             "pool_switched",
-            "post_auth_downstream_sync","post_auth_downstream_sync_error","post_auth_push_diff",
+            "post_auth_downstream_sync","post_auth_downstream_sync_error",
+            "post_auth_extranonce_skip_already_in_subscribe","post_auth_extranonce_skip_raw_subscribe",
+            "post_auth_push_diff",
             "post_auth_push_extranonce","post_auth_push_notify_clean","post_auth_push_notify_clean_error",
             "post_auth_push_setup_error","process_exiting",
             "prune_internal_ids","prune_job_owner","prune_seen_upstream_ids","prune_submit_owner",
@@ -775,7 +1256,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             "subscribe_id_response_skipped_duplicate","subscribe_parse_error","subscribe_result",
             "switch_skipped_no_cached_job",
             "upstream_response_dup_observed","upstream_tx",
-            "weights_normalized","write_failed",
+            "weights_normalized","weights_override_changed","write_failed",
         ]
 
         # --- controls (created first; populated by reload_cfg) ---
@@ -846,6 +1327,8 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             poolA_name   = ui.input("Name").classes("w-64")
             poolA_port   = ui.number("Port", precision=0).props("step=1 min=1 max=65535").classes("w-64")
             poolA_wallet = ui.input("Wallet").classes("w-full")
+            poolA_chain  = ui.select(["BTC", "BCH"], value="BTC").classes("w-64").tooltip(
+                "Which blockchain this pool mines. Required for Auto-Balance oracle to map weights correctly.")
 
         # Pool B
         with ui.expansion("Pool B Settings:", icon="settings").classes("w-full").tooltip("Settings for Pool B"):
@@ -853,13 +1336,39 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             poolB_name   = ui.input("Name").classes("w-64")
             poolB_port   = ui.number("Port", precision=0).props("step=1 min=1 max=65535").classes("w-64")
             poolB_wallet = ui.input("Wallet").classes("w-full")
+            poolB_chain  = ui.select(["BTC", "BCH"], value="BCH").classes("w-64").tooltip(
+                "Which blockchain this pool mines. Required for Auto-Balance oracle to map weights correctly.")
 
         # Scheduler
         with ui.expansion("Scheduler Settings:", icon="settings").classes("w-full").tooltip("Settings for the dual-pool scheduler"):
-            sch_min_switch = ui.number("Min Switch Seconds", precision=0).props("step=1 min=0").classes("w-64").tooltip("Minimum time before switching pools. Recommend between 30 seconds and 60 seconds.")
-            sch_slice      = ui.number("Slice Seconds",      precision=0).props("step=1 min=0").classes("w-64").tooltip("Duration of each mining slice before switching. Recommend you use ~60% of Min Switch Seconds.")
-            sch_weightA    = ui.number("Pool A Weight",      precision=0).props("step=1 min=0").classes("w-64").tooltip("Weighting for Pool A in the scheduler.")
-            sch_weightB    = ui.number("Pool B Weight",      precision=0).props("step=1 min=0").classes("w-64").tooltip("Weighting for Pool B in the scheduler.")
+            sch_min_switch = ui.number("Min Switch Seconds", precision=0).props("step=1 min=25 max=300").classes("w-64").tooltip("Minimum time before switching pools. Recommend between 30 seconds and 60 seconds.")
+            sch_slice      = ui.number("Slice Seconds",      precision=0).props("step=1 min=1 max=120").classes("w-64").tooltip("Duration of each mining slice before switching. Recommend you use ~60% of Min Switch Seconds.")
+
+            # Visual separator to avoid accidentally editing weights when changing timing fields
+            ui.separator().classes("my-2")
+            ui.label("Pool Weights").classes("text-sm font-semibold").style("color: #6E93D6")
+            sch_weightA    = ui.number("Pool A Weight",      precision=0).props("step=5 min=0 max=100").classes("w-64").tooltip("Weighting for Pool A in the scheduler. Values are relative (e.g. 50/50 = same as 1/1).")
+            sch_weightB    = ui.number("Pool B Weight",      precision=0).props("step=5 min=0 max=100").classes("w-64").tooltip("Weighting for Pool B in the scheduler. Values are relative (e.g. 50/50 = same as 1/1).")
+            ui.separator().classes("my-2")
+
+            # Oracle Auto-Balance settings
+            ui.label("Oracle Auto-Balance").classes("text-sm font-semibold").style("color: #6E93D6")
+            sch_auto_balance = ui.checkbox("Enable Auto-Balance").tooltip(
+                "When enabled, the oracle automatically adjusts Pool A/B weights based on real-time "
+                "BTC and BCH network hashrate. Manual weights and the slider are ignored. "
+                "Requires Pool A and Pool B to have different chain assignments (one BTC, one BCH).")
+            sch_max_deviation = ui.number("Max Deviation (%)", value=20, precision=0).props("step=1 min=5 max=45").classes("w-64").tooltip(
+                "Maximum percentage points the oracle can deviate from 50/50. "
+                "Example: 20 means weights can range from 30/70 to 70/30. "
+                "45 means weights can range from 5/95 to 95/5. "
+                "Range: 5-45. Lower = more conservative, higher = more aggressive.")
+            sch_oracle_url = ui.input("Oracle URL").classes("w-full").tooltip(
+                "URL of the oracle data endpoint (oracle.php). "
+                "Default: https://www.sr-analyst.com/dpmp/oracle.php")
+            sch_oracle_poll = ui.number("Oracle Poll Seconds", value=600, precision=0).props("step=60 min=600 max=3600").classes("w-64").tooltip(
+                "How often the oracle fetches fresh hashrate data, in seconds. "
+                "Default: 600 (10 minutes). Minimum: 600. "
+                "The data collector updates every 10 minutes, so polling faster has no benefit.")
 
         ui.separator()
 
@@ -942,18 +1451,26 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             poolA_name.value   = str(_safe_get(cfg, ["pools", "A", "name"], "") or "")
             poolA_port.value   = _to_int(_safe_get(cfg, ["pools", "A", "port"], 3333), 3333)
             poolA_wallet.value = str(_safe_get(cfg, ["pools", "A", "wallet"], "") or "")
+            poolA_chain.value  = str(_safe_get(cfg, ["pools", "A", "chain"], "BTC") or "BTC").upper()
 
             # pools B
             poolB_host.value   = str(_safe_get(cfg, ["pools", "B", "host"], "") or "")
             poolB_name.value   = str(_safe_get(cfg, ["pools", "B", "name"], "") or "")
             poolB_port.value   = _to_int(_safe_get(cfg, ["pools", "B", "port"], 3333), 3333)
             poolB_wallet.value = str(_safe_get(cfg, ["pools", "B", "wallet"], "") or "")
+            poolB_chain.value  = str(_safe_get(cfg, ["pools", "B", "chain"], "BCH") or "BCH").upper()
 
             # scheduler
             sch_min_switch.value = _to_int(_safe_get(cfg, ["scheduler", "min_switch_seconds"], 30), 30)
             sch_slice.value      = _to_int(_safe_get(cfg, ["scheduler", "slice_seconds"], 30), 30)
             sch_weightA.value    = _to_int(_safe_get(cfg, ["scheduler", "poolA_weight"], 50), 50)
             sch_weightB.value    = _to_int(_safe_get(cfg, ["scheduler", "poolB_weight"], 50), 50)
+
+            # oracle auto-balance
+            sch_auto_balance.value  = bool(_safe_get(cfg, ["scheduler", "auto_balance"], False))
+            sch_max_deviation.value = _to_int(_safe_get(cfg, ["scheduler", "auto_balance_max_deviation"], 20), 20)
+            sch_oracle_url.value    = str(_safe_get(cfg, ["scheduler", "oracle_url"], "https://www.sr-analyst.com/dpmp/oracle.php") or "")
+            sch_oracle_poll.value   = _to_int(_safe_get(cfg, ["scheduler", "oracle_poll_seconds"], 600), 600)
 
             lbl_cfg.text = f"[{now_utc()}] reloaded"
             ui.notify("config reloaded", type="positive")
@@ -993,12 +1510,14 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             cfg["pools"]["A"]["name"]   = str(poolA_name.value or "").strip()
             cfg["pools"]["A"]["port"]   = _to_int(poolA_port.value, 3333)
             cfg["pools"]["A"]["wallet"] = str(poolA_wallet.value or "").strip()
+            cfg["pools"]["A"]["chain"]  = str(poolA_chain.value or "BTC").strip().upper()
 
             cfg["pools"].setdefault("B", {})
             cfg["pools"]["B"]["host"]   = str(poolB_host.value or "").strip()
             cfg["pools"]["B"]["name"]   = str(poolB_name.value or "").strip()
             cfg["pools"]["B"]["port"]   = _to_int(poolB_port.value, 2018)
             cfg["pools"]["B"]["wallet"] = str(poolB_wallet.value or "").strip()
+            cfg["pools"]["B"]["chain"]  = str(poolB_chain.value or "BCH").strip().upper()
 
             # scheduler
             cfg.setdefault("scheduler", {})
@@ -1006,6 +1525,13 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             cfg["scheduler"]["slice_seconds"]      = _to_int(sch_slice.value, 30)
             cfg["scheduler"]["poolA_weight"]       = _to_int(sch_weightA.value, 50)
             cfg["scheduler"]["poolB_weight"]       = _to_int(sch_weightB.value, 50)
+
+            # oracle auto-balance
+            cfg["scheduler"]["auto_balance"]               = bool(sch_auto_balance.value)
+            cfg["scheduler"]["auto_balance_max_deviation"]  = max(5, min(45, _to_int(sch_max_deviation.value, 20)))
+            cfg["scheduler"]["oracle_url"]                 = str(sch_oracle_url.value or "").strip()
+            cfg["scheduler"]["oracle_poll_seconds"]        = max(600, min(3600, _to_int(sch_oracle_poll.value, 600)))
+
             cfg.setdefault("scheduler", {}).setdefault("mode", "ratio")  # preserve/ensure
 
             try:
@@ -1047,7 +1573,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
         ui.label("Logs").classes("text-lg font-semibold")
 
         with ui.row().classes("items-center gap-3"):
-            inp_filter = ui.input("filter contains…").classes("w-64").tooltip("Show only log lines containing this text")
+            inp_filter = ui.input("filter contains...").classes("w-64").tooltip("Show only log lines containing this text")
             chk_freeze = ui.checkbox("freeze").tooltip("Stop auto-refreshing logs")
             #btn_jump   = ui.button("jump to end", icon="south")
             lbl_logs   = ui.label("").classes("text-xs text-gray-500")
@@ -1071,7 +1597,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             text = re.sub(r'\bbc1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{38,58}\b', '[REDACTED]', text)
             # BCH cashaddr (with prefix)
             text = re.sub(r'\bbitcoincash:[qp][a-z0-9]{41,}\b', '[REDACTED]', text)
-            # BCH short cashaddr (no prefix — starts with q or p + 41 alnum)
+            # BCH short cashaddr (no prefix ... starts with q or p + 41 alnum)
             text = re.sub(r'\b[qp][a-z0-9]{41,55}\b', '[REDACTED]', text)
             # Legacy addresses (1... or 3...)
             text = re.sub(r'\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b', '[REDACTED]', text)
@@ -1154,5 +1680,4 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
 
         ui.html(f'<div class="about-content">{html}</div>', sanitize=False).classes("w-full")
 
-
-ui.run(host=HOST, port=PORT, title="dpmpv2 NiceGUI", reload=False, show=False)
+ui.run(host=HOST, port=PORT, title="DPMP Dashboard", reload=False, show=False)

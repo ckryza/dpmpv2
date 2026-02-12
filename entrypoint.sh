@@ -8,6 +8,9 @@ if [ ! -f /data/config_v2.json ]; then
   cp -a /app/dpmp/config_v2_example.json /data/config_v2.json
 fi
 
+# Merge any new default fields into existing config (safe, non-destructive)
+python3 /app/dpmp/merge_config.py /app/dpmp/config_v2_example.json /data/config_v2.json
+
 RUN_LOG="/data/dpmpv2_run.log"
 GUI_LOG="/data/dpmpv2_gui.log"
 

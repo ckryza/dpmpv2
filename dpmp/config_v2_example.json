@@ -11,18 +11,35 @@
   "logging": {
     "allow": [],
     "deny": [
-      "submit_route",
-      "share_result",
-      "scheduler_tick",
-      "id_response_seen",      
-      "downstream_extranonce_skip_raw_subscribe",
-      "downstream_extranonce_skip_nochange",
-      "downstream_extranonce_set",
-      "downstream_diff_set",
-      "job_forwarded",
-      "miner_method",
-      "pool_notify",
-      "notify_clean_forced"
+        "authorize_rewrite","authorize_rewrite_other","authorize_rewrite_secondary",
+        "bootstrap_reconnect_forced","bootstrap_skipped_handshake_pool",
+        "downstream_extranonce_check","downstream_extranonce_skip_already_in_subscribe",
+        "downstream_extranonce_skip_no_data",
+        "downstream_extranonce_skip_nochange","downstream_extranonce_skip_raw_subscribe",
+        "downstream_extranonce_set","downstream_diff_set",
+        "downstream_notify_flushed_after_subscribe",
+        "downstream_send_diff","downstream_send_extranonce","downstream_send_notify",
+        "downstream_send_raw","downstream_subscribe_forwarded_raw","downstream_tx",
+        "handshake_response_dropped",
+        "id_response_seen",
+        "job_forwarded","job_forwarded_diff_state",
+        "miner_method",
+        "notify_clean_forced",
+        "oracle_calc_result","oracle_data_age","oracle_next_poll",
+        "oracle_override_written","oracle_poll_start","oracle_weights_applied",
+        "pool_notify",
+        "post_auth_downstream_sync","post_auth_extranonce_skip_already_in_subscribe",
+        "post_auth_extranonce_skip_raw_subscribe",
+        "post_auth_push_diff","post_auth_push_extranonce",
+        "post_auth_push_notify_clean",
+        "prune_internal_ids","prune_job_owner","prune_seen_upstream_ids","prune_submit_owner",
+        "scheduler_tick",
+        "send_upstream_flush_done","send_upstream_flush_start","send_upstream_queued",
+        "share_result",
+        "submit_local_sanity","submit_route","submit_snapshot",
+        "subscribe_id_response_skipped_duplicate","subscribe_result",
+        "upstream_response_dup_observed","upstream_tx",
+        "weights_override_changed"        
     ],
     "json": true,
     "level": "INFO"
@@ -37,20 +54,26 @@
       "host": "POOL_A_HOST",
       "name": "POOL_A",
       "port": 3333,
-      "wallet": "POOL_A_WALLET"
+      "wallet": "POOL_A_WALLET",
+      "chain": "BTC"
     },
     "B": {
       "host": "POOL_B_HOST",
       "name": "POOL_B",
       "port": 3333,
-      "wallet": "POOL_B_WALLET"
+      "wallet": "POOL_B_WALLET",
+      "chain": "BCH"
     }
   },
-  "scheduler": {
+"scheduler": {
     "min_switch_seconds": 50,
     "mode": "ratio",
     "poolA_weight": 50,
     "poolB_weight": 50,
-    "slice_seconds": 30
+    "slice_seconds": 30,
+    "auto_balance": false,
+    "auto_balance_max_deviation": 20,
+    "oracle_url": "https://www.sr-analyst.com/dpmp/oracle.php",
+    "oracle_poll_seconds": 600
   }
 }
