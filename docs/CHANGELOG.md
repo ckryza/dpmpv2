@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.0.3 - 2026-02-11
+- calculate realtime network hashrate for BTC and BCH (short-term and long-term)
+- add auto-balance options to config
+- add auto-balance logic to DPMP and dashboard
+
 ## 2.0.2 - 2026-02-09
 - Fixes for ck-type pools and bootstrap sequence
 - Add realtime hashrate allocation slider to GUI

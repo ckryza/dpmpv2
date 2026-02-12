@@ -105,6 +105,11 @@ if [ ! -f dpmp/config_v2.json ]; then
   run cp dpmp/config_v2_example.json dpmp/config_v2.json
 fi
 
+#-------------------------------------------------------------------------------------
+# Merge any new default fields into existing config (safe, non-destructive)
+#-------------------------------------------------------------------------------------
+run .venv/bin/python dpmp/merge_config.py dpmp/config_v2_example.json dpmp/config_v2.json
+
 # ----------------------------------------------------------------------
 # Install systemd user services
 # ----------------------------------------------------------------------
