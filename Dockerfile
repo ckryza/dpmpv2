@@ -12,8 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Allow-list ONLY the runtime files we need
 COPY requirements.txt /app/requirements.txt
 COPY entrypoint.sh /app/entrypoint.sh
-COPY dpmp/dpmpv2.py /app/dpmp/dpmpv2.py
-COPY dpmp/config_v2_example.json /app/dpmp/config_v2_example.json
+COPY dpmp /app/dpmp
 COPY gui_nice /app/gui_nice
 
 RUN pip install --no-cache-dir -U pip \
