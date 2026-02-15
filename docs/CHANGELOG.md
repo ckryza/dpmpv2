@@ -1,5 +1,10 @@
 # Changelog
 
+## 3.0.1 - 2026-02-14
+- can now switch between Slider and Auto-Balance with no restart required (added switch button)
+- Auto-Balance times now in local time
+- minor cosmetic updates
+
 ## 3.0.0 - 2026-02-11
 - calculate realtime network hashrate for BTC and BCH (short-term and long-term)
 - add auto-balance options to config

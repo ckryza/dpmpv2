@@ -26,6 +26,7 @@ DPMP_LOG_PATH = os.environ.get("DPMP_LOG_PATH", os.path.expanduser("~/dpmp/dpmpv
 GUI_LOG_PATH  = os.environ.get("GUI_LOG_PATH", os.path.expanduser("~/dpmp/dpmpv2_gui.log"))
 WEIGHTS_OVERRIDE_PATH = os.path.join(os.path.dirname(os.environ.get("DPMP_CONFIG_PATH", os.path.expanduser("~/dpmp/dpmp/config_v2.json"))), "weights_override.json")
 ORACLE_CHART_HISTORY_PATH = os.path.join(os.path.dirname(os.environ.get("DPMP_CONFIG_PATH", os.path.expanduser("~/dpmp/dpmp/config_v2.json"))), "oracle_chart_history.json")
+ORACLE_MODE_PATH = os.path.join(os.path.dirname(os.environ.get("DPMP_CONFIG_PATH", os.path.expanduser("~/dpmp/dpmp/config_v2.json"))), "oracle_mode.json")
 HOST = os.environ.get("NICEGUI_HOST", "0.0.0.0")
 PORT = int(os.environ.get("NICEGUI_PORT", "8845"))
 POLL_S = float(os.environ.get("NICEGUI_POLL_S", "2.0"))
@@ -147,7 +148,7 @@ def prom_first_float(metrics: dict, name: str, labels: dict | None = None) -> fl
                 except Exception:
                     return None
         return None
-    # no label filter â†’ first value
+    # no label filter -- first value
     try:
         return float(rows[0].get("value"))
     except Exception:
@@ -225,6 +226,31 @@ def delete_weight_override() -> None:
     except Exception:
         pass
 
+# oracle_mode.json helpers (hot-switch between oracle and slider)
+def write_oracle_mode(oracle_active: bool) -> None:
+    """Write oracle_mode.json so DPMP knows whether oracle should write weights."""
+    write_json_atomic(ORACLE_MODE_PATH, {"oracle_active": oracle_active})
+
+def read_oracle_mode() -> bool | None:
+    """Read oracle_mode.json. Returns True/False, or None if file missing."""
+    try:
+        with open(ORACLE_MODE_PATH, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return bool(obj.get("oracle_active", True))
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+def delete_oracle_mode() -> None:
+    """Remove oracle_mode.json so DPMP falls back to config auto_balance on restart."""
+    try:
+        os.remove(ORACLE_MODE_PATH)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
 # write JSON file atomically
 def write_json_atomic(path: str, obj: Dict[str, Any]) -> None:
     tmp = f"{path}.tmp"
@@ -258,7 +284,7 @@ def load_oracle_chart_history(poll_seconds: int) -> list:
         saved_at = obj.get("saved_at", 0)
         if not points:
             return []
-        # If saved_at is older than 2x poll interval, data is stale — discard
+        # If saved_at is older than 2x poll interval, data is stale -- discard
         age = time.time() - saved_at
         if age > poll_seconds * 2:
             return []
@@ -466,9 +492,10 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                     btn_restart = ui.button("Restart DPMP", icon="restart_alt")
                     lbl_restart = ui.label("").classes("text-sm")
 
-            # Right column: Hashrate Allocation Slider
-            # Only show the slider if BOTH pools have weight > 0 in config.
-            # At 0/100 or 100/0, one pool is never connected ... sliding toward it would break things.
+            # Right column: Hashrate allocation (slider OR oracle panel)
+            # Both panels are ALWAYS built. Visibility is toggled by the switch button.
+            # The oracle background data collection runs regardless of which panel is visible.
+
             cfg_wA, cfg_wB = get_config_weights()
             cfg_total = cfg_wA + cfg_wB
             cfg_slider_default = round((cfg_wA / cfg_total) * 100 / 5) * 5 if cfg_total > 0 else 50
@@ -482,26 +509,57 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             ab_cfg = get_auto_balance_config()
             _auto_balance_enabled = ab_cfg["auto_balance"]
 
-            # ---- MANUAL MODE: show slider ----
-            weight_slider_ref = None  # default; set below only if slider is shown
+            # Determine chain validity: oracle requires exactly one BTC + one BCH pool
+            _chain_a = ab_cfg["poolA_chain"]
+            _chain_b = ab_cfg["poolB_chain"]
+            _chain_valid = sorted([_chain_a, _chain_b]) == ["BCH", "BTC"]
 
-            if not _auto_balance_enabled and cfg_wA > 0 and cfg_wB > 0:
-                # If an override file exists (slider was moved), start there instead of config defaults
-                try:
-                    ov = read_json(WEIGHTS_OVERRIDE_PATH)
-                    ov_wA = int(ov.get("poolA_weight", -1))
-                    ov_wB = int(ov.get("poolB_weight", -1))
-                    ov_total = ov_wA + ov_wB
-                    if ov_wA >= 0 and ov_wB >= 0 and ov_total > 0:
-                        slider_initial = round((ov_wA / ov_total) * 100 / 5) * 5
-                        slider_initial = max(5, min(95, slider_initial))
-                    else:
+            # Determine initial mode:
+            #   - If chain config is invalid -> always slider, no switch button
+            #   - If oracle_mode.json exists -> use its value
+            #   - Otherwise -> use config auto_balance
+            _oracle_mode_file = read_oracle_mode()  # True/False/None
+            if not _chain_valid:
+                _show_oracle = False
+            elif _oracle_mode_file is not None:
+                _show_oracle = _oracle_mode_file
+            else:
+                _show_oracle = _auto_balance_enabled
+
+            # Shared mutable state for mode switching
+            _mode = {"oracle_active": _show_oracle}
+
+            # ---- SLIDER PANEL (always built) ----
+            weight_slider_ref = None
+
+            # Only build the slider interaction if BOTH pools have weight > 0
+            _slider_usable = (cfg_wA > 0 and cfg_wB > 0)
+
+            with ui.card().classes("flex-1 min-w-[320px] max-w-[480px]") as slider_card:
+
+                with ui.row().classes("w-full items-center justify-between"):
+                    with ui.row().classes("items-center gap-1"):
+                        ui.icon("balance", size="sm").style("color: #6E93D6")
+                        ui.label("Hashrate Allocation").classes("text-base font-semibold").style("color: #6E93D6")
+
+                    # Switch button: only shown when chain config is valid
+                    if _chain_valid:
+                        btn_switch_to_oracle = ui.button("Switch to Oracle", icon="swap_horiz").props("dense outline size=sm").classes("text-xs")
+
+                if _slider_usable:
+                    # If an override file exists (slider was moved), start there instead of config defaults
+                    try:
+                        ov = read_json(WEIGHTS_OVERRIDE_PATH)
+                        ov_wA = int(ov.get("poolA_weight", -1))
+                        ov_wB = int(ov.get("poolB_weight", -1))
+                        ov_total = ov_wA + ov_wB
+                        if ov_wA >= 0 and ov_wB >= 0 and ov_total > 0:
+                            slider_initial = round((ov_wA / ov_total) * 100 / 5) * 5
+                            slider_initial = max(5, min(95, slider_initial))
+                        else:
+                            slider_initial = cfg_slider_default
+                    except Exception:
                         slider_initial = cfg_slider_default
-                except Exception:
-                    slider_initial = cfg_slider_default
-
-                with ui.card().classes("flex-1 min-w-[320px] max-w-[480px]"):
-                    ui.label("Hashrate Allocation").classes("text-base font-semibold").style("color: #6E93D6")
 
                     with ui.row().classes("w-full items-center gap-3"):
                         ui.label("Pool A").classes("text-sm font-semibold").style("color: #22d3ee")
@@ -514,23 +572,35 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                     with ui.row().classes("w-full justify-center"):
                         btn_weight_reset = ui.button("Reset to Config Defaults", icon="restart_alt").props("dense outline size=sm").classes("text-xs")
 
-                weight_slider_ref = weight_slider
+                    weight_slider_ref = weight_slider
+                else:
+                    ui.label("Slider disabled (one pool has 0 weight)").classes("text-sm").style("color: #888")
 
-            # ---- AUTO-BALANCE MODE: show oracle panel ----
-            _oracle_ui = {}  # holds references to oracle UI elements for the update timer
+            # Set initial visibility
+            slider_card.visible = not _show_oracle
 
-            if _auto_balance_enabled:
-                # Determine chart order: left chart = Pool A's chain, right chart = Pool B's chain
+            # ---- ORACLE PANEL (always built when chain config is valid) ----
+            _oracle_ui = {}  # holds references to oracle UI elements
+            _oracle_charts = []
+
+            if _chain_valid:
                 _chain_left = ab_cfg["poolA_chain"]   # e.g. "BCH"
                 _chain_right = ab_cfg["poolB_chain"]   # e.g. "BTC"
 
-                with ui.card().classes("flex-1 min-w-[280px] max-w-[540px]"):
+                with ui.card().classes("flex-1 min-w-[280px] max-w-[540px]") as oracle_card:
+
                     with ui.row().classes("w-full items-center justify-between"):
-                        ui.label("Oracle Auto-Balance").classes("text-base font-semibold").style("color: #6E93D6")
-                        # Health indicator
                         with ui.row().classes("items-center gap-1"):
-                            oracle_health_dot = ui.icon("circle", size="xs")
-                            oracle_health_lbl = ui.label("starting...").classes("text-xs")
+                            ui.icon("auto_graph", size="sm").style("color: #6E93D6")
+                            ui.label("Oracle Auto-Balance").classes("text-base font-semibold").style("color: #6E93D6")
+
+                        with ui.row().classes("items-center gap-2"):
+                            # Health indicator
+                            with ui.row().classes("items-center gap-1"):
+                                oracle_health_dot = ui.icon("circle", size="xs")
+                                oracle_health_lbl = ui.label("starting...").classes("text-xs")
+                            # Switch button
+                            btn_switch_to_slider = ui.button("Switch to Slider", icon="swap_horiz").props("dense outline size=sm").classes("text-xs")
                     _oracle_ui["health_dot"] = oracle_health_dot
                     _oracle_ui["health_lbl"] = oracle_health_lbl
 
@@ -611,16 +681,79 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                     _oracle_ui["ratio_lbl"] = oracle_ratio_lbl
                     _oracle_ui["countdown_lbl"] = oracle_countdown_lbl
 
-                # List of oracle echart references for dark mode sync
-                _oracle_charts = []
-                if _auto_balance_enabled:
-                    _oracle_charts = [_oracle_ui.get("chart_left"), _oracle_ui.get("chart_right")]
+                # Set initial visibility
+                oracle_card.visible = _show_oracle
 
-                # Oracle UI update timer (reads Prometheus metrics)
+                _oracle_charts = [_oracle_ui.get("chart_left"), _oracle_ui.get("chart_right")]
+            else:
+                oracle_card = None  # no oracle panel when chain config is invalid
 
-                _CHART_MAX_POINTS = 8
-                _oracle_poll_interval = ab_cfg["oracle_poll_seconds"]
+            # ---- SWITCH BUTTON HANDLERS ----
+            def _do_switch_to_oracle():
+                """User clicked 'Switch to Oracle' on the slider panel."""
+                _mode["oracle_active"] = True
+                write_oracle_mode(True)
+                slider_card.visible = False
+                if oracle_card is not None:
+                    oracle_card.visible = True
 
+                # Immediately write the oracle's current weights to weights_override.json
+                # so the scheduler starts converging right away instead of waiting up to
+                # 10 minutes for the next oracle poll cycle.
+                try:
+                    raw = http_get_text(METRICS_URL)
+                    wA = prom_value(raw, "dpmp_oracle_weight", {"pool": "A"})
+                    wB = prom_value(raw, "dpmp_oracle_weight", {"pool": "B"})
+                    if wA is not None and wB is not None and (int(wA) + int(wB)) > 0:
+                        write_weight_override(int(wA), int(wB))
+                except Exception:
+                    pass  # oracle data may not be available yet; next poll will handle it
+
+                ui.notify("Switched to Oracle mode", type="info")
+
+            def _do_switch_to_slider():
+                """User clicked 'Switch to Slider' on the oracle panel."""
+                _mode["oracle_active"] = False
+                write_oracle_mode(False)
+                if oracle_card is not None:
+                    oracle_card.visible = False
+                slider_card.visible = True
+                # Write the current slider position to weights_override.json
+                # so DPMP immediately picks up the slider's weights
+                if weight_slider_ref is not None:
+                    val = int(weight_slider_ref.value)
+                    write_weight_override(val, 100 - val)
+                ui.notify("Switched to Slider mode", type="info")
+
+            if _chain_valid:
+                btn_switch_to_oracle.on_click(_do_switch_to_oracle)
+                btn_switch_to_slider.on_click(_do_switch_to_slider)
+
+            # ---- ORACLE CHART STATE + UPDATE TIMER (always runs when chain valid) ----
+            _CHART_MAX_POINTS = 8
+            _oracle_poll_interval = ab_cfg["oracle_poll_seconds"]
+
+            # Helper: convert UTC epoch to user's local time string.
+            # The server (Docker) may be in UTC, so we use a browser-detected offset
+            # stored in _tz_offset (dict so closures can mutate it).
+            # Default offset is 0 (UTC) until the browser reports its real offset.
+            _tz_offset = {"seconds": 0}  # set by _init_tz_offset() after page load
+
+            def _utc_epoch_to_local_hhmm(epoch_s: float = None) -> str:
+                """Convert a UTC epoch timestamp to user-local HH:MM string."""
+                if epoch_s is None:
+                    epoch_s = time.time()
+                adjusted = epoch_s + _tz_offset["seconds"]
+                return time.strftime("%H:%M", time.gmtime(adjusted))
+
+            def _utc_epoch_to_local_hhmmss(epoch_s: float = None) -> str:
+                """Convert a UTC epoch timestamp to user-local HH:MM:SS string."""
+                if epoch_s is None:
+                    epoch_s = time.time()
+                adjusted = epoch_s + _tz_offset["seconds"]
+                return time.strftime("%H:%M:%S", time.gmtime(adjusted))
+
+            if _chain_valid:
                 # Try to restore chart history from disk (survives browser refresh)
                 _restored_history = load_oracle_chart_history(_oracle_poll_interval)
 
@@ -639,18 +772,13 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                     n_real = len(_restored_history)
                     labels = [h["time_label"] for h in _restored_history]
                     if n_real < _CHART_MAX_POINTS:
-                        last_label = labels[-1]
-                        try:
-                            parts = last_label.split(":")
-                            last_min_total = int(parts[0]) * 60 + int(parts[1])
-                        except Exception:
-                            last_min_total = 0
-                        poll_min = max(1, _oracle_poll_interval // 60)
+                        # Project future timestamps using epoch if available
+                        last_h = _restored_history[-1]
+                        last_epoch = last_h.get("epoch_s", time.time())
+                        poll_s = max(60, _oracle_poll_interval)
                         for i in range(1, _CHART_MAX_POINTS - n_real + 1):
-                            proj_min = last_min_total + (i * poll_min)
-                            hh = (proj_min // 60) % 24
-                            mm = proj_min % 60
-                            labels.append(f"{hh:02d}:{mm:02d}")
+                            proj_epoch = last_epoch + (i * poll_s)
+                            labels.append(_utc_epoch_to_local_hhmm(proj_epoch))
 
                     left_short_data = [h["left_short"] for h in _restored_history] + [None] * (_CHART_MAX_POINTS - n_real)
                     left_long_data = [h["left_long"] for h in _restored_history] + [None] * (_CHART_MAX_POINTS - n_real)
@@ -685,7 +813,11 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                         pass
 
                     # Restore "Last updated" label from the most recent point
-                    _oracle_ui["countdown_lbl"].text = f"Last updated: {last_pt['time_label']} UTC"
+                    # Use the saved epoch_s if available, otherwise show the time_label
+                    if "epoch_s" in last_pt:
+                        _oracle_ui["countdown_lbl"].text = f"Last updated: {_utc_epoch_to_local_hhmmss(last_pt['epoch_s'])}"
+                    else:
+                        _oracle_ui["countdown_lbl"].text = f"Last updated: {last_pt['time_label']}"
 
                 def _oracle_metric_from_raw(raw_text, name, labels_dict):
                     """Extract oracle metric with arbitrary labels from raw Prometheus text."""
@@ -727,7 +859,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
 
                         # Distinguish three states:
                         # 1. Healthy (oracle has polled successfully)
-                        # 2. Warming up (DPMP running but oracle hasn't polled yet — all gauges zero)
+                        # 2. Warming up (DPMP running but oracle hasn't polled yet --” all gauges zero)
                         # 3. Offline (oracle polled but returned error)
                         if is_healthy:
                             _oracle_ui["health_dot"].style("color: limegreen")
@@ -793,16 +925,18 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                                 is_new_poll = True
                                 _oracle_state["last_data_age"] = data_age
                                 _oracle_state["last_hashrates"] = current_hashrates
-                                # Stamp "Last Updated"
-                                updated_ts = time.strftime("%H:%M:%S", time.gmtime())
-                                _oracle_ui["countdown_lbl"].text = f"Last updated: {updated_ts} UTC"
+                                # Stamp "Last Updated" in local time
+                                updated_ts = _utc_epoch_to_local_hhmmss()
+                                _oracle_ui["countdown_lbl"].text = f"Last updated: {updated_ts}"
 
                         if is_new_poll:
-                            # Add new data point to history
-                            now_label = time.strftime("%H:%M", time.gmtime())
+                            # Add new data point to history (use local time for labels)
+                            now_epoch = time.time()
+                            now_label = _utc_epoch_to_local_hhmm(now_epoch)
                             history = _oracle_state["chart_history"]
                             history.append({
                                 "time_label": now_label,
+                                "epoch_s": now_epoch,
                                 "left_short": ehs_short_l, "left_long": ehs_long_l,
                                 "right_short": ehs_short_r, "right_long": ehs_long_r,
                             })
@@ -818,21 +952,14 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                             # Build x-axis labels: real times + projected future times
                             n_real = len(history)
                             labels = [h["time_label"] for h in history]
-                            # Fill remaining slots with projected timestamps
+                            # Fill remaining slots with projected timestamps (local time)
                             if n_real < _CHART_MAX_POINTS:
-                                # Parse last real time to project forward
-                                last_label = labels[-1]
-                                try:
-                                    parts = last_label.split(":")
-                                    last_min_total = int(parts[0]) * 60 + int(parts[1])
-                                except Exception:
-                                    last_min_total = 0
-                                poll_min = max(1, _oracle_poll_interval // 60)
+                                last_pt_h = history[-1]
+                                last_epoch = last_pt_h.get("epoch_s", time.time())
+                                poll_s = max(60, _oracle_poll_interval)
                                 for i in range(1, _CHART_MAX_POINTS - n_real + 1):
-                                    proj_min = last_min_total + (i * poll_min)
-                                    hh = (proj_min // 60) % 24
-                                    mm = proj_min % 60
-                                    labels.append(f"{hh:02d}:{mm:02d}")
+                                    proj_epoch = last_epoch + (i * poll_s)
+                                    labels.append(_utc_epoch_to_local_hhmm(proj_epoch))
 
                             # Build series data arrays (None for empty slots)
                             left_short_data = [h["left_short"] for h in history] + [None] * (_CHART_MAX_POINTS - n_real)
@@ -896,7 +1023,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                 )
             else:
                 lbl_weight_status.content = (
-                    f'<span style="color:#f59e0b">â— Live override active ... DPMP is using these weights</span>'
+                    f'<span style="color:#f59e0b">&#9650; Live override active ... DPMP is using these weights</span>'
                 )
 
         def _on_slider_change(e):
@@ -924,18 +1051,33 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             btn_weight_reset.on_click(_reset_weights)
             _update_weight_display()
 
+        def _fmt_short(v: float) -> str:
+            """Format a number with K/M/G/T suffix for compact display."""
+            if v >= 1e12:
+                return f"{v/1e12:.2f}T"
+            if v >= 1e9:
+                return f"{v/1e9:.2f}G"
+            if v >= 1e6:
+                return f"{v/1e6:.2f}M"
+            if v >= 1e3:
+                return f"{v/1e3:.2f}K"
+            return f"{int(v)}"
 
         def do_restart():
             # Delete weight override so DPMP starts fresh with config defaults
             delete_weight_override()
 
+            # Delete oracle_mode.json so DPMP falls back to config auto_balance
+            delete_oracle_mode()
+
             # Clear chart history so charts start fresh after DPMP restart
             # (also cleared on GUI startup, but clear here too for immediate effect)
             clear_oracle_chart_history()
-            _oracle_state["chart_history"] = []
-            _oracle_state["has_data"] = False
-            _oracle_state["last_data_age"] = None
-            _oracle_state["last_hashrates"] = None
+            if _chain_valid:
+                _oracle_state["chart_history"] = []
+                _oracle_state["has_data"] = False
+                _oracle_state["last_data_age"] = None
+                _oracle_state["last_hashrates"] = None
 
             # Reset slider back to current config defaults (recompute in case config changed)
             if weight_slider_ref is not None:
@@ -948,6 +1090,15 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                     _cfg["slider_default"] = 50
                 weight_slider_ref.value = _cfg["slider_default"]
                 _update_weight_display()
+
+            # Reset panel visibility to config default
+            _new_ab = get_auto_balance_config()
+            _new_chain_valid = sorted([_new_ab["poolA_chain"], _new_ab["poolB_chain"]]) == ["BCH", "BTC"]
+            _new_show_oracle = _new_ab["auto_balance"] and _new_chain_valid
+            _mode["oracle_active"] = _new_show_oracle
+            slider_card.visible = not _new_show_oracle
+            if oracle_card is not None:
+                oracle_card.visible = _new_show_oracle
 
 
             ok, msg = restart_dpmpv2()
@@ -1049,7 +1200,20 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             # Sync oracle chart text colors with initial dark mode state
             _sync_chart_dark_mode(is_dark)
 
+
         ui.timer(0.0, _init_dark_from_storage, once=True)
+
+        # Detect browser timezone offset so oracle times display in user's local time.
+        # JavaScript's getTimezoneOffset() returns minutes AHEAD of UTC (negative for east),
+        # e.g., EST (UTC-5) returns 300. We invert to get seconds to ADD to UTC epoch.
+        async def _init_tz_offset() -> None:
+            try:
+                offset_min = await ui.run_javascript("new Date().getTimezoneOffset()")
+                _tz_offset["seconds"] = -int(offset_min) * 60  # e.g., 300 -> -18000 -> add -300*60
+            except Exception:
+                _tz_offset["seconds"] = 0  # fall back to UTC
+
+        ui.timer(0.0, _init_tz_offset, once=True)
 
         # Rolling window for "Recent Ratio" ... stores (timestamp, difA, difB) snapshots.
         # We keep ~2 minutes of history (at 2s poll interval, that's ~60 samples).
@@ -1111,7 +1275,8 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                 lbl_acc.content = f"<b>Accepted</b>: A {int(accA)} / B {int(accB)}"
                 lbl_rej.content = f"<b>Rejected</b>: A {int(rejA)} / B {int(rejB)} ({rejpA:.2f}% / {rejpB:.2f}%)"
                 lbl_jobs.content = f"<b>Jobs</b>: A {int(jobA)} / B {int(jobB)}"
-                lbl_dif.content = f"<b>SumDiff</b>: A {int(difA)} / B {int(difB)}"
+                #lbl_dif.content = f"<b>SumDiff</b>: A {int(difA)} / B {int(difB)}"
+                lbl_dif.content = f"<b>SumDiff</b>: A {_fmt_short(difA)} / B {_fmt_short(difB)}"
                 lbl_rat.content = f"<b>Diff Ratio (all-time)</b>: A {pctA:.2f}% / B {pctB:.2f}%"
 
                 # Rolling 2-minute ratio 
@@ -1179,7 +1344,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             "job_forwarded","job_forwarded_diff_state",
             "miner_method",
             "notify_clean_forced",
-            "oracle_calc_result","oracle_data_age","oracle_next_poll",
+            "oracle_calc_result","oracle_data_age","oracle_mode_slider","oracle_next_poll",
             "oracle_override_written","oracle_poll_start","oracle_weights_applied",
             "pool_notify",
             "post_auth_downstream_sync","post_auth_extranonce_skip_already_in_subscribe",
@@ -1223,7 +1388,10 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             "notify_clean_force_error","notify_clean_forced",
             "oracle_bad_timestamps","oracle_calc_result","oracle_cancelled","oracle_config",
             "oracle_data_age","oracle_disabled","oracle_disabled_bad_chain_config",
-            "oracle_fallback_50_50","oracle_next_poll","oracle_override_write_error",
+            "oracle_disabled_invalid_chains",
+            "oracle_fallback_50_50","oracle_mode_file_deleted_on_startup","oracle_mode_slider",
+            "oracle_mode_switch_to_oracle","oracle_mode_switch_to_slider",
+            "oracle_next_poll","oracle_override_write_error",
             "oracle_override_written","oracle_poll_error","oracle_poll_start",
             "oracle_starting","oracle_startup_delay","oracle_task_cancelled",
             "oracle_task_started","oracle_ts_parse_warning","oracle_weights_applied",
@@ -1327,8 +1495,9 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             poolA_name   = ui.input("Name").classes("w-64")
             poolA_port   = ui.number("Port", precision=0).props("step=1 min=1 max=65535").classes("w-64")
             poolA_wallet = ui.input("Wallet").classes("w-full")
-            poolA_chain  = ui.select(["BTC", "BCH"], value="BTC").classes("w-64").tooltip(
-                "Which blockchain this pool mines. Required for Auto-Balance oracle to map weights correctly.")
+            poolA_chain  = ui.select(["BTC", "BCH", "None"], value="BTC", label="Chain").classes("w-64").tooltip(
+                "Which blockchain this pool mines. Set to 'None' if not applicable. "
+                "Required for Auto-Balance oracle to map weights correctly.")
 
         # Pool B
         with ui.expansion("Pool B Settings:", icon="settings").classes("w-full").tooltip("Settings for Pool B"):
@@ -1336,8 +1505,9 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             poolB_name   = ui.input("Name").classes("w-64")
             poolB_port   = ui.number("Port", precision=0).props("step=1 min=1 max=65535").classes("w-64")
             poolB_wallet = ui.input("Wallet").classes("w-full")
-            poolB_chain  = ui.select(["BTC", "BCH"], value="BCH").classes("w-64").tooltip(
-                "Which blockchain this pool mines. Required for Auto-Balance oracle to map weights correctly.")
+            poolB_chain  = ui.select(["BTC", "BCH", "None"], value="BCH", label="Chain").classes("w-64").tooltip(
+                "Which blockchain this pool mines. Set to 'None' if not applicable. "
+                "Required for Auto-Balance oracle to map weights correctly.")
 
         # Scheduler
         with ui.expansion("Scheduler Settings:", icon="settings").classes("w-full").tooltip("Settings for the dual-pool scheduler"):
@@ -1451,14 +1621,17 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             poolA_name.value   = str(_safe_get(cfg, ["pools", "A", "name"], "") or "")
             poolA_port.value   = _to_int(_safe_get(cfg, ["pools", "A", "port"], 3333), 3333)
             poolA_wallet.value = str(_safe_get(cfg, ["pools", "A", "wallet"], "") or "")
-            poolA_chain.value  = str(_safe_get(cfg, ["pools", "A", "chain"], "BTC") or "BTC").upper()
+            _raw_chainA = str(_safe_get(cfg, ["pools", "A", "chain"], "") or "").strip().upper()
+            _chain_map = {"BTC": "BTC", "BCH": "BCH", "NONE": "None"}
+            poolA_chain.value = _chain_map.get(_raw_chainA, "BTC")
 
             # pools B
             poolB_host.value   = str(_safe_get(cfg, ["pools", "B", "host"], "") or "")
             poolB_name.value   = str(_safe_get(cfg, ["pools", "B", "name"], "") or "")
             poolB_port.value   = _to_int(_safe_get(cfg, ["pools", "B", "port"], 3333), 3333)
             poolB_wallet.value = str(_safe_get(cfg, ["pools", "B", "wallet"], "") or "")
-            poolB_chain.value  = str(_safe_get(cfg, ["pools", "B", "chain"], "BCH") or "BCH").upper()
+            _raw_chainB = str(_safe_get(cfg, ["pools", "B", "chain"], "") or "").strip().upper()
+            poolB_chain.value = _chain_map.get(_raw_chainB, "BCH")
 
             # scheduler
             sch_min_switch.value = _to_int(_safe_get(cfg, ["scheduler", "min_switch_seconds"], 30), 30)
@@ -1542,6 +1715,8 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
 
             # Delete weight override so DPMP starts fresh with config defaults
             delete_weight_override()
+            # Delete oracle_mode.json so DPMP falls back to config auto_balance
+            delete_oracle_mode()
             # Reset slider back to NEW config defaults (recompute from saved config)
             if weight_slider_ref is not None:
                 new_wA = _to_int(sch_weightA.value, 50)

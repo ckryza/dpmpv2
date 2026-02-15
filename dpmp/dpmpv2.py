@@ -9,7 +9,6 @@ Max Miners
 - For low-end Raspberry Pi setup, ~10 miners per DPMP instance is reasonable.
 - Upstream pool connection limits may apply (e.g., 20 connections max).
 - Docker container resources may limit max miners per instance.
-
 """
 from __future__ import annotations
 
@@ -52,6 +51,8 @@ ORACLE_AGE = Gauge("dpmp_oracle_data_age_seconds", "Age of oracle data in second
 SWITCH_SUBMIT_GRACE_S = 4.0  # seconds to tolerate stale submits right after a pool switch (was 0.75)
 # Path to optional weights override file (written by GUI slider, polled by scheduler)
 WEIGHTS_OVERRIDE_PATH = None  # set in main() from config path
+# Path to oracle mode file (written by GUI switch button, polled by oracle task)
+ORACLE_MODE_PATH = None       # set in main() from config path
 MAX_CACHED_NOTIFY_AGE_S = 20.0  # don't switch into pool if cached notify older than this
 MAX_CONVERGE_DEVIATION = 0.05 # default max deviation (5%) to trigger urgent pool switch
 
@@ -72,6 +73,34 @@ def read_weight_override() -> tuple[int, int] | None:
         return None
     except Exception:
         return None
+
+
+def read_oracle_mode(config_auto_balance: bool) -> bool:
+    """Check whether the oracle should write weights_override.json this cycle.
+
+    Priority:
+      1. oracle_mode.json exists  -> use its "oracle_active" value
+      2. oracle_mode.json missing -> fall back to config auto_balance setting
+
+    The file is written by the GUI switch button and deleted on DPMP restart.
+
+    Args:
+        config_auto_balance: the auto_balance value from config_v2.json (startup default)
+
+    Returns:
+        True  = oracle should write weights (oracle is in control)
+        False = oracle should NOT write weights (slider is in control)
+    """
+    if ORACLE_MODE_PATH is None:
+        return config_auto_balance
+    try:
+        with open(ORACLE_MODE_PATH, "rb") as f:
+            obj = json.loads(f.read())
+        return bool(obj.get("oracle_active", True))
+    except FileNotFoundError:
+        return config_auto_balance
+    except Exception:
+        return config_auto_balance
 
 
 # Get current UTC time as ISO 8601 string
@@ -419,7 +448,7 @@ class RatioScheduler:
             return "A"
         return "B"
 
-# â”€â”€ Hashrate Oracle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Hashrate Oracle 
 # Async background task that polls the oracle endpoint and writes
 # weights_override.json based on real-time BTC/BCH hashrate measurements.
 # Only runs when auto_balance=true in config.
@@ -430,19 +459,23 @@ from urllib.error import HTTPError, URLError
 
 async def oracle_poll_loop(cfg: AppCfg):
     """
-    Background task that runs forever when auto_balance is enabled.
-    
+    Background task that runs whenever chain config is valid (one BTC + one BCH pool).
+
+    Always collects data and updates Prometheus gauges regardless of mode.
+    Only writes weights_override.json when oracle_mode.json says oracle is active
+    (or when no oracle_mode.json exists and config auto_balance is true).
+
     Every oracle_poll_seconds (default 600 = 10 min):
-      1. GET oracle.php â†’ JSON with BTC/BCH block timestamps + difficulty
+      1. GET oracle endpoint -> JSON with BTC/BCH block timestamps + difficulty
       2. Calculate hashrate for short window (6 blocks) and long window (72 blocks)
       3. Compute weights using inverse-ratio model
       4. Clamp to max_deviation (default 30/70)
-      5. Write weights_override.json
-    
+      5. If oracle mode is active: write weights_override.json
+
     Safety rules:
       - 60-second startup delay (avoids hammering if user restarts repeatedly)
       - On error: hold current weights, try again next cycle
-      - After 3 consecutive failures: revert to 50/50
+      - After 3 consecutive failures: revert to 50/50 (only if oracle mode active)
       - Stale data (>20 min old): treat as error
     """
     poll_s = max(60, int(cfg.sched.oracle_poll_seconds))
@@ -461,7 +494,7 @@ async def oracle_poll_loop(cfg: AppCfg):
         log("oracle_disabled_bad_chain_config",
             poolA_chain=pool_chain["A"], poolB_chain=pool_chain["B"],
             reason="auto_balance requires one BTC pool and one BCH pool")
-        return  # exit task â€” oracle cannot run without proper chain labels
+        return  # exit task -- oracle cannot run without proper chain labels
 
     btc_pool = "A" if pool_chain["A"] == "BTC" else "B"
     bch_pool = "A" if pool_chain["A"] == "BCH" else "B"
@@ -478,7 +511,7 @@ async def oracle_poll_loop(cfg: AppCfg):
 
     while True:
         try:
-            # â”€â”€ Step 1: Fetch data from oracle endpoint â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # Step 1: Fetch data from oracle endpoint 
             log("oracle_poll_start")
 
             # Run the blocking HTTP call in a thread so we don't stall
@@ -492,7 +525,7 @@ async def oracle_poll_loop(cfg: AppCfg):
             if not data.get("ok"):
                 raise Exception(f"oracle response not ok: {data.get('error', 'unknown')}")
 
-            # â”€â”€ Step 2: Check data freshness â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # Step 2: Check data freshness 
             # The "ts" field is the MySQL timestamp when the collector pushed data.
             # If it's more than 20 minutes old, the collector might be down.
             ts_str = data.get("ts", "")
@@ -509,9 +542,9 @@ async def oracle_poll_loop(cfg: AppCfg):
                         raise Exception(f"oracle data is stale ({int(age_s)}s old)")
                 except ValueError as e:
                     log("oracle_ts_parse_warning", ts=ts_str, err=str(e))
-                    # Don't fail on parse error â€” the data might still be fine
+                    # Don't fail on parse error -- the data might still be fine
 
-            # â”€â”€ Step 3: Calculate hashrates â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # Step 3: Calculate hashrates 
             short_n = int(data.get("short_window", 6))
             long_n = int(data.get("long_window", 72))
 
@@ -525,7 +558,7 @@ async def oracle_poll_loop(cfg: AppCfg):
                 data["bch_ts_short"], data["bch_ts_long"],
                 short_n, long_n, "BCH")
 
-            # â”€â”€ Step 4: Compute weights (inverse ratio model) â”€â”€â”€â”€â”€â”€â”€â”€
+            # Step 4: Compute weights (inverse ratio model) 
             btc_ratio = btc_hr_short / btc_hr_long if btc_hr_long > 0 else 1.0
             bch_ratio = bch_hr_short / bch_hr_long if bch_hr_long > 0 else 1.0
 
@@ -565,7 +598,7 @@ async def oracle_poll_loop(cfg: AppCfg):
                 raw_btc_pct=round(pct_btc, 1), raw_bch_pct=round(pct_bch, 1),
                 clamped_btc=wt_btc, clamped_bch=wt_bch)
 
-            # â”€â”€ Step 5: Map to pools and write override â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # Step 5: Map to pools and write override 
             # btc_pool / bch_pool tell us which config pool is which chain.
             wA = wt_btc if btc_pool == "A" else wt_bch
             wB = wt_btc if btc_pool == "B" else wt_bch
@@ -574,9 +607,13 @@ async def oracle_poll_loop(cfg: AppCfg):
                 poolA_weight=wA, poolA_chain=pool_chain["A"],
                 poolB_weight=wB, poolB_chain=pool_chain["B"])
 
-            # Write weights_override.json (same file the GUI slider uses).
-            # The scheduler already reads this file every tick.
-            if WEIGHTS_OVERRIDE_PATH is not None:
+            # Only write weights_override.json if oracle mode is active.
+            # When the user switches to slider mode via the GUI, oracle_mode.json
+            # is set to false and the slider controls weights_override.json instead.
+            # The oracle still runs (collecting data + updating Prometheus gauges)
+            # but does not interfere with the slider's weight file.
+            oracle_active = read_oracle_mode(cfg.sched.auto_balance)
+            if oracle_active and WEIGHTS_OVERRIDE_PATH is not None:
                 try:
                     tmp = f"{WEIGHTS_OVERRIDE_PATH}.tmp"
                     obj = {"poolA_weight": int(wA), "poolB_weight": int(wB),
@@ -589,6 +626,8 @@ async def oracle_poll_loop(cfg: AppCfg):
                         wA=wA, wB=wB)
                 except Exception as e:
                     log("oracle_override_write_error", err=str(e))
+            elif not oracle_active:
+                log("oracle_mode_slider", reason="oracle_mode.json says slider is active, skipping weight write")
 
             consecutive_failures = 0
 
@@ -606,7 +645,9 @@ async def oracle_poll_loop(cfg: AppCfg):
             if consecutive_failures >= 3:
                 log("oracle_fallback_50_50",
                     reason=f"{consecutive_failures} consecutive failures")
-                if WEIGHTS_OVERRIDE_PATH is not None:
+                # Only write fallback weights if oracle is actually in control
+                oracle_active_fb = read_oracle_mode(cfg.sched.auto_balance)
+                if oracle_active_fb and WEIGHTS_OVERRIDE_PATH is not None:
                     try:
                         tmp = f"{WEIGHTS_OVERRIDE_PATH}.tmp"
                         obj = {"poolA_weight": 50, "poolB_weight": 50,
@@ -644,7 +685,7 @@ def _calc_hashrate_pair(difficulty: float, ts_latest: int,
     """
     Calculate short-window and long-window hashrate for one chain.
     
-    Formula: hashrate = difficulty Ã— 2^32 / average_block_time
+    Formula: hashrate = difficulty 2^32 / average_block_time
     
     Returns (hashrate_short, hashrate_long) in H/s.
     """
@@ -664,7 +705,7 @@ def _calc_hashrate_pair(difficulty: float, ts_latest: int,
 
     return (hr_short, hr_long)
 
-# â”€â”€ End Hashrate Oracle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# End Hashrate Oracle 
 
 # Proxy session handling a single miner connection and two upstream pools
 class ProxySession:
@@ -739,7 +780,7 @@ class ProxySession:
         self._internal_subscribe_id: Dict[str, int] = {}   # pool_key -> id
         self._internal_authorize_id: Dict[str, int] = {}   # pool_key -> id
 
-        # â”€â”€ Failover state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Failover state 
         # pool_alive: True when pool TCP connection is healthy and reading.
         #             Set to False when pool_reader detects EOF or error.
         #             Set back to True when reconnect succeeds.
@@ -763,7 +804,7 @@ class ProxySession:
         #                   if the dead pool has weight 0. When the pool recovers,
         #                   we restore these original values.
         self.original_weights: tuple[int, int] = (cfg.sched.wA, cfg.sched.wB)
-        # â”€â”€ End failover state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # End failover state 
 
     # Send JSON stratum message upstream to pool A or B
     async def send_upstream(self, pool_key: str, msg: dict) -> None:
@@ -791,7 +832,7 @@ class ProxySession:
         pool gets its subscribe/authorize from the miner directly during the
         initial handshake.
         
-        On RECONNECT (is_reconnect=True), always bootstrap â€” the miner won't
+        On RECONNECT (is_reconnect=True), always bootstrap -- the miner won't
         re-send subscribe/authorize, so we must do it ourselves.
         """
         if not is_reconnect:
@@ -944,11 +985,11 @@ class ProxySession:
             # explicit send even though A was the raw-subscribe pool.
             last_en_pool = getattr(self, "last_downstream_extranonce_pool", None)
             if last_en_pool is not None and last_en_pool != pool_key:
-                # Miner currently has a DIFFERENT pool's extranonce â€” must send.
+                # Miner currently has a DIFFERENT pool's extranonce -- must send.
                 # Fall through to the normal send path below.
                 pass
             else:
-                # Miner still has the subscribe extranonce â€” safe to skip.
+                # Miner still has the subscribe extranonce -- safe to skip.
                 en1 = self.extranonce1.get(pool_key)
                 en2s = self.extranonce2_size.get(pool_key)
                 if en1 is not None and en2s is not None:
@@ -1356,7 +1397,7 @@ class ProxySession:
                         p = msg.get("params") or []
                         nonce_hex = p[4] if len(p) > 4 else None
                         if nonce_hex is not None:
-                            # Very rough heuristic: random hash â†’ expected diff ~ 1
+                            # Very rough heuristic: random hash expected diff ~ 1
                             # If miner were meeting diff~3000, accept rate would be ~1/3000.
                             # Log just to correlate submit frequency vs expected accepts.
                             log("submit_local_sanity",
@@ -1370,7 +1411,7 @@ class ProxySession:
                         d = self.latest_diff.get(pool)
                     self.submit_diff[mid] = float(d or 0.0)
 
-                # â”€â”€ Failover guard: reject submit if target pool is dead â”€â”€
+                # Failover guard: reject submit if target pool is dead 
                 # If the pool that owns this job just died, we can't forward
                 # the share.  Send the miner a clean rejection instead of
                 # crashing on a None writer.
@@ -1510,7 +1551,7 @@ class ProxySession:
                             log("subscribe_result", pool=pool_key, extranonce1=self.extranonce1[pool_key], extranonce2_size=self.extranonce2_size[pool_key])
 
                             # Immediately provide extranonce context to the miner for the active pool.
-                            # BUT skip if we just raw-forwarded the subscribe response â€” the miner
+                            # BUT skip if we just raw-forwarded the subscribe response -- the miner
                             # already has the extranonce from that response.  Sending mining.set_extranonce
                             # to miners that don't support it (NerdAxe, NerdMiner, etc.) causes them
                             # to disconnect or reboot in a loop.
@@ -1542,7 +1583,7 @@ class ProxySession:
                     if ok_auth and (self.handshake_pool is not None) and (pool_key == self.handshake_pool) and (not already_switched_away):
                         try:
                             # Extranonce (if known)
-                            # Skip if we already raw-forwarded the subscribe response for this pool â€”
+                            # Skip if we already raw-forwarded the subscribe response for this pool 
                             # the miner already has the extranonce.  Sending mining.set_extranonce
                             # to miners that don't support it (NerdAxe, NerdMiner, etc.) causes
                             # disconnect/reboot loops.
@@ -1618,7 +1659,7 @@ class ProxySession:
                         ACCEPTED_DIFFICULTY_SUM.labels(pool=p).inc(d)
                         # Cap the difficulty credited to the scheduler counters.
                         # Without this, a single high-diff share on the minority
-                        # pool can swing the ratio 30+ points (e.g., 80/20 â†’ 50/50),
+                        # pool can swing the ratio 30+ points (e.g., 80/20  50/50),
                         # causing a multi-minute recovery on the majority pool.
                         # Cap: one share can move the ratio by at most ~5%.
                         _total = self.accepted_diff_sum.get("A", 0.0) + self.accepted_diff_sum.get("B", 0.0)
@@ -1649,7 +1690,7 @@ class ProxySession:
           shares that the pool can never accept (session is gone).
         - latest_diff: The difficulty was for the old session; the pool will
           send a new one after reconnect.
-        - extranonce1 / extranonce2_size: Same â€” session-scoped values that
+        - extranonce1 / extranonce2_size: Same session-scoped values that
           become invalid when the TCP connection drops.
         - pool_w entry: The old writer is broken; remove it so send_upstream()
           queues messages instead of writing to a dead socket.
@@ -1667,7 +1708,7 @@ class ProxySession:
         self.extranonce1[pool_key] = None
         self.extranonce2_size[pool_key] = None
 
-        # â”€â”€ Clear "last sent" tracking so reconnect WILL send the new extranonce â”€â”€
+        # Clear "last sent" tracking so reconnect WILL send the new extranonce 
         # Without this, the bootstrap response updates extranonce1[pool_key] and
         # maybe_send_downstream_extranonce() sees new==last and skips sending.
         if getattr(self, "last_downstream_extranonce_pool", None) == pool_key:
@@ -1676,7 +1717,7 @@ class ProxySession:
             self.last_downstream_extranonce_pool = None
             log("clear_pool_state_reset_last_downstream_extranonce", sid=self.sid, pool=pool_key)
 
-        # â”€â”€ NEW: clear the raw-subscribe guard so reconnect can send extranonce â”€â”€
+        # NEW: clear the raw-subscribe guard so reconnect can send extranonce 
         if getattr(self, "raw_subscribe_forwarded_pool", None) == pool_key:
             self.raw_subscribe_forwarded_pool = None
             log("clear_pool_state_reset_raw_subscribe_flag", sid=self.sid, pool=pool_key)
@@ -1701,14 +1742,14 @@ class ProxySession:
         log("pool_state_cleared", sid=self.sid, pool=pool_key)
 
 
-    # â”€â”€ Periodic state pruning â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Periodic state pruning 
     # Several dicts/sets grow with every job or upstream response but
     # are never trimmed.  Over weeks of runtime this leaks memory.
     # This method is called every ~60 seconds from forward_jobs().
     def prune_stale_state(self):
         """Remove entries older than 5 minutes from structures that grow unbounded."""
         now = time.monotonic()
-        max_age = 300.0  # 5 minutes â€” no job/response older than this is useful
+        max_age = 300.0  # 5 minutes -- no job/response older than this is useful
 
         # 1) job_owner: keyed by (pool_key, jobid).
         #    Keep only the last ~200 entries.  Jobs older than that are
@@ -1731,7 +1772,7 @@ class ProxySession:
         if len(self.seen_upstream_response_ids) > max_seen:
             # set() has no insertion order, so just clear and start fresh.
             # The worst that can happen is a duplicate response gets forwarded
-            # once â€” harmless, the miner ignores unexpected responses.
+            # once -- harmless, the miner ignores unexpected responses.
             excess = len(self.seen_upstream_response_ids)
             self.seen_upstream_response_ids.clear()
             log("prune_seen_upstream_ids", sid=self.sid, cleared=excess)
@@ -1761,7 +1802,7 @@ class ProxySession:
             log("prune_submit_owner", sid=self.sid, dropped=excess,
                 remaining=len(self.submit_owner))
 
-    # â”€â”€ End periodic state pruning â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # End periodic state pruning 
 
 
     # Pool Failover: reconnecting wrapper around pool_reader 
@@ -1772,10 +1813,10 @@ class ProxySession:
           1. pool_reader() runs, processing messages until EOF or error.
           2. When pool_reader() returns (pool disconnected), we land here.
           3. Mark the pool dead, clear stale state.
-          4. Sleep with exponential backoff (5s, 10s, 20s, 40s â€¦ capped at 60s).
+          4. Sleep with exponential backoff (5s, 10s, 20s, 40s -- capped at 60s).
           5. Try to reconnect (connect_pool).
-          6. If reconnect succeeds â†’ reset fail counter, loop back to step 1.
-          7. If reconnect fails â†’ increment fail counter, loop back to step 4.
+          6. If reconnect succeeds -- reset fail counter, loop back to step 1.
+          7. If reconnect fails -- increment fail counter, loop back to step 4.
 
         This method runs forever (until the miner session itself ends),
         so the asyncio.wait(FIRST_COMPLETED) in run() is no longer
@@ -1784,11 +1825,11 @@ class ProxySession:
         pcfg = self.cfg.poolA if pool_key == "A" else self.cfg.poolB
 
         while True:
-            # â”€â”€ Phase 1: read from pool until it disconnects â”€â”€â”€â”€â”€â”€â”€â”€
+            # Phase 1: read from pool until it disconnects 
             try:
                 await self.pool_reader(pool_key, reader)
             except asyncio.CancelledError:
-                # Session is shutting down â€” don't reconnect, just exit.
+                # Session is shutting down -- don't reconnect, just exit.
                 raise
             except Exception as e:
                 log("pool_reader_error", sid=self.sid, pool=pool_key, err=str(e))
@@ -1796,7 +1837,7 @@ class ProxySession:
             # If we get here, pool_reader returned (EOF) or raised.
             # That means the pool's TCP connection is dead.
 
-            # â”€â”€ Phase 2: mark dead + clear stale state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # Phase 2: mark dead + clear stale state 
             self.pool_alive[pool_key] = False
             self.pool_last_fail_mono[pool_key] = time.monotonic()
             self.clear_pool_state(pool_key)
@@ -1804,9 +1845,9 @@ class ProxySession:
                 fail_count=self.pool_fail_count[pool_key],
                 other_alive=self.pool_alive["B" if pool_key == "A" else "A"])
 
-            # â”€â”€ Phase 3: reconnect loop with backoff â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # Phase 3: reconnect loop with backoff 
             while True:
-                # Exponential backoff: 5, 10, 20, 40, 60, 60, 60 â€¦
+                # Exponential backoff: 5, 10, 20, 40, 60, 60, 60 
                 base_delay = 5.0
                 max_delay = 60.0
                 delay = min(base_delay * (2 ** self.pool_fail_count[pool_key]), max_delay)
@@ -1835,7 +1876,7 @@ class ProxySession:
                         err=str(e), fail_count=self.pool_fail_count[pool_key])
                     continue  # back to top of reconnect loop (sleep again)
 
-                # â”€â”€ Phase 4: reconnect succeeded! â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                # Phase 4: reconnect succeeded! 
                 self.pool_alive[pool_key] = True
                 self.pool_fail_count[pool_key] = 0
                 self.pool_last_fail_mono[pool_key] = None
@@ -1852,7 +1893,7 @@ class ProxySession:
                 log("pool_reconnected", sid=self.sid, pool=pool_key,
                     other_alive=self.pool_alive["B" if pool_key == "A" else "A"])
 
-                # â”€â”€ Force miner to re-handshake after pool reconnect â”€â”€â”€â”€â”€â”€
+                # Force miner to re-handshake after pool reconnect 
                 # When a pool reconnects, it issues a NEW extranonce1.
                 # The miner must pick up this new extranonce or every share
                 # will be rejected ("low difficulty share").
@@ -1873,7 +1914,7 @@ class ProxySession:
                 except Exception as e:
                     log("miner_disconnect_for_reconnect_failed", sid=self.sid, pool=pool_key, err=str(e))
 
-                break  # exit reconnect loop â†’ back to Phase 1 (pool_reader)
+                break  # exit reconnect loop -- back to Phase 1 (pool_reader)
 
     # Scheduler: forward jobs to miner based on configured weights
     async def forward_jobs(self):
@@ -1889,7 +1930,7 @@ class ProxySession:
         last_prune_mono = time.monotonic()
 
         while True:
-            # â”€â”€ Periodic cleanup (every 60s) â”€â”€
+            # Periodic cleanup (every 60s) 
             if time.monotonic() - last_prune_mono >= 60.0:
                 self.prune_stale_state()
                 last_prune_mono = time.monotonic()
@@ -1898,9 +1939,9 @@ class ProxySession:
             min_switch = max(0, int(self.cfg.sched.min_switch_seconds))
             switched_this_tick = False  # force-forward cached notify immediately after a switch
 
-            # â”€â”€ Failover: emergency switch if current pool is dead â”€â”€â”€â”€â”€â”€
+            # Failover: emergency switch if current pool is dead 
             # If the pool we're currently forwarding from just died, don't
-            # wait for the normal min_switch_seconds timer â€” switch immediately
+            # wait for the normal min_switch_seconds timer -- switch immediately
             # to the other pool if it's alive.  Without this, the miner would
             # sit idle (no new jobs) until the next scheduler tick.
             if not self.pool_alive.get(current_pool, False):
@@ -1917,11 +1958,11 @@ class ProxySession:
                     switched_this_tick = True
                     await self.resend_active_notify_clean(other, reason="failover_emergency")
                 elif not self.pool_alive.get(other, False):
-                    # Both pools dead â€” nothing to do, just wait.
+                    # Both pools dead -- nothing to do, just wait.
                     await asyncio.sleep(0.10)
                     continue
 
-            # â”€â”€ Normal scheduling logic â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # Normal scheduling logic 
             # Read weights early so we can scale the min-switch time.
             _override = read_weight_override()
             if _override is not None:
@@ -1934,10 +1975,6 @@ class ProxySession:
             # Scale min_switch by the active pool's target weight.
             # At 15/85, a full 50s slice on Pool A massively overshoots
             # (the miner should only spend ~15% of time on A).
-            # Formula: effective_min = min_switch Ã— (2 Ã— active_weight_fraction)
-            # At 50/50: 50 Ã— (2Ã—0.50) = 50s (unchanged)
-            # At 15/85 on A: 50 Ã— (2Ã—0.15) = 15s
-            # At 15/85 on B: 50 Ã— (2Ã—0.85) = 50s (capped at min_switch)
             # Floor of 10s prevents sub-second thrashing.
             if totw > 0:
                 _active_frac = (wA / totw) if current_pool == "A" else (wB / totw)
@@ -2004,7 +2041,7 @@ class ProxySession:
 
                     # Decay accepted difficulty so old history doesn't dominate.
                     # But use a VERY gentle decay (0.9995) to avoid making the
-                    # counters volatile â€” especially for the minority pool at
+                    # counters volatile -- especially for the minority pool at
                     # lopsided ratios (e.g., 80/20) where a single share can
                     # swing the ratio by 20+ points if the baseline is too small.
                     #
@@ -2037,13 +2074,13 @@ class ProxySession:
                     #   3) MAX_CONVERGE_DEVIATION can be configured to adjust the urgency threshold (default 2%).
                     time_on_pool = now - last_switch_ts
 
-                    # Compute minority_frac early â€” needed by both urgency and hysteresis checks.
+                    # Compute minority_frac early -- needed by both urgency and hysteresis checks.
                     minority_frac = min(targetA, targetB)
 
                     # Scale urgency threshold by minority pool fraction.
-                    # At 50/50: threshold = max(0.05, 0.50) = 0.50 â†’ urgent almost never fires
-                    # At 80/20: threshold = max(0.05, 0.20) = 0.20 â†’ only truly large deviations
-                    # At 95/5:  threshold = max(0.05, 0.05) = 0.05 â†’ tighter at extreme ratios
+                    # At 50/50: threshold = max(0.05, 0.50) = 0.50 -- urgent almost never fires
+                    # At 80/20: threshold = max(0.05, 0.20) = 0.20 -- only truly large deviations
+                    # At 95/5:  threshold = max(0.05, 0.05) = 0.05 -- tighter at extreme ratios
                     _urgency_threshold = max(MAX_CONVERGE_DEVIATION, minority_frac)
                     urgent = current_deviation > _urgency_threshold
 
@@ -2068,9 +2105,9 @@ class ProxySession:
                         # large overshoot; only switch when the deficit is big
                         # enough to justify that slice.
                         # At 15/85 on B: minority_frac=0.15, threshold=0.0375
-                        #   â†’ only switch Bâ†’A when shareA < 0.1125 (meaningfully behind)
+                        #   -- only switch B/A when shareA < 0.1125 (meaningfully behind)
                         # At 50/50: minority_frac=0.50, threshold=0.125
-                        #   â†’ rarely triggers (deviation seldom that large at 50/50)
+                        #   -- rarely triggers (deviation seldom that large at 50/50)
 
                         if prefer != current_pool and not urgent:
                             hysteresis = minority_frac / 4.0
@@ -2202,7 +2239,7 @@ class ProxySession:
                     self.connect_pool(self.cfg.poolA), timeout=15.0)
                 self.pool_alive["A"] = True
             except Exception as e:
-                # Pool A unreachable at startup â€” not fatal.
+                # Pool A unreachable at startup -- not fatal.
                 # Mark dead and let the reconnect wrapper handle recovery.
                 log("pool_initial_connect_failed", sid=self.sid, pool="A", err=str(e))
                 self.pool_alive["A"] = False
@@ -2297,10 +2334,20 @@ async def handle_miner(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
 
 # Main entry point
 async def main():
-    global WEIGHTS_OVERRIDE_PATH
+    global WEIGHTS_OVERRIDE_PATH, ORACLE_MODE_PATH
     cfg_path = os.environ.get("DPMP_CONFIG", os.path.join(os.path.dirname(__file__), "config_v2.json"))
 
     WEIGHTS_OVERRIDE_PATH = os.path.join(os.path.dirname(cfg_path), "weights_override.json")
+    ORACLE_MODE_PATH = os.path.join(os.path.dirname(cfg_path), "oracle_mode.json")
+
+    # Delete oracle_mode.json on startup so config auto_balance is the default.
+    # The file is only created when the GUI switch button is clicked at runtime.
+    try:
+        if os.path.isfile(ORACLE_MODE_PATH):
+            os.remove(ORACLE_MODE_PATH)
+            log("oracle_mode_file_deleted_on_startup")
+    except Exception:
+        pass
 
     # Clear oracle chart history on startup so GUI charts begin fresh
     _chart_hist = os.path.join(os.path.dirname(cfg_path), "oracle_chart_history.json")
@@ -2369,13 +2416,21 @@ async def main():
     # Keep running until stopped
     serve_task = asyncio.create_task(server.serve_forever())
 
-    # Start oracle auto-balance task if enabled
+    # Start oracle task if chain config is valid (one BTC + one BCH pool).
+    # The oracle ALWAYS runs to collect data and update Prometheus gauges.
+    # Whether it actually writes weights_override.json depends on oracle_mode.json
+    # (checked inside oracle_poll_loop each cycle).
     oracle_task = None
-    if cfg.sched.auto_balance:
+    chain_a = getattr(cfg.poolA, "chain", "").upper()
+    chain_b = getattr(cfg.poolB, "chain", "").upper()
+    chain_valid = sorted([chain_a, chain_b]) == ["BCH", "BTC"]
+    if chain_valid:
         oracle_task = asyncio.create_task(oracle_poll_loop(cfg))
-        log("oracle_task_started")
+        log("oracle_task_started", auto_balance=cfg.sched.auto_balance,
+            reason="chain config valid, oracle always collects data")
     else:
-        log("oracle_disabled", auto_balance=False)
+        log("oracle_disabled_invalid_chains", chain_a=chain_a, chain_b=chain_b,
+            reason="need exactly one BTC and one BCH pool for oracle")
 
     try:
         await stop.wait()
