@@ -141,7 +141,16 @@ footer {
 <div class="section">
     <h2>Overview</h2>
     <div class="card">
-        <p><strong>DPMP</strong> is a high-reliability Stratum v1 proxy that sits between ASIC miners and two upstream pools. It time-slices work deterministically, preserves extranonce correctness, and evaluates fairness using difficulty-weighted acceptance rather than raw share counts.</p>
+        <strong>DPMP</strong> is a lightweight, high-reliability&nbsp;<strong>Stratum v1 mining
+        proxy</strong>&nbsp;designed to sit between one or more miners and&nbsp;two upstream mining pools. It was
+        designed primarily for Bitcoin solo-miners who run one or more ASIC miners (SHA-256) and want to split hash power
+        across compatible coins/pools (i.e., BTC/BCH/DGB). Some miners, like the NerdQAxe++, have a built-in "dual pool
+        mining" feature but the majority of miners out there do not.</p>
+        <p>So if you have one or more miners that do NOT have a built-in dual-pool mining feature (such as the Canaan Avalon Q
+        or the Nano3S) and you would like, for example, to mine to a BTC pool and a Bitcoin Cash pool simultaneously, then
+        <strong>DPMP</strong> is for you.</p>
+
+
     </div>
 </div>
 
@@ -152,13 +161,19 @@ footer {
         <a href="#img1" class="image-wrapper">
             <img src="images/1a.png" alt="Oracle Auto-Balance">
             <div class="caption">Oracle Auto-Balance panel with real-time network hashrate tracking.</div>
-        </a>
+        </a>        
 
         <a href="#img2" class="image-wrapper">
             <img src="images/1b.png" alt="Hashrate Allocation Slider">
             <div class="caption">Live Hashrate Allocation slider for manual control.</div>
         </a>
 
+    </div>
+</div>
+
+<div class="section">
+    <div class="card">
+        <p>In terms of allocating hashrate between the two pools, <strong>DPMP</strong> offers two modes of operation: <strong>Oracle Auto-Balance</strong> and <strong>Manual Hashrate Allocation</strong>. The Oracle Auto-Balance mode uses real-time network hashrate data to dynamically adjust pool weights for optimal profitability, while the Manual Hashrate Allocation mode allows users to set a fixed percentage of hashrate to each pool using an intuitive slider interface. Both modes can be switched in real-time without requiring a restart, providing flexibility for miners to adapt to changing market conditions or personal preferences.</p>
     </div>
 </div>
 
@@ -172,7 +187,9 @@ footer {
         </a>
 
         <div class="card">
-            <p>DPMP measures fairness using <strong>total accepted difficulty (SumDiff)</strong>, normalizing across VarDiff and startup ramp differences between pools.</p>
+            <p>The <strong>Stats</strong> tab in the web UI provides detailed metrics and statistics for each worker and pool. The Worker table includes hashrate, current difficulty, shares-per-second, best share, and rejected shares.</p>
+            <p>The Pool table shows pool name, slot, associated coin, latency, accepted/rejected shares, jobs, and total accepted difficulty (SumDiff).</p>
+            <p>Both tables can be sorted by clicking on any column header.</p>
         </div>
 
     </div>
@@ -196,10 +213,17 @@ footer {
 </div>
 
 <div class="section">
+    <div class="card">
+        <p>The <strong>Config</strong> tab is organized into sections, including Logging Settings, Pool Settings, and Scheduler Settings. Pool Settings is where you will define the two pools to be used in <strong>DPMP</strong>. If you want to utilize the Oracle Auto-Balance feature, you must configure a bitcoin-mining pool and a bitcoin-cash mining pool and assign the correct coin to each pool, and you must also check the 'Enable Auto-Balance' checkbox in the Scheduler Settings section.</p>
+        <p>The <strong>Logs</strong> tab provides a real-time view of <strong>DPMP</strong>'s structured JSON logs, which include detailed information about miner connections, share submissions, pool interactions, and any errors or warnings. Logs can be filtered by event name, and exported for further analysis or troubleshooting. You can configure the specific logging events to display in the Logging Settings section of the Config tab.</p>
+    </div>
+</div>
+
+<div class="section">
     <h2>About</h2>
     <div class="card">
-        <p>DPMP maintains concurrent upstream connections while serializing downstream work to prevent extranonce collisions and stale shares. Over time, accepted difficulty converges to the configured scheduler ratio.</p>
-        <p><a href="https://github.com/ckryza/dpmpv2">View Source on GitHub</a></p>
+        <p><strong>DPMP</strong> is currently available for one-click install (umbrelOS 1.5) in our <a href="https://github.com/ckryza/ckryza-umbrel-app-store">Umbrel Community App Store</a>. We also have a bare-metal install available in our <a href="https://github.com/ckryza/dpmpv2">dpmpv2</a> repo..</p>
+        
     </div>
 </div>
 
