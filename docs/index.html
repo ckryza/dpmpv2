@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Dual Pool Mining Proxy (DPMP)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<style>
+body {
+    margin: 0;
+    font-family: Arial, Helvetica, sans-serif;
+    background: #0e0e11;
+    color: #e6e6e6;
+    line-height: 1.6;
+}
+
+header {
+    padding: 40px 20px;
+    text-align: center;
+    background: #121218;
+    border-bottom: 1px solid #222;
+}
+
+header h1 {
+    margin: 0;
+    font-size: 32px;
+    color: #4da3ff;
+}
+
+header p {
+    color: #bbb;
+    margin-top: 10px;
+}
+
+.section {
+    max-width: 1100px;
+    margin: 60px auto;
+    padding: 0 20px;
+}
+
+.section h2 {
+    color: #4da3ff;
+    margin-bottom: 20px;
+    border-bottom: 1px solid #222;
+    padding-bottom: 10px;
+}
+
+.grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 40px;
+}
+
+@media (min-width: 900px) {
+    .grid {
+        grid-template-columns: 1fr 1fr;
+    }
+}
+
+img {
+    width: 100%;
+    border-radius: 6px;
+    border: 1px solid #222;
+}
+
+.card {
+    background: #14141a;
+    padding: 20px;
+    border-radius: 6px;
+    border: 1px solid #222;
+}
+
+footer {
+    text-align: center;
+    padding: 40px 20px;
+    border-top: 1px solid #222;
+    color: #777;
+    font-size: 14px;
+}
+
+a {
+    color: #4da3ff;
+    text-decoration: none;
+}
+
+a:hover {
+    text-decoration: underline;
+}
+</style>
+</head>
+
+<body>
+
+<header>
+    <h1>Dual Pool Mining Proxy (DPMP)</h1>
+    <p>A deterministic, time-sliced Stratum v1 proxy for dual-pool mining and intelligent hashrate allocation.</p>
+</header>
+
+<div class="section">
+    <h2>What is DPMP?</h2>
+    <div class="card">
+        <p><strong>DPMP</strong> is a lightweight, high-reliability <strong>Stratum v1 mining proxy</strong> designed to sit between one or more ASIC miners and two upstream mining pools.</p>
+        <p>It enables deterministic dual-pool scheduling, advanced difficulty and extranonce handling, Prometheus metrics observability, and structured logging — all while remaining transparent to both miners and pools.</p>
+        <p>Miners connect to DPMP as if it were a pool. DPMP connects upstream to two real pools and time-slices work between them while preserving Stratum protocol correctness.</p>
+    </div>
+</div>
+
+<div class="section">
+    <h2>Home Dashboard</h2>
+    <div class="grid">
+        <div>
+            <img src="images/1a.png" alt="Oracle Auto-Balance">
+            <p>Oracle Auto-Balance panel showing real-time network hashrate analysis and dynamic weighting adjustments.</p>
+        </div>
+        <div>
+            <img src="images/1b.png" alt="Hashrate Allocation Slider">
+            <p>Live Hashrate Allocation slider allowing real-time manual reweighting without restart.</p>
+        </div>
+    </div>
+</div>
+
+<div class="section">
+    <h2>Metrics & Observability</h2>
+    <div class="grid">
+        <div>
+            <img src="images/2.png" alt="Stats">
+            <p>Worker-level and pool-level metrics including Accepted, Rejected, Jobs, and difficulty-weighted totals (SumDiff).</p>
+        </div>
+        <div class="card">
+            <p>DPMP evaluates fairness using <strong>accepted difficulty totals</strong> rather than job counts or share counts.</p>
+            <p>This normalizes across VarDiff behavior and startup difficulty ramps, making it the closest approximation to true hashpower contribution.</p>
+        </div>
+    </div>
+</div>
+
+<div class="section">
+    <h2>Configuration & Control</h2>
+    <div class="grid">
+        <div>
+            <img src="images/3.png" alt="Config">
+            <p>Full configuration management including pool settings, scheduler tuning, oracle configuration, logging, and metrics options.</p>
+        </div>
+        <div>
+            <img src="images/4.png" alt="Logs">
+            <p>Structured JSON logging with downloadable ZIP export for deep debugging and protocol-level analysis.</p>
+        </div>
+    </div>
+</div>
+
+<div class="section">
+    <h2>Scheduling Model</h2>
+    <div class="card">
+        <p>DPMP uses a <strong>time-sliced scheduler with sticky intervals</strong>. Only one pool is active at a time to avoid extranonce collisions and stale job conditions.</p>
+        <p>Because pools may assign very different difficulties, fairness is measured using total accepted difficulty rather than raw share counts.</p>
+        <p>The scheduler ratio, recent difficulty window, and lifetime SumDiff converge toward the configured weighting over time.</p>
+    </div>
+</div>
+
+<div class="section">
+    <h2>Auto-Balancing</h2>
+    <div class="card">
+        <p>DPMP includes an optional <strong>Oracle-based Auto-Balancer</strong> that dynamically adjusts pool weighting based on relative network hashrate shifts.</p>
+        <p>The oracle polls external endpoints and computes an optimal ratio using short-term vs baseline hashrate windows.</p>
+        <p>Deviation thresholds prevent extreme swings while allowing intelligent adaptation.</p>
+    </div>
+</div>
+
+<div class="section">
+    <h2>About</h2>
+    <div class="card">
+        <p>DPMP acts as both a pool (to miners) and a miner (to pools), routing jobs and shares according to a deterministic scheduler while maintaining protocol correctness.</p>
+        <p>The proxy is intentionally <strong>transparent</strong> — neither miners nor pools require modification.</p>
+        <p>For full documentation and source code, visit the <a href="https://github.com/ckryza/dpmpv2">GitHub Repository</a>.</p>
+    </div>
+</div>
+
+<footer>
+    © 2026 DPMP Project · Built with NiceGUI · Stratum v1 Infrastructure Proxy
+</footer>
+
+</body>
+</html>
