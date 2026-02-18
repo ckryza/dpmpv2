@@ -173,7 +173,13 @@ footer {
 
 <div class="section">
     <div class="card">
-        <p>In terms of allocating hashrate between the two pools, <strong>DPMP</strong> offers two modes of operation: <strong>Oracle Auto-Balance</strong> and <strong>Manual Hashrate Allocation</strong>. The Oracle Auto-Balance mode uses real-time network hashrate data to dynamically adjust pool weights to put more hash power on the pool with the lower relative network hashrate, while the Manual Hashrate Allocation mode allows users to set a fixed percentage of hashrate to each pool using an intuitive slider interface. Both modes can be switched in real-time without requiring a restart, providing flexibility for miners to adapt to changing market conditions or personal preferences.</p>
+        <p>In terms of allocating hashrate between the two pools, <strong>DPMP</strong> offers two modes of operation: <strong>Oracle Auto-Balance</strong> and <strong>Manual Hashrate Allocation</strong>. The Oracle Auto-Balance mode uses real-time network hashrate data (currently, we support BTC and BCH only) to dynamically adjust pool weights to put more hash power on the coin/pool with the lower relative network hashrate, while the Manual Hashrate Allocation mode allows users to set a fixed percentage of hashrate to each pool using an intuitive slider interface.</p>
+
+        <p>The Manual Hashrate Allocation pane is always available regardless of the pools you are mining to. So, for example, you could be mining to a Bitcoin pool and a Bitcoin Cash pool, or a Bitcoin Cash pool and a Digibyte pool, or two different Bitcoin pools...it doesn't matter, the Manual Hashrate slider will always be available.</p>
+
+        <p>For the Oracle Auto-Balance pane to be available, you MUST be mining to a Bitcoin pool and a Bitcoin Cash pool because those are the only two coins that we currently measure realtime network hashrate for (we hope to add others in the future). When you first set up your pools on the <strong>DPMP</strong> Config tab (e.g., Pool A Settings and Pool B Settings), in the <i>Chain</i> dropdown box you must select BCH for your Bitcoin Cash pool and BTC for your Bitcoin pool. Then you must check the 'Enable Auto-Balance' box in the Scheduler settings section. Once you make those changes and click on the <strong>APPLY + RESTART</strong> button, you will see the Oracle Auto-Balance pane on the Home tab of the <strong>DPMP</strong> Dashboard.</p>
+
+        <p><strong>Note</strong>: You can switch between Auto-Balance and Manual Hashrate Allocation at any time by clicking on the button at the top-right of each pane, no restart required.</p>
     </div>
 </div>
 
@@ -216,6 +222,12 @@ footer {
     <div class="card">
         <p>The <strong>Config</strong> tab is organized into sections, including Logging Settings, Pool Settings, and Scheduler Settings. Pool Settings is where you will define the two pools to be used in <strong>DPMP</strong>. If you want to utilize the Oracle Auto-Balance feature, you must configure a bitcoin-mining pool and a bitcoin-cash mining pool and assign the correct coin to each pool, and you must also check the 'Enable Auto-Balance' checkbox in the Scheduler Settings section.</p>
         <p>The <strong>Logs</strong> tab provides a real-time view of <strong>DPMP</strong>'s structured JSON logs, which include detailed information about miner connections, share submissions, pool interactions, and any errors or warnings. Logs can be filtered by event name, and exported (in Zip format) for further analysis or troubleshooting. You can configure the specific logging events to display in the Logging Settings section of the Config tab.</p>
+        
+        <h4>Pool Configuration</h4>
+        <p>For each pool, you must supply a Host URL, the Port being used, and the Wallet Address you want to use with that pool. Optionally, you can assign a pool name (used only in the Pool Stats table on the Stats tab), and you can assign the associated coin in the Chain dropdown box. This is only necessary if you intend to use the Oracle Auto-Balance feature and, if you do, you will need to set up a Bitcoin and a Bitcoin Cash pool since those are the only two coins currently supported. When inputting your wallet addresses, be sure to double-check your work since any payouts will be sent to the wallet addresses that you define here.</p>
+
+        <h4>Miner Configuration</h4>
+        <p>When setting up your miners, you should point them to the IP address of the box on which you are running the <strong>DPMP</strong> proxy and you should use port 3351. For the wallet address, you can use any address you like since it won't be used (the wallet addresses defined on the <strong>DPMP</strong> Config tab are the <strong>only</strong> wallet addresses that the pools will see). You should append your workername to the end of the wallet address using a period to separate the two (i.e., '<strong>[wallet-address].[workername]</strong>'). Once you begin mining, <strong>DPMP</strong> will ignore any wallet addresses sent by your miner(s) and will strip out just the workername. When communicating with each pool, <strong>DPMP</strong> will use only the wallet addresses you defined in Pool A Settings and Pool B Settings, and it will append the workername it obtained from each miner.</p>    
     </div>
 </div>
 
