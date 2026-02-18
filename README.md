@@ -206,6 +206,14 @@ DPMP v2 is designed for users who:
 
 # Changelog
 
+## 3.0.2 - 2026-02-17
+- add Stats tab with Worker and Pool tables
+- address pool/miner compatibility issues
+- fix: no slider or auto-balancer display on 0/100 or 100/0 config ratios
+- adjust hashrate allocation logic to better account for individual miner hashrate
+- ratio convergence is now faster
+- prep for transition to fleet management
+
 ## 3.0.1 - 2026-02-14
 - can now switch between Slider and Auto-Balance with no restart required (added switch button)
 - Auto-Balance times now in local time

@@ -70,8 +70,10 @@
     preserves protocol correctness while still achieving long-term fairness.</p>
 <p dir="auto">Because pools may assign very different difficulties (especially at startup or under VarDiff), job count
     or share count alone is misleading when evaluating balance. Instead, the most reliable metric is "total accepted
-    difficulty" (<strong>SumDiff</strong> on the Home page), which measures the actual amount of valid proof-of-work
-    accepted by each pool. Difficulty-weighted acceptance normalizes across VarDiff, startup difficulty ramps, and
+    difficulty" (<strong>SumDiff</strong> on the Home tab), which measures the actual amount of valid proof-of-work
+    accepted by each pool. The <strong>Recent Diff</strong> metric is a short-term window of accepted difficulty that 
+    captures transient shifts in hashrate distribution, while the <strong>Scheduler Ratio</strong> metric reflects the configured 
+    time allocation. Difficulty-weighted acceptance normalizes across VarDiff, startup difficulty ramps, and
     pool-specific policies, making it the closest proxy to real hashpower contribution. When <strong>DPMP</strong> is
     configured correctly, the accepted difficulty totals for Pool A and Pool B converge toward the configured ratio over
     time—even if job counts or raw share counts appear skewed in the short term.</p>
@@ -118,6 +120,8 @@
     deviation threshold to between 5 and 45. So with a setting of 5 the Auto-Balancer will never move beyond a 45/55 -
     55/45 ratio. With a max deviation threshold of 45, the Auto-Balancer will never move beyond a 5/95 - 95/5 ratio. The
     default max deviation value is 20, so the Auto-Balancer will never move beyond 30/70 - 70/30.</p>
+<p dir="auto"><strong>Note</strong>: You can toggle between the Slider panel and the Auto-Balancer panel at any time by
+    clicking on the <strong>Slider/Oracle</strong> button, and the hashrate allocation will adjust accordingly.</p>
 <hr />
 <p dir="auto"><strong>DPMP</strong> has pool failover protection implemented as follows: if you are splitting work
     between pools A and B (i.e., pool weighting ratio is NOT 0/100 or 100/0) then if either pool fails, all work (100%)

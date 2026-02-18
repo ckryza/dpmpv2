@@ -38,6 +38,8 @@ SHARES_ACCEPTED = Counter("dpmp_shares_accepted_total", "Shares accepted by pool
 SHARES_REJECTED = Counter("dpmp_shares_rejected_total", "Shares rejected by pools", ["pool"])
 JOBS_FORWARDED = Counter("dpmp_jobs_forwarded_total", "Jobs forwarded to miner", ["pool"])
 ACCEPTED_DIFFICULTY_SUM = Counter("dpmp_accepted_difficulty_sum", "Sum of difficulty for accepted shares", ["pool"])
+SCHEDULER_TIME_SUM = Counter("dpmp_scheduler_time_sum", "Time-based scheduler credits (seconds on pool)", ["pool"])
+SCHEDULER_SHARE = Gauge("dpmp_scheduler_share", "Per-miner scheduler time-ratio (averaged across fleet)", ["pool"])
 DIFF_DOWNSTREAM = Gauge("dpmp_downstream_difficulty", "Current downstream difficulty")
 ACTIVE_POOL = Gauge("dpmp_active_pool", "Active pool (1=active,0=inactive)", ["pool"])
 
@@ -55,6 +57,408 @@ WEIGHTS_OVERRIDE_PATH = None  # set in main() from config path
 ORACLE_MODE_PATH = None       # set in main() from config path
 MAX_CACHED_NOTIFY_AGE_S = 20.0  # don't switch into pool if cached notify older than this
 MAX_CONVERGE_DEVIATION = 0.05 # default max deviation (5%) to trigger urgent pool switch
+
+# Global fleet coordination: track which pool each miner session is on,
+# weighted by each miner's observed hashrate (share difficulty).
+# The scheduler uses the fleet-wide hashrate distribution to decide
+# switching.  This prevents herding AND handles mixed-hashrate fleets:
+# an 80 TH/s miner counts as ~80x more than a 1 TH/s miner.
+import threading
+_fleet_lock = threading.Lock()
+_fleet_pool: dict[str, str] = {}      # sid_str -> current pool ("A" or "B")
+_fleet_weight: dict[str, float] = {}  # sid_str -> hashrate weight (share difficulty)
+_fleet_shareA: dict[str, float] = {}  # sid_str -> current per-session shareA ratio
+_fleet_last_switch_mono: float = 0.0
+_FLEET_SWITCH_COOLDOWN_S = 3.0  # seconds between consecutive miner switches
+_fleet_next_pool_idx: int = 0  # round-robin counter for initial pool assignment
+
+# ---------------------------------------------------------------------------
+# Per-worker stats tracking (for Stats tab in GUI)
+# ---------------------------------------------------------------------------
+# Unlike Prometheus metrics (which have label cardinality issues with dynamic
+# worker names), this is a plain dict that we periodically dump to a JSON file.
+# app.py reads the file directly -- no extra HTTP server needed.
+#
+# Structure: _worker_stats[worker_name] = {
+#   "accepted": int,        # total accepted shares
+#   "rejected": int,        # total rejected shares
+#   "difficulty": float,    # current downstream difficulty
+#   "last_seen": float,     # time.time() of last accepted share
+#   "share_log": [(ts, diff), ...],  # rolling buffer for hashrate calc
+# }
+_worker_stats_lock = threading.Lock()
+_worker_stats: dict[str, dict] = {}
+
+# Per-pool latency tracking: time from submit -> result (round-trip)
+# _pool_submit_time[msg_id] = (pool_key, monotonic_timestamp)
+_pool_submit_time_lock = threading.Lock()
+_pool_submit_time: dict[Any, tuple[str, float]] = {}
+_pool_latency: dict[str, float] = {"A": 0.0, "B": 0.0}  # latest latency in ms
+
+# Path to worker stats JSON file (set in main())
+WORKER_STATS_PATH: str | None = None
+# Path to best shares JSON file (persists across restarts)
+BEST_SHARES_PATH: str | None = None
+# In-memory best share per worker (loaded from file on startup)
+_best_shares: dict[str, float] = {}
+_best_shares_lock = threading.Lock()
+
+# Maximum share_log entries per worker (covers 24hr at ~1 share/sec = 86400,
+# but most miners submit far less frequently; 5000 is plenty for 24hr window)
+_SHARE_LOG_MAX = 5000
+
+
+def _load_best_shares() -> None:
+    """Load best shares from JSON file on startup."""
+    global _best_shares
+    if not BEST_SHARES_PATH:
+        return
+    try:
+        if os.path.isfile(BEST_SHARES_PATH):
+            with open(BEST_SHARES_PATH, "r") as f:
+                data = json.loads(f.read())
+            if isinstance(data, dict):
+                with _best_shares_lock:
+                    _best_shares = {k: float(v) for k, v in data.items()}
+                log("best_shares_loaded", count=len(_best_shares))
+    except Exception as e:
+        log("best_shares_load_error", err=str(e))
+
+
+def _save_best_shares() -> None:
+    """Write best shares to JSON file (called periodically, not on every share)."""
+    if not BEST_SHARES_PATH:
+        return
+    try:
+        with _best_shares_lock:
+            snapshot = dict(_best_shares)
+        tmp = BEST_SHARES_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(json.dumps(snapshot, indent=2))
+        os.replace(tmp, BEST_SHARES_PATH)
+    except Exception as e:
+        log("best_shares_save_error", err=str(e))
+
+
+def _worker_record_share(worker: str, difficulty: float, accepted: bool) -> None:
+    """Record a share for a worker.  Called from the share_result handler."""
+    now = time.time()
+    with _worker_stats_lock:
+        ws = _worker_stats.get(worker)
+        if ws is None:
+            ws = {
+                "accepted": 0,
+                "rejected": 0,
+                "difficulty": difficulty,
+                "last_seen": now,
+                "share_log": [],
+            }
+            _worker_stats[worker] = ws
+
+        if accepted:
+            ws["accepted"] += 1
+            ws["share_log"].append((now, difficulty))
+            # Trim share_log to max size (drop oldest entries)
+            if len(ws["share_log"]) > _SHARE_LOG_MAX:
+                ws["share_log"] = ws["share_log"][-_SHARE_LOG_MAX:]
+        else:
+            ws["rejected"] += 1
+
+        ws["difficulty"] = difficulty
+        ws["last_seen"] = now
+
+    # Update best share (accepted shares only)
+    if accepted and difficulty > 0:
+        with _best_shares_lock:
+            prev = _best_shares.get(worker, 0.0)
+            if difficulty > prev:
+                _best_shares[worker] = difficulty
+
+
+def _worker_calc_hashrate(share_log: list, window_seconds: float) -> float:
+    """Estimate hashrate from a rolling window of (timestamp, difficulty) entries.
+
+    Formula: hashrate = sum(difficulty_in_window) * 2^32 / elapsed_seconds
+
+    Difficulty 1 represents 2^32 (4,294,967,296) hashes of work.  So a miner
+    submitting 1 share/sec at difficulty 1000 is doing ~4.295 TH/s of work.
+
+    Elapsed time uses the span from first_share to last_share in the window,
+    NOT first_share to now.  This avoids inflating the rate when there's a
+    gap between the last share and the current time (e.g., right after a
+    pool switch), and avoids deflating it during the initial ramp-up.
+
+    We require at least 2 shares to calculate -- a single share gives no
+    rate information.
+
+    Example: AvalonQ at ~80 TH/s, pool diff 1024, ~18 shares/sec:
+      18 * 1024 * 2^32 / 1 = ~79.2 TH/s
+    """
+    if not share_log:
+        return 0.0
+    now = time.time()
+    cutoff = now - window_seconds
+
+    # Collect shares within the window
+    window_shares = [(ts, d) for ts, d in share_log if ts >= cutoff]
+    if len(window_shares) < 2:
+        return 0.0
+
+    total_diff = sum(d for _, d in window_shares)
+    first_ts = window_shares[0][0]
+    last_ts = window_shares[-1][0]
+
+    # Elapsed = span from first to last share in the window.
+    # This measures the actual observation period with data at both ends.
+    elapsed = last_ts - first_ts
+    if elapsed < 1.0:
+        return 0.0
+
+    return total_diff * 4294967296.0 / elapsed
+
+
+def _worker_build_stats_snapshot() -> dict:
+    """Build a JSON-serializable snapshot of all worker stats for the GUI.
+
+    Returns a dict like:
+    {
+      "workers": {
+        "BitAxe01": {
+          "hr_5m": 123.4,    # hashes/sec (5-minute window)
+          "hr_60m": 120.1,   # hashes/sec (60-minute window)
+          "hr_24h": 118.5,   # hashes/sec (24-hour window)
+          "sps": 0.15,       # shares per second (from 5-minute window)
+          "diff": 1000.0,    # current downstream difficulty
+          "shares": 450,     # total accepted shares
+          "best": 25000.0,   # best share difficulty (from persistent file)
+          "rejected": 3,     # total rejected shares
+          "rej_pct": 0.66,   # rejected / (accepted + rejected) * 100
+          "last_seen": 1708000000.0,  # Unix timestamp of last share
+        }, ...
+      },
+      "pool_latency": {"A": 45.2, "B": 32.1},  # ms
+      "ts": 1708000000.0  # snapshot timestamp
+    }
+    """
+    workers = {}
+    with _worker_stats_lock:
+        for wname, ws in _worker_stats.items():
+            sl = ws.get("share_log", [])
+            acc = ws.get("accepted", 0)
+            rej = ws.get("rejected", 0)
+            total = acc + rej
+
+            # Shares per second from 5-minute window
+            now = time.time()
+            cutoff_5m = now - 300
+            shares_in_5m = sum(1 for ts, _ in sl if ts >= cutoff_5m)
+            elapsed_5m = min(300.0, now - sl[0][0]) if sl and sl[0][0] >= cutoff_5m else 300.0
+            sps = shares_in_5m / max(1.0, elapsed_5m) if shares_in_5m > 0 else 0.0
+
+            with _best_shares_lock:
+                best = _best_shares.get(wname, 0.0)
+
+            workers[wname] = {
+                "hr_5m": round(_worker_calc_hashrate(sl, 300), 2),
+                "hr_60m": round(_worker_calc_hashrate(sl, 3600), 2),
+                "hr_24h": round(_worker_calc_hashrate(sl, 86400), 2),
+                "sps": round(sps, 4),
+                "diff": ws.get("difficulty", 0.0),
+                "shares": acc,
+                "best": best,
+                "rejected": rej,
+                "rej_pct": round(rej / total * 100, 2) if total > 0 else 0.0,
+                "last_seen": ws.get("last_seen", 0.0),
+            }
+
+    return {
+        "workers": workers,
+        "pool_latency": dict(_pool_latency),
+        "ts": time.time(),
+    }
+
+
+def _worker_stats_write_loop_sync() -> None:
+    """Background thread that writes worker_stats.json and best_shares.json
+    every 5 seconds.  Runs in a daemon thread so it dies with the process."""
+    while True:
+        try:
+            time.sleep(5)
+            if WORKER_STATS_PATH:
+                snapshot = _worker_build_stats_snapshot()
+                tmp = WORKER_STATS_PATH + ".tmp"
+                with open(tmp, "w") as f:
+                    f.write(json.dumps(snapshot, separators=(",", ":")))
+                os.replace(tmp, WORKER_STATS_PATH)
+            # Save best shares less frequently (every 30 seconds)
+            if int(time.time()) % 30 < 5:
+                _save_best_shares()
+        except Exception as e:
+            log("worker_stats_write_error", err=str(e))
+
+
+def _pool_record_submit_time(msg_id: Any, pool_key: str) -> None:
+    """Record the monotonic time when a share was submitted to a pool.
+    Called right before sending the share upstream."""
+    with _pool_submit_time_lock:
+        _pool_submit_time[msg_id] = (pool_key, time.monotonic())
+        # Prune old entries (shouldn't happen, but safety)
+        if len(_pool_submit_time) > 500:
+            oldest = sorted(_pool_submit_time.items(), key=lambda x: x[1][1])
+            for k, _ in oldest[:250]:
+                _pool_submit_time.pop(k, None)
+
+
+def _pool_record_result_time(msg_id: Any) -> None:
+    """Record when the pool responded to a submitted share.
+    Calculates round-trip latency and updates the pool's latency gauge."""
+    with _pool_submit_time_lock:
+        entry = _pool_submit_time.pop(msg_id, None)
+    if entry is None:
+        return
+    pool_key, submit_mono = entry
+    latency_ms = (time.monotonic() - submit_mono) * 1000.0
+    _pool_latency[pool_key] = round(latency_ms, 1)
+
+
+def _fleet_register(sid_str: str, pool: str, weight: float = 1.0) -> None:
+    """Register or update a miner's current pool assignment and weight."""
+    with _fleet_lock:
+        _fleet_pool[sid_str] = pool
+        if weight > 0:
+            _fleet_weight[sid_str] = weight
+
+def _fleet_update_weight(sid_str: str, weight: float) -> None:
+    """Update a miner's hashrate weight (called on accepted shares)."""
+    with _fleet_lock:
+        if weight > 0:
+            _fleet_weight[sid_str] = weight
+
+def _fleet_update_share(sid_str: str, shareA: float) -> None:
+    """Update a miner's current scheduler shareA ratio."""
+    with _fleet_lock:
+        _fleet_shareA[sid_str] = shareA
+
+def _fleet_avg_share() -> tuple[float, float]:
+    """Return the average (shareA, shareB) across all active miners.
+    Simple average -- each miner counts equally regardless of hashrate,
+    since each independently targets the same ratio."""
+    with _fleet_lock:
+        if not _fleet_shareA:
+            return 0.5, 0.5
+        avg_a = sum(_fleet_shareA.values()) / len(_fleet_shareA)
+        return avg_a, 1.0 - avg_a
+
+def _fleet_unregister(sid_str: str) -> None:
+    """Remove a miner from fleet tracking (on disconnect)."""
+    with _fleet_lock:
+        _fleet_pool.pop(sid_str, None)
+        _fleet_weight.pop(sid_str, None)
+        _fleet_shareA.pop(sid_str, None)
+
+def _fleet_ratio() -> tuple[float, float]:
+    """Return (hashrate_on_A, hashrate_on_B) across all active miners.
+    Each miner's contribution is weighted by its observed share difficulty."""
+    with _fleet_lock:
+        a = sum(_fleet_weight.get(sid, 1.0)
+                for sid, p in _fleet_pool.items() if p == "A")
+        b = sum(_fleet_weight.get(sid, 1.0)
+                for sid, p in _fleet_pool.items() if p == "B")
+        return a, b
+
+def _fleet_try_switch() -> bool:
+    """Try to claim a fleet-wide switch slot (cooldown gate)."""
+    global _fleet_last_switch_mono
+    with _fleet_lock:
+        now = time.monotonic()
+        if now - _fleet_last_switch_mono >= _FLEET_SWITCH_COOLDOWN_S:
+            _fleet_last_switch_mono = now
+            return True
+        return False
+
+# When an en2_size change is sent to a miner during a pool switch, this dict
+# pre-writes which pool the miner should handshake on IF it disconnects and
+# reconnects.  Miners that handle the change gracefully never use the hint.
+# Keyed by miner IP address (str), value is (pool_key, monotonic_timestamp).
+# Entries expire after _EN2_HINT_TTL_S seconds to avoid stale hints.
+_next_handshake_pool: dict[str, tuple[str, float]] = {}
+_EN2_HINT_TTL_S = 30.0  # hint expires after 30 seconds
+
+# Auto-detection: miners that can't handle en2_size changes get pinned to
+# one pool (avoids wasted hashing on rejects or disconnect loops).
+# _en2_strikes tracks consecutive strike count per miner IP.
+# Once count >= _EN2_STRIKE_THRESHOLD, the IP is added to _en2_force_disconnect.
+# Strikes reset to 0 when a miner successfully accepts a share after an
+# en2_size change, so only consistently failing miners get flagged.
+# _en2_struck_hint tracks the hint timestamp that was already counted as a
+# strike, so multiple rejected shares from the same en2_size event only
+# count as one strike.
+_en2_strikes: dict[str, int] = {}
+_en2_struck_hint: dict[str, float] = {}  # miner_ip -> hint_timestamp already struck
+_en2_force_disconnect: set[str] = set()
+_EN2_STRIKE_THRESHOLD = 4      # consecutive en2_size failures -> pin to pool
+_EN2_STRIKE_WINDOW_S = 10.0    # reject must occur within 10s of hint to count
+
+def _record_en2_strike(miner_ip: str) -> bool:
+    """Record a strike for a miner that rejected shares after en2_size change.
+    Only counts one strike per hint (per en2_size change event).
+    Returns True if the miner has now crossed the threshold."""
+    # Check if we already struck against this particular hint
+    entry = _next_handshake_pool.get(miner_ip)
+    if entry is None:
+        return False
+    _, hint_ts = entry
+    if _en2_struck_hint.get(miner_ip) == hint_ts:
+        return False  # already counted this en2_size event
+
+    _en2_struck_hint[miner_ip] = hint_ts
+    count = _en2_strikes.get(miner_ip, 0) + 1
+    _en2_strikes[miner_ip] = count
+    if count >= _EN2_STRIKE_THRESHOLD:
+        _en2_force_disconnect.add(miner_ip)
+        return True
+    return False
+
+def _reset_en2_strikes(miner_ip: str) -> None:
+    """Reset strikes for a miner that successfully handled an en2_size change.
+    Called when an accepted share arrives within the strike window."""
+    prev = _en2_strikes.get(miner_ip, 0)
+    if prev > 0:
+        _en2_strikes[miner_ip] = 0
+        log("en2_strikes_reset", miner_ip=miner_ip, previous_strikes=prev,
+            reason="miner accepted share after en2_size change")
+    # Also clear the struck hint so the next en2_size event can be evaluated fresh
+    _en2_struck_hint.pop(miner_ip, None)
+
+def _pop_en2_hint(miner_ip: str) -> str | None:
+    """Pop and return the en2_size handshake hint for a miner IP, or None if expired/missing."""
+    entry = _next_handshake_pool.pop(miner_ip, None)
+    if entry is None:
+        return None
+    pool_key, ts = entry
+    if time.monotonic() - ts > _EN2_HINT_TTL_S:
+        return None  # hint expired
+    return pool_key
+
+def _peek_en2_hint(miner_ip: str) -> str | None:
+    """Read the en2_size handshake hint without consuming it. Returns None if expired/missing."""
+    entry = _next_handshake_pool.get(miner_ip)
+    if entry is None:
+        return None
+    pool_key, ts = entry
+    if time.monotonic() - ts > _EN2_HINT_TTL_S:
+        _next_handshake_pool.pop(miner_ip, None)  # clean up expired
+        return None
+    return pool_key
+
+def _has_recent_en2_hint(miner_ip: str) -> bool:
+    """Check if there's a recent (non-expired) en2_size hint for this miner,
+    WITHOUT consuming or expiring it. Used to detect post-switch rejects."""
+    entry = _next_handshake_pool.get(miner_ip)
+    if entry is None:
+        return False
+    _, ts = entry
+    return (time.monotonic() - ts) <= _EN2_STRIKE_WINDOW_S
 
 # Read weight override file if it exists (written by GUI slider)
 def read_weight_override() -> tuple[int, int] | None:
@@ -744,15 +1148,34 @@ class ProxySession:
         self.last_downstream_en1: Optional[str] = None
         self.last_downstream_en2s: Optional[int] = None
 
-        # Start active on the pool with higher weight (avoids early misroutes at 0/100 or 100/0).
+        # Start active pool: spread miners across pools from the start.
+        # If one pool has zero weight, all miners go to the other.
+        # Otherwise, alternate miners between pools using a global counter
+        # so the fleet starts pre-balanced (e.g., 2 on A and 2 on B at 50/50).
+        global _fleet_next_pool_idx
         if cfg.sched.wA <= 0 and cfg.sched.wB > 0:
             self.active_pool: str = "B"
         elif cfg.sched.wB <= 0 and cfg.sched.wA > 0:
             self.active_pool: str = "A"
-        elif cfg.sched.wB > cfg.sched.wA:
-            self.active_pool: str = "B"
         else:
-            self.active_pool: str = "A"
+            # Both pools have weight -- alternate between A and B
+            self.active_pool: str = "A" if (_fleet_next_pool_idx % 2 == 0) else "B"
+            _fleet_next_pool_idx += 1
+
+        # Override active_pool if this miner was disconnected due to en2_size
+        # mismatch and should start on the target pool immediately.
+        # (Don't pop the hint here -- let the handshake selection consume it,
+        # but peek at it to set the initial active_pool.)
+        try:
+            _peer = miner_w.get_extra_info("peername")
+            if _peer:
+                _hint = _peek_en2_hint(_peer[0])
+                if _hint:
+                    self.active_pool = _hint
+                    log("active_pool_from_en2_hint", sid=self.sid,
+                        pool=self.active_pool, miner_ip=_peer[0])
+        except Exception:
+            pass
 
         self.job_owner: Dict[tuple, str] = {}  # key=(pool_key, jobid)
 
@@ -836,21 +1259,35 @@ class ProxySession:
         re-send subscribe/authorize, so we must do it ourselves.
         """
         if not is_reconnect:
-            # Determine which pool will be the handshake pool (same logic as in miner_to_pools)
+            # Check for en2_size reconnect hint first
+            handshake = None
             try:
-                wA = float(getattr(self.cfg.sched, "wA", 0))
-                wB = float(getattr(self.cfg.sched, "wB", 0))
+                _peer = self.miner_w.get_extra_info("peername")
+                if _peer:
+                    _hint = _peek_en2_hint(_peer[0])
+                    if _hint:
+                        handshake = _hint
+                        log("bootstrap_handshake_from_en2_hint", sid=self.sid,
+                            pool=handshake, miner_ip=_peer[0])
             except Exception:
-                wA, wB = 1.0, 0.0
-            
-            if wA <= 0 and wB > 0:
-                handshake = "B"
-            elif wB <= 0 and wA > 0:
-                handshake = "A"
-            elif wB > wA:
-                handshake = "B"
-            else:
-                handshake = "A"
+                pass
+
+            if handshake is None:
+                # Determine which pool will be the handshake pool (same logic as in miner_to_pools)
+                try:
+                    wA = float(getattr(self.cfg.sched, "wA", 0))
+                    wB = float(getattr(self.cfg.sched, "wB", 0))
+                except Exception:
+                    wA, wB = 1.0, 0.0
+                
+                if wA <= 0 and wB > 0:
+                    handshake = "B"
+                elif wB <= 0 and wA > 0:
+                    handshake = "A"
+                elif wB > wA:
+                    handshake = "B"
+                else:
+                    handshake = "A"
             
             # Only bootstrap the NON-handshake pool at initial startup
             if pcfg.key == handshake:
@@ -1034,6 +1471,25 @@ class ProxySession:
                     force_send=force_send, handshake=handshake, last_en_pool=last_en_pool)
                 return
 
+            # If extranonce2_size is changing, some miners (e.g., Braiins BM-101)
+            # may disconnect after receiving mining.set_extranonce with a different
+            # en2_size.  We pre-write a handshake hint so that IF the miner
+            # disconnects, the next session lands on the correct pool automatically.
+            # Miners flagged via the strike system never reach this code because
+            # forward_jobs blocks the pool switch entirely for them.
+            if (self.last_downstream_en2s is not None
+                    and new_en2s != self.last_downstream_en2s):
+                try:
+                    peer = self.miner_w.get_extra_info("peername")
+                    if peer:
+                        _next_handshake_pool[peer[0]] = (pool_key, time.monotonic())
+                except Exception:
+                    pass
+                log("downstream_extranonce_size_change_hint", sid=self.sid,
+                    pool=pool_key, old_en2s=self.last_downstream_en2s,
+                    new_en2s=new_en2s, new_en1=new_en1,
+                    reason="en2_size changing, hint written for potential reconnect")
+
             # Send the extranonce
             msg = {"method": "mining.set_extranonce", "params": [new_en1, new_en2s]}
             try:
@@ -1139,6 +1595,20 @@ class ProxySession:
                 try:
                     cfg_id = msg.get("id")
                     if self.handshake_pool is None:
+                        # Check for en2_size reconnect hint (miner disconnected
+                        # after en2_size change and should handshake on target pool).
+                        try:
+                            peer = self.miner_w.get_extra_info("peername")
+                            if peer:
+                                hint = _pop_en2_hint(peer[0])
+                                if hint:
+                                    self.handshake_pool = hint
+                                    log("handshake_pool_from_en2_hint", sid=self.sid,
+                                        pool=hint, miner_ip=peer[0])
+                        except Exception:
+                            pass
+
+                    if self.handshake_pool is None:
                         # Choose handshake pool from config weights (avoid hard-wiring to A).
                         try:
                             wA = float(getattr(self.cfg.sched, "wA", 0))
@@ -1178,6 +1648,19 @@ class ProxySession:
 
             if m == "mining.subscribe":
                 self.subscribe_id = msg.get("id")
+                if self.handshake_pool is None:
+                    # Check for en2_size reconnect hint
+                    try:
+                        peer = self.miner_w.get_extra_info("peername")
+                        if peer:
+                            hint = _pop_en2_hint(peer[0])
+                            if hint:
+                                self.handshake_pool = hint
+                                log("handshake_pool_from_en2_hint", sid=self.sid,
+                                    pool=hint, miner_ip=peer[0])
+                    except Exception:
+                        pass
+
                 if self.handshake_pool is None:
                     # Choose handshake pool from config weights (avoid hard-wiring to A).
                     try:
@@ -1426,6 +1909,51 @@ class ProxySession:
                     }), "downstream")
                     continue
 
+                # Low-diff suppression: after a pool switch, the miner may
+                # have a pipeline of shares built at the old (lower) pool's
+                # difficulty.  These will be rejected by the new pool as
+                # "low difficulty share".  Instead of forwarding them upstream
+                # (where they waste bandwidth and inflate reject counters),
+                # we silently absorb them and send a fake "accepted" back to
+                # the miner.  This only applies during a brief grace window
+                # after a switch, so normal VarDiff adjustments are unaffected.
+                #
+                # We compare the share's expected difficulty (what we last
+                # sent downstream for this pool) against the pool's current
+                # required difficulty.  If our downstream diff is less than
+                # 50% of the pool's diff, the share will almost certainly be
+                # rejected as low-diff.
+                _switch_age = None
+                if self.last_switch_mono is not None:
+                    _switch_age = time.monotonic() - self.last_switch_mono
+                if _switch_age is not None and _switch_age < SWITCH_SUBMIT_GRACE_S:
+                    _pool_diff = self.latest_diff.get(pool) or 0.0
+                    _our_diff = self.last_downstream_diff_by_pool.get(pool) or 0.0
+                    # Only suppress if we know both diffs and ours is way below pool's
+                    if _pool_diff > 0 and _our_diff > 0 and _our_diff < _pool_diff * 0.5:
+                        _suppressed = getattr(self, "_lowdiff_suppressed", 0)
+                        self._lowdiff_suppressed = _suppressed + 1
+                        # Log once per burst (first suppression and then every 50th)
+                        if _suppressed == 0 or _suppressed % 50 == 0:
+                            log("submit_suppressed_low_diff", sid=self.sid,
+                                mid=msg.get("id"), jid=jid, pool=pool,
+                                our_diff=_our_diff, pool_diff=_pool_diff,
+                                switch_age_s=round(_switch_age, 2),
+                                suppressed_count=_suppressed + 1)
+                        # Send fake "accepted" so the miner does not slow down or error
+                        self.submit_owner.pop(msg.get("id"), None)
+                        self.submit_diff.pop(msg.get("id"), None)
+                        await write_line(self.miner_w, dumps_json({
+                            "id": msg.get("id"), "result": True, "error": None
+                        }), "downstream")
+                        continue
+                else:
+                    # Outside grace window: reset suppression counter
+                    if getattr(self, "_lowdiff_suppressed", 0) > 0:
+                        log("submit_suppressed_low_diff_end", sid=self.sid,
+                            pool=pool, total_suppressed=self._lowdiff_suppressed)
+                        self._lowdiff_suppressed = 0
+
                 if pool == "B":
                     out = dict(msg)
                     params = list(out.get("params") or [])
@@ -1434,6 +1962,8 @@ class ProxySession:
                         params[0] = f"{self.cfg.poolB.wallet}.{self.worker}" if self.cfg.poolB.wallet else str(params[0])
                         # Keep versionbits if present (miners may be version-rolling).
                         out["params"] = params
+                    # --- Stats tab: record submit time for latency measurement ---
+                    _pool_record_submit_time(msg.get("id"), "B")
                     await write_line(self.wB, dumps_json(out), "upstreamB")
                 else:
                     out = dict(msg)
@@ -1443,6 +1973,8 @@ class ProxySession:
                         params[0] = f"{self.cfg.poolA.wallet}.{self.worker}" if self.cfg.poolA.wallet else str(params[0])
                         # Keep versionbits if present (miners may be version-rolling).
                         out["params"] = params
+                    # --- Stats tab: record submit time for latency measurement ---
+                    _pool_record_submit_time(msg.get("id"), "A")
                     await write_line(self.wA, dumps_json(out), "upstreamA")
                 continue
 
@@ -1654,24 +2186,65 @@ class ProxySession:
                     d = float(self.submit_diff.pop(mid, 0.0))
                     ok = bool(msg.get("result"))
 
+                    # --- Stats tab: pool latency (submit -> result round-trip) ---
+                    _pool_record_result_time(mid)
+
                     if ok:
                         SHARES_ACCEPTED.labels(pool=p).inc()
                         ACCEPTED_DIFFICULTY_SUM.labels(pool=p).inc(d)
-                        # Cap the difficulty credited to the scheduler counters.
-                        # Without this, a single high-diff share on the minority
-                        # pool can swing the ratio 30+ points (e.g., 80/20  50/50),
-                        # causing a multi-minute recovery on the majority pool.
-                        # Cap: one share can move the ratio by at most ~5%.
-                        _total = self.accepted_diff_sum.get("A", 0.0) + self.accepted_diff_sum.get("B", 0.0)
-                        _max_credit = _total * 0.10 if _total > 0 else d
-                        _credit = min(d, _max_credit) if _max_credit > 0 else d
-                        self.accepted_diff_sum[p] = self.accepted_diff_sum.get(p, 0.0) + _credit
-                        log("share_result", sid=self.sid, pool=p, accepted=True,
-                            diff=d, credit=round(_credit, 1), capped=(d != _credit))
+                        # Scheduler counters now use TIME-BASED credits (accumulated
+                        # in forward_jobs), not per-share difficulty.  This prevents
+                        # high-hashrate miners from dominating the ratio calculation.
+                        # Prometheus still tracks real difficulty for GUI display.
+                        log("share_result", sid=self.sid, pool=p, accepted=True, diff=d)
+                        # Update this miner's fleet weight based on share difficulty.
+                        # Pools auto-tune difficulty proportional to hashrate, so
+                        # diff is a good proxy for relative miner hashrate.
+                        _fleet_update_weight(str(self.sid), d)
+
+                        # --- Stats tab: per-worker share tracking ---
+                        try:
+                            wn = self.worker or "unknown"
+                            _worker_record_share(wn, d, True)
+                        except Exception:
+                            pass
+                        # If this miner had en2 strikes and just accepted a share
+                        # within the strike window, it handled the change fine --
+                        # reset its consecutive strike counter.
+                        try:
+                            _peer = self.miner_w.get_extra_info("peername")
+                            if _peer and _has_recent_en2_hint(_peer[0]):
+                                _reset_en2_strikes(_peer[0])
+                        except Exception:
+                            pass
 
                     else:
                         SHARES_REJECTED.labels(pool=p).inc()
                         log("share_result", sid=self.sid, pool=p, accepted=False, error=msg.get("error"))
+
+                        # --- Stats tab: per-worker rejected share tracking ---
+                        try:
+                            wn = self.worker or "unknown"
+                            _worker_record_share(wn, d, False)
+                        except Exception:
+                            pass
+                        # Auto-detect miners that can't handle en2_size changes:
+                        # if a reject arrives shortly after an en2_size hint was
+                        # written, this miner likely can't handle the change.
+                        try:
+                            _peer = self.miner_w.get_extra_info("peername")
+                            if _peer and _has_recent_en2_hint(_peer[0]):
+                                crossed = _record_en2_strike(_peer[0])
+                                if crossed:
+                                    log("en2_force_disconnect_learned", sid=self.sid,
+                                        miner_ip=_peer[0],
+                                        reason="miner rejected shares after en2_size changes, will pin to current pool")
+                                else:
+                                    log("en2_strike_recorded", sid=self.sid,
+                                        miner_ip=_peer[0],
+                                        strikes=_en2_strikes.get(_peer[0], 0))
+                        except Exception:
+                            pass
                 await write_line(self.miner_w, dumps_json(msg), "downstream")
                 continue
 
@@ -1924,7 +2497,44 @@ class ProxySession:
         ACTIVE_POOL.labels(pool="A").set(1 if current_pool == "A" else 0)
         ACTIVE_POOL.labels(pool="B").set(1 if current_pool == "B" else 0)
         last_switch_ts = time.monotonic()
+        _last_credit_ts = time.monotonic()  # for time-based scheduler credits
         min_switch = max(0, int(self.cfg.sched.min_switch_seconds))
+
+        # Register this miner in the global fleet tracker
+        _fleet_register(str(self.sid), current_pool)
+        # Seed per-session counters so each miner starts as if it has already
+        # been running at the target ratio, with a small bias toward its
+        # starting pool.  This prevents miners from immediately switching
+        # away from their initial pool assignment.
+        import random
+        _override = read_weight_override()
+        if _override is not None:
+            _init_wA, _init_wB = _override
+        else:
+            _init_wA = max(0, int(getattr(self.cfg.sched, "wA", getattr(self.cfg.sched, "poolA_weight", 0))))
+            _init_wB = max(0, int(getattr(self.cfg.sched, "wB", getattr(self.cfg.sched, "poolB_weight", 0))))
+        _init_totw = _init_wA + _init_wB
+        if _init_totw > 0:
+            _seed_total = 60.0
+            _tA = (_init_wA / _init_totw)
+            _tB = (_init_wB / _init_totw)
+            # Start at target ratio, then add a small bias toward starting pool.
+            # This ensures the miner stays on its initial pool for at least one
+            # slice before the time-based ratio naturally guides switching.
+            # Random component (0-5s) breaks symmetry between same-pool miners.
+            _bias = 10.0 + random.uniform(0.0, 5.0)
+            if current_pool == "A":
+                self.accepted_diff_sum["A"] = _seed_total * _tA + _bias
+                self.accepted_diff_sum["B"] = _seed_total * _tB
+            else:
+                self.accepted_diff_sum["A"] = _seed_total * _tA
+                self.accepted_diff_sum["B"] = _seed_total * _tB + _bias
+        # Random jitter on first switch timing
+        _jitter = random.uniform(0.0, 10.0)
+        last_switch_ts = time.monotonic() - (max(1, int(self.cfg.sched.slice_seconds)) - _jitter)
+        log("scheduler_init", sid=self.sid, pool=current_pool, jitter=round(_jitter, 1),
+            seedA=round(self.accepted_diff_sum.get("A", 0), 1),
+            seedB=round(self.accepted_diff_sum.get("B", 0), 1))
 
         last_sent_seq = {"A": 0, "B": 0}
         last_prune_mono = time.monotonic()
@@ -1982,6 +2592,47 @@ class ProxySession:
                 _active_frac = 0.5
             _effective_min_switch = max(float(slice_s), min(float(min_switch), float(min_switch) * _active_frac * 2.0))
 
+            # ---- Time-based credits, decay, and ratio: run EVERY tick (0.1s) ----
+            # These must run every tick so the decay rate works as intended.
+            # At 0.9995 per tick with 10 ticks/sec, half-life is ~138 seconds.
+            # Previously these were inside the min_switch gate and only ran
+            # every 30-60s, making the effective half-life thousands of seconds
+            # and causing the Scheduler Ratio to drift over hours.
+            _tick_elapsed = now - _last_credit_ts
+            _last_credit_ts = now
+            _tick_credit = min(_tick_elapsed, 2.0)
+            SCHEDULER_TIME_SUM.labels(pool=current_pool).inc(_tick_credit)
+
+            self.accepted_diff_sum[current_pool] = (
+                self.accepted_diff_sum.get(current_pool, 0.0) + _tick_credit
+            )
+
+            #_decay = 0.9999
+            #self.accepted_diff_sum["A"] = self.accepted_diff_sum.get("A", 0.0) * _decay
+            #self.accepted_diff_sum["B"] = self.accepted_diff_sum.get("B", 0.0) * _decay
+
+            _decay = 0.999 ** _tick_credit
+            self.accepted_diff_sum["A"] = self.accepted_diff_sum.get("A", 0.0) * _decay
+            self.accepted_diff_sum["B"] = self.accepted_diff_sum.get("B", 0.0) * _decay
+
+            diffA = float(self.accepted_diff_sum.get("A", 0.0))
+            diffB = float(self.accepted_diff_sum.get("B", 0.0))
+            tot = diffA + diffB
+
+            if totw > 0:
+                targetA = (wA / totw)
+                targetB = (wB / totw)
+            else:
+                targetA, targetB = 0.5, 0.5
+
+            shareA = (diffA / tot) if tot > 0 else targetA
+            shareB = (diffB / tot) if tot > 0 else targetB
+
+            _fleet_update_share(str(self.sid), shareA)
+            _avg_a, _avg_b = _fleet_avg_share()
+            SCHEDULER_SHARE.labels(pool="A").set(_avg_a)
+            SCHEDULER_SHARE.labels(pool="B").set(_avg_b)
+
             if (now - last_switch_ts) >= _effective_min_switch:
                 # Choose the pool that is behind in accepted difficulty share vs target.
                 # BUT if one or more pool has failed....
@@ -1996,27 +2647,35 @@ class ProxySession:
                 _prev = getattr(self, "_last_effective_weights", None)
                 _curr = (wA, wB)
                 if _prev != _curr:
-                    # Reseed accepted difficulty counters to match the NEW target ratio.
-                    # Why not reset to 0/0? Because after a reset, the very first share
-                    # creates a massive deviation (e.g., 100%/0%) and triggers urgent
-                    # oscillation. Instead, keep the total difficulty but redistribute
-                    # it to match the new targets, so the scheduler starts balanced.
-                    old_diffA = self.accepted_diff_sum.get("A", 0.0)
-                    old_diffB = self.accepted_diff_sum.get("B", 0.0)
-                    old_total = old_diffA + old_diffB
-                    new_total = wA + wB
-                    if old_total > 0 and new_total > 0:
-                        self.accepted_diff_sum["A"] = old_total * (wA / new_total)
-                        self.accepted_diff_sum["B"] = old_total * (wB / new_total)
+                    # Hard reset per-session counters to new target ratio.
+                    # This gives near-instant convergence instead of waiting
+                    # for old history to decay (~6 minutes at 0.9995/tick).
+                    # Seed with enough history to prevent urgent oscillation,
+                    # biased toward current pool so the miner doesn't
+                    # immediately switch away.
+                    import random
+                    _seed_total = 60.0
+                    if totw > 0:
+                        _new_tA = wA / totw
+                        _new_tB = wB / totw
                     else:
-                        self.accepted_diff_sum["A"] = 0.0
-                        self.accepted_diff_sum["B"] = 0.0
+                        _new_tA, _new_tB = 0.5, 0.5
+                    _bias = 10.0 + random.uniform(0.0, 5.0)
+                    if current_pool == "A":
+                        self.accepted_diff_sum["A"] = _seed_total * _new_tA + _bias
+                        self.accepted_diff_sum["B"] = _seed_total * _new_tB
+                    else:
+                        self.accepted_diff_sum["A"] = _seed_total * _new_tA
+                        self.accepted_diff_sum["B"] = _seed_total * _new_tB + _bias
+                    # Reset switch timer so miner re-evaluates promptly
+                    last_switch_ts = now - _effective_min_switch
+                    _cA, _cB = _fleet_ratio()
                     log("weights_override_changed", sid=self.sid,
                         wA=wA, wB=wB, prev=_prev,
                         source="slider" if _override is not None else "config",
-                        old_diffA=round(old_diffA, 1), old_diffB=round(old_diffB, 1),
-                        new_diffA=round(self.accepted_diff_sum["A"], 1),
-                        new_diffB=round(self.accepted_diff_sum["B"], 1))
+                        fleet_on_A=_cA, fleet_on_B=_cB,
+                        new_seedA=round(self.accepted_diff_sum["A"], 1),
+                        new_seedB=round(self.accepted_diff_sum["B"], 1))
                     self._last_effective_weights = _curr
 
                 if not self.pool_alive.get("A", False):
@@ -2036,31 +2695,9 @@ class ProxySession:
                 pick = current_pool
 
                 if totw > 0:
+                    # Recalculate targets with failover-adjusted weights
                     targetA = (wA / totw)
                     targetB = (wB / totw)
-
-                    # Decay accepted difficulty so old history doesn't dominate.
-                    # But use a VERY gentle decay (0.9995) to avoid making the
-                    # counters volatile -- especially for the minority pool at
-                    # lopsided ratios (e.g., 80/20) where a single share can
-                    # swing the ratio by 20+ points if the baseline is too small.
-                    #
-                    # 0.9995 per tick means effective memory of ~2000 ticks.
-                    # At 30s ticks that's ~16 hours before old data fades to 50%.
-                    # The weight-change reseed handles the "slider moved" case,
-                    # so decay only needs to handle very long-term drift.
-
-                    _decay = 0.9995
-                    self.accepted_diff_sum["A"] = self.accepted_diff_sum.get("A", 0.0) * _decay
-                    self.accepted_diff_sum["B"] = self.accepted_diff_sum.get("B", 0.0) * _decay
-
-
-                    diffA = float(self.accepted_diff_sum.get("A", 0.0))
-                    diffB = float(self.accepted_diff_sum.get("B", 0.0))
-                    tot = diffA + diffB
-
-                    shareA = (diffA / tot) if tot > 0 else targetA
-                    shareB = (diffB / tot) if tot > 0 else targetB
 
                     # How far off-target is the current pool? (positive = over-target)
                     if current_pool == "A":
@@ -2110,7 +2747,7 @@ class ProxySession:
                         #   -- rarely triggers (deviation seldom that large at 50/50)
 
                         if prefer != current_pool and not urgent:
-                            hysteresis = minority_frac / 4.0
+                            hysteresis = min(minority_frac / 4.0, 0.04)
                             if abs(current_deviation) < hysteresis:
                                 prefer = current_pool
                                 reason = "hold_current_hysteresis"
@@ -2129,15 +2766,48 @@ class ProxySession:
                         self._last_scheduler_tick_log = _now_mono
 
                 # Don't switch into a pool until we have a cached job for it.
+                # Also, don't switch miners that are flagged as unable to handle
+                # en2_size changes -- they stay on whichever pool they handshaked on.
                 if pick != current_pool:
-                    if self.latest_notify_raw.get(pick) is None:
+                    _skip_en2 = False
+                    try:
+                        _peer = self.miner_w.get_extra_info("peername")
+                        if _peer and _peer[0] in _en2_force_disconnect:
+                            # Check if the switch would actually cause an en2_size change
+                            _curr_en2s = self.extranonce2_size.get(current_pool)
+                            _pick_en2s = self.extranonce2_size.get(pick)
+                            if _curr_en2s is not None and _pick_en2s is not None and _curr_en2s != _pick_en2s:
+                                _skip_en2 = True
+                    except Exception:
+                        pass
+
+                    if _skip_en2:
+                        # Reset the switch timer so the scheduler doesn't keep
+                        # urgently retrying every tick for this pinned miner.
+                        last_switch_ts = now
+                        # Only log once per 60 seconds to avoid noise
+                        _last_en2_skip_log = getattr(self, "_last_en2_skip_log", 0.0)
+                        if now - _last_en2_skip_log >= 60.0:
+                            log("pool_switch_skipped_en2_flagged", sid=self.sid,
+                                from_pool=current_pool, to_pool=pick,
+                                miner_ip=_peer[0] if _peer else "?",
+                                reason="miner cannot handle en2_size change, staying on current pool")
+                            self._last_en2_skip_log = now
+                    elif self.latest_notify_raw.get(pick) is None:
                         log("switch_skipped_no_cached_job", sid=self.sid, from_pool=current_pool, to_pool=pick)
+                    elif not _fleet_try_switch():
+                        # Another miner switched recently -- wait for cooldown
+                        # so the fleet ratio can update before we decide.
+                        # Reset switch timer so we wait a full slice before
+                        # retrying (prevents scheduler tick spam).
+                        last_switch_ts = now
                     else:
                         self.active_pool = pick
                         ACTIVE_POOL.labels(pool="A").set(1 if pick == "A" else 0)
                         ACTIVE_POOL.labels(pool="B").set(1 if pick == "B" else 0)
                         current_pool = pick
                         last_switch_ts = now
+                        _fleet_register(str(self.sid), pick)  # update fleet tracker
                         log("pool_switched", sid=self.sid, to_pool=pick)
                         switched_this_tick = True
                         self.last_switch_mono = time.monotonic()                      
@@ -2339,6 +3009,17 @@ async def main():
 
     WEIGHTS_OVERRIDE_PATH = os.path.join(os.path.dirname(cfg_path), "weights_override.json")
     ORACLE_MODE_PATH = os.path.join(os.path.dirname(cfg_path), "oracle_mode.json")
+
+    # --- Stats tab: set up file paths and load persistent best shares ---
+    global WORKER_STATS_PATH, BEST_SHARES_PATH
+    WORKER_STATS_PATH = os.path.join(os.path.dirname(cfg_path), "worker_stats.json")
+    BEST_SHARES_PATH = os.path.join(os.path.dirname(cfg_path), "best_shares.json")
+    _load_best_shares()
+
+    # Start background thread that writes worker_stats.json every 5 seconds
+    _stats_writer = threading.Thread(target=_worker_stats_write_loop_sync, daemon=True)
+    _stats_writer.start()
+    log("worker_stats_writer_started", stats_path=WORKER_STATS_PATH, best_shares_path=BEST_SHARES_PATH)
 
     # Delete oracle_mode.json on startup so config auto_balance is the default.
     # The file is only created when the GUI switch button is clicked at runtime.
