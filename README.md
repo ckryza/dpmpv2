@@ -206,6 +206,12 @@ DPMP v2 is designed for users who:
 
 # Changelog
 
+## 3.0.3 - 2026-02-26
+- finalize fleet implementation
+- add Fleet table to Stats tab
+- address pool/miner compatibility issues
+- cosmetic updates
+
 ## 3.0.2 - 2026-02-17
 - add Stats tab with Worker and Pool tables
 - address pool/miner compatibility issues

@@ -28,6 +28,7 @@ WEIGHTS_OVERRIDE_PATH = os.path.join(os.path.dirname(os.environ.get("DPMP_CONFIG
 ORACLE_CHART_HISTORY_PATH = os.path.join(os.path.dirname(os.environ.get("DPMP_CONFIG_PATH", os.path.expanduser("~/dpmp/dpmp/config_v2.json"))), "oracle_chart_history.json")
 ORACLE_MODE_PATH = os.path.join(os.path.dirname(os.environ.get("DPMP_CONFIG_PATH", os.path.expanduser("~/dpmp/dpmp/config_v2.json"))), "oracle_mode.json")
 WORKER_STATS_PATH = os.path.join(os.path.dirname(os.environ.get("DPMP_CONFIG_PATH", os.path.expanduser("~/dpmp/dpmp/config_v2.json"))), "worker_stats.json")
+FLEET_METRICS_PATH = os.path.join(os.path.dirname(os.environ.get("DPMP_CONFIG_PATH", os.path.expanduser("~/dpmp/dpmp/config_v2.json"))), "fleet_metrics.json")
 HOST = os.environ.get("NICEGUI_HOST", "0.0.0.0")
 PORT = int(os.environ.get("NICEGUI_PORT", "8845"))
 POLL_S = float(os.environ.get("NICEGUI_POLL_S", "2.0"))
@@ -168,6 +169,79 @@ def read_text_file(path: str, max_bytes: int = 200_000) -> str:
     except Exception as e:
         return f"[error reading {path}] {e}"
 
+
+import math as _math
+
+# build ratio gauge
+def _build_gauge_svg(pct_a: float, size: int = 160) -> str:
+    """Build a half-circle gauge SVG. 0%A left, 50/50 top, 100%A right.
+
+    Uses multiple small arc segments instead of complex large-arc flags
+    to avoid browser rendering issues with semicircular arcs.
+    """
+    pct_a = max(0.001, min(0.999, pct_a))
+    cx, cy = 100, 92
+    r = 68
+    sw = 12  # stroke width
+    nr = 58  # needle length
+
+    def _xy(deg, rr=r):
+        rd = _math.radians(deg)
+        return (cx + rr * _math.cos(rd), cy - rr * _math.sin(rd))
+
+    # Needle angle: 0%A -> 180deg (left), 100%A -> 0deg (right)
+    nd = 180.0 - (pct_a * 180.0)
+    npt = _xy(nd, nr)
+
+    # Build arcs using series of line-to points for reliability
+    def _arc_path(start_deg, end_deg, steps=24):
+        pts = []
+        for i in range(steps + 1):
+            d = start_deg + (end_deg - start_deg) * i / steps
+            pts.append(_xy(d))
+        path = 'M %.1f,%.1f' % pts[0]
+        for p in pts[1:]:
+            path += ' L %.1f,%.1f' % p
+        return path
+
+    # Background: full semicircle 180->0 (light grey)
+    bg_path = _arc_path(180, 0, 48)
+    bg = '<path d="%s" fill="none" stroke="#9ca3af" stroke-opacity="0.2" stroke-width="%d" stroke-linecap="round"/>' % (bg_path, sw)
+
+    # Pool A (blue): 180 -> needle
+    aa = ''
+    a_deg = 180.0 - nd  # degrees of arc for A
+    if a_deg > 0.5:
+        a_path = _arc_path(180, nd, max(4, int(a_deg / 4)))
+        aa = '<path d="%s" fill="none" stroke="#3b82f6" stroke-width="%d" stroke-linecap="round"/>' % (a_path, sw)
+
+    # Pool B (darker grey): needle -> 0
+    ba = ''
+    if nd > 0.5:
+        b_path = _arc_path(nd, 0, max(4, int(nd / 4)))
+        ba = '<path d="%s" fill="none" stroke="#9ca3af" stroke-opacity="0.35" stroke-width="%d" stroke-linecap="round"/>' % (b_path, sw)
+
+    # Tick marks at 0%, 25%, 50%, 75%, 100%
+    tk = ''
+    for fr in [0.0, 0.25, 0.5, 0.75, 1.0]:
+        ta = 180.0 - fr * 180.0
+        ti = _xy(ta, r - 9)
+        to = _xy(ta, r + 9)
+        tk += '<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="#9ca3af" stroke-opacity="0.4" stroke-width="1.5"/>' % (ti[0], ti[1], to[0], to[1])
+
+    # A/B labels
+    lb = '<text x="%d" y="%d" fill="#22d3ee" font-size="11" font-weight="bold" text-anchor="middle">A</text>' % (cx - r - 14, cy + 4)
+    lb += '<text x="%d" y="%d" fill="#f59e0b" font-size="11" font-weight="bold" text-anchor="middle">B</text>' % (cx + r + 14, cy + 4)
+
+    # Needle + center dot
+    ne = '<line x1="%d" y1="%d" x2="%.1f" y2="%.1f" stroke="#ef4444" stroke-width="2.5" stroke-linecap="round"/>' % (cx, cy, npt[0], npt[1])
+    ne += '<circle cx="%d" cy="%d" r="4" fill="#ef4444"/>' % (cx, cy)
+
+    w = size
+    h = int(size * 0.62)
+    return '<svg width="%d" height="%d" viewBox="-5 -2 210 100" xmlns="http://www.w3.org/2000/svg">%s%s%s%s%s%s</svg>' % (w, h, bg, aa, ba, tk, lb, ne)
+
+
 # read JSON file
 def read_json(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
@@ -185,6 +259,7 @@ def get_config_weights() -> tuple[int, int]:
     except Exception:
         return (50, 50)
 
+# get the data points needed for auto-balancer operation
 def get_auto_balance_config() -> dict:
     """Read auto-balance and chain config from config_v2.json.
     
@@ -212,6 +287,7 @@ def get_auto_balance_config() -> dict:
             "poolA_chain": "BTC", "poolB_chain": "BCH",
         }
 
+# get name/chain info for both pools
 def get_pool_info() -> dict:
     """Read pool names and chains from config_v2.json for the Stats tab.
     Returns dict like:
@@ -232,7 +308,7 @@ def get_pool_info() -> dict:
             "B": {"name": "Pool B", "chain": "--"},
         }
 
-
+# worker stats for worker table
 def read_worker_stats() -> dict:
     """Read worker_stats.json written by dpmpv2.  Returns {} on any error."""
     try:
@@ -241,7 +317,16 @@ def read_worker_stats() -> dict:
     except Exception:
         return {}
 
+# fleet stats for fleet table
+def read_fleet_metrics() -> dict:
+    """Read fleet_metrics.json written by dpmpv2.  Returns {} on any error."""
+    try:
+        with open(FLEET_METRICS_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
+# format hashrate for table
 def fmt_hashrate(h: float) -> str:
     """Format a hashrate (in H/s) into a human-readable string.
     Examples: 1234 -> '1.23 KH/s', 1234567 -> '1.23 MH/s', etc.
@@ -255,7 +340,7 @@ def fmt_hashrate(h: float) -> str:
             return f"{h / threshold:.2f} {label}"
     return f"{h:.2f} H/s"
 
-
+# format difficulty for table
 def fmt_diff(d: float) -> str:
     """Format a difficulty value with K/M/G/T suffixes for readability."""
     if d <= 0:
@@ -454,8 +539,22 @@ def restart_dpmpv2() -> tuple[bool, str]:
                 except Exception:
                     pass
 
-            _time.sleep(0.3)
+            # Give dpmpv2 time to run its clean shutdown handler
+            # (disconnect miners, flush state).  Check every 0.5s
+            # for up to 5s before resorting to SIGKILL.
+            for _wait in range(10):
+                _time.sleep(0.5)
+                still_alive = False
+                for pid in pids:
+                    try:
+                        os.kill(pid, 0)  # signal 0 = check if alive
+                        still_alive = True
+                    except OSError:
+                        pass  # already exited
+                if not still_alive:
+                    break
 
+            # Force kill any stragglers
             for pid in pids:
                 try:
                     os.kill(pid, signal.SIGKILL)
@@ -479,6 +578,7 @@ def restart_dpmpv2() -> tuple[bool, str]:
     except Exception as e:
         return False, str(e)
 
+############################################################################################################
 
 @dataclass
 class AppState:
@@ -546,7 +646,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
 
                 with ui.row().classes("items-center gap-2"):
                     btn_restart = ui.button("Restart DPMP", icon="restart_alt")
-                    lbl_restart = ui.label("").classes("text-sm")
+                ui.html('<span style="font-size:0.8rem; opacity:0.7;">[Please see the <b>About</b> tab for setup and operational instructions.]</span>', sanitize=False)
 
             # Right column: Hashrate allocation (slider OR oracle panel)
             # Both panels are ALWAYS built. Visibility is toggled by the switch button.
@@ -565,7 +665,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             ab_cfg = get_auto_balance_config()
             _auto_balance_enabled = ab_cfg["auto_balance"]
 
-            # Determine chain validity: oracle requires exactly one BTC + one BCH pool
+            # Determine chain validity: oracle auto-balance requires one BTC + one BCH pool
             _chain_a = ab_cfg["poolA_chain"]
             _chain_b = ab_cfg["poolB_chain"]
             _chain_valid = sorted([_chain_a, _chain_b]) == ["BCH", "BTC"]
@@ -591,15 +691,16 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             # Only build the slider interaction if BOTH pools have weight > 0
             _slider_usable = (cfg_wA > 0 and cfg_wB > 0)
 
-            with ui.card().classes("flex-1 min-w-[320px] max-w-[480px]") as slider_card:
+            #with ui.card().classes("flex-1 min-w-[320px] max-w-[480px]").style("min-height:357px") as slider_card:
+            with ui.card().classes("flex-1 min-w-[320px] max-w-[480px] slider-card-height") as slider_card:
 
                 with ui.row().classes("w-full items-center justify-between"):
                     with ui.row().classes("items-center gap-1"):
                         ui.icon("balance", size="sm").style("color: #6E93D6")
                         ui.label("Hashrate Allocation").classes("text-base font-semibold").style("color: #6E93D6")
 
-                    # Switch button: only shown when chain config is valid
-                    if _chain_valid:
+                    # Switch button: only shown when chain config is valid AND both pools active
+                    if _chain_valid and _slider_usable:
                         btn_switch_to_oracle = ui.button("Oracle", icon="swap_horiz").props("dense outline size=sm").classes("text-xs")
 
                 if _slider_usable:
@@ -635,11 +736,11 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             # Set initial visibility
             slider_card.visible = not _show_oracle
 
-            # ---- ORACLE PANEL (always built when chain config is valid) ----
+            # ---- ORACLE PANEL (only built when chain config is valid AND both pools active) ----
             _oracle_ui = {}  # holds references to oracle UI elements
             _oracle_charts = []
 
-            if _chain_valid:
+            if _chain_valid and _slider_usable:
                 _chain_left = ab_cfg["poolA_chain"]   # e.g. "BCH"
                 _chain_right = ab_cfg["poolB_chain"]   # e.g. "BTC"
 
@@ -1188,40 +1289,56 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
 
 
             ok, msg = restart_dpmpv2()
-            lbl_restart.text = f"[{now_utc()}] {msg}"
             if ok:
-                ui.notify("DPMP restarted", type="positive")
+                ui.notify("DPMP restarted successfully", type="positive")
             else:
-                ui.notify(f"restart failed: {msg}", type="negative")
+                ui.notify(f"Restart failed: {msg}", type="negative")
 
         btn_restart.on_click(do_restart)
 
         ui.separator()
 
-
-        lbl_status = ui.label("Status").classes("text-lg font-semibold").style('color: blue;')
-
-        
-        with ui.row().classes("gap-6 items-center"):            
+        with ui.row().classes("gap-4 items-center w-full"):
+            lbl_status = ui.label("Status").classes("text-lg font-semibold").style('color: blue;')
             lbl_dpmp = ui.html("<b>DPMP</b>: checking...", sanitize=False).classes("text-sm")
             lbl_pool = ui.html("Active pool: ...", sanitize=False).classes("text-sm").tooltip("Which pool is currently active")
             lbl_miner = ui.html("<b>Miner(s) connected</b>: ...", sanitize=False).classes("text-sm").tooltip("Whether any miners are currently connected downstream")
             lbl_spin = ui.spinner('rings', size='lg', color='green')
 
-        with ui.row().classes("gap-6 items-center"):
-            lbl_acc = ui.html("<b>Accepted</b>: A ... / B ...", sanitize=False).classes("text-sm").tooltip("Total accepted shares per pool")
-            lbl_rej = ui.html("<b>Rejected</b>: A ... / B ...", sanitize=False).classes("text-sm").tooltip("Total rejected shares per pool")
-            lbl_jobs = ui.html("<b>Jobs</b>: A ... / B ...", sanitize=False).classes("text-sm").tooltip("Total jobs forwarded per pool")
-            lbl_dif = ui.html("<b>SumDiff</b>: A ... / B ...", sanitize=False).classes("text-sm").tooltip("Sum of difficulty of accepted shares per pool")
-            lbl_rat = ui.html("<b>Diff Ratio</b>: A ...% / B ...%", sanitize=False).classes("text-sm").tooltip("Percentage of accepted difficulty per pool (all-time since last restart)")
+        _vc = "font-size:0.8rem; font-weight:600;"
+        _hc = "opacity:0.5; text-transform:uppercase; letter-spacing:0.05em;"
 
-        with ui.row().classes("gap-6 items-center"):
-            lbl_sched_rat = ui.html("<b>Scheduler Ratio</b>: waiting for data...", sanitize=False).classes("text-sm font-semibold").tooltip("Average per-miner time allocation ratio -- shows scheduler convergence in real-time, unaffected by hashrate differences").style("color: #6E93D6")
-            lbl_recent_rat = ui.html("<b>Recent Diff (5min)</b>: waiting for data...", sanitize=False).classes("text-sm").tooltip("Exponentially-weighted difficulty ratio -- shows actual hashrate delivered to pools over 5 minutes").style("color: #94a3b8")
-            
+        with ui.row().classes("w-full flex-wrap gap-6 items-stretch"):
 
-        ui.separator()
-        lbl_note = ui.html("<b>Note</b>: <b>Scheduler Ratio</b> shows the average time-allocation ratio across all miners -- this is what DPMP is targeting right now. <b>Recent Diff</b> shows the actual difficulty-weighted hashrate split over 5 minutes and this may move around a bit if you have a mix of high-hashrate and low-hashrate miners. See the <b>About</b> tab for more details.", sanitize=False).classes("text-sm")
+            with ui.card().classes("min-w-[300px]"):
+                with ui.row().classes("gap-x-6 gap-y-1"):
+                    with ui.column().classes("gap-0"):
+                        ui.label("ACCEPTED").classes("text-xs").style(_hc)
+                        lbl_acc = ui.html('A -- / B --', sanitize=False).style(_vc)
+                    with ui.column().classes("gap-0"):
+                        ui.label("REJECTED").classes("text-xs").style(_hc)
+                        lbl_rej = ui.html('A -- / B --', sanitize=False).style(_vc)
+                    with ui.column().classes("gap-0"):
+                        ui.label("JOBS").classes("text-xs").style(_hc)
+                        lbl_jobs = ui.html('A -- / B --', sanitize=False).style(_vc)
+                with ui.row().classes("gap-x-6 gap-y-1"):
+                    with ui.column().classes("gap-0"):
+                        ui.label("SUM DIFFICULTY").classes("text-xs").style(_hc)
+                        lbl_dif = ui.html('A -- / B --', sanitize=False).style(_vc)
+                    with ui.column().classes("gap-0"):
+                        ui.label("DIFF RATIO (ALL-TIME)").classes("text-xs").style(_hc)
+                        lbl_rat = ui.html('A --% / B --%', sanitize=False).style(_vc)
+
+            with ui.card().classes("flex-1 min-w-[320px] max-w-[480px]"):
+                with ui.row().classes("w-full justify-center gap-8"):
+                    with ui.column().classes("items-center gap-0"):
+                        ui.label("SCHEDULER RATIO").classes("text-xs").style(_hc)
+                        lbl_gauge_sr = ui.html(_build_gauge_svg(0.5), sanitize=False)
+                        lbl_sched_rat = ui.html('<span style="color:#22d3ee">A --%</span> / <span style="color:#f59e0b">B --%</span>', sanitize=False).style("font-size:0.8rem; font-weight:600;")
+                    with ui.column().classes("items-center gap-0"):
+                        ui.label("RECENT DIFF").classes("text-xs").style(_hc)
+                        lbl_gauge_rd = ui.html(_build_gauge_svg(0.5), sanitize=False)
+                        lbl_recent_rat = ui.html('<span style="color:#22d3ee">A --%</span> / <span style="color:#f59e0b">B --%</span>', sanitize=False).style("font-size:0.8rem; font-weight:600;")
 
         ui.separator()
 
@@ -1369,81 +1486,86 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                 rejpA = 100*rejA/accA if accA > 0 else 0.0
                 rejpB = 100*rejB/accB if accB > 0 else 0.0
 
-                lbl_acc.content = f"<b>Accepted</b>: A {int(accA)} / B {int(accB)}"
-                lbl_rej.content = f"<b>Rejected</b>: A {int(rejA)} / B {int(rejB)} ({rejpA:.2f}% / {rejpB:.2f}%)"
-                lbl_jobs.content = f"<b>Jobs</b>: A {int(jobA)} / B {int(jobB)}"
-                #lbl_dif.content = f"<b>SumDiff</b>: A {int(difA)} / B {int(difB)}"
-                lbl_dif.content = f"<b>SumDiff</b>: A {_fmt_short(difA)} / B {_fmt_short(difB)}"
-                lbl_rat.content = f"<b>Diff Ratio (all-time)</b>: A {pctA:.2f}% / B {pctB:.2f}%"
+                lbl_acc.content = '<span style="color:#22d3ee">A %s</span> <span style="opacity:0.3">/</span> <span style="color:#f59e0b">B %s</span>' % (f'{int(accA):,}', f'{int(accB):,}')
+                lbl_rej.content = '<span style="color:#22d3ee">A %d (%.2f%%)</span> <span style="opacity:0.3">/</span> <span style="color:#f59e0b">B %d (%.2f%%)</span>' % (int(rejA), rejpA, int(rejB), rejpB)
+                lbl_jobs.content = '<span style="color:#22d3ee">A %s</span> <span style="opacity:0.3">/</span> <span style="color:#f59e0b">B %s</span>' % (f'{int(jobA):,}', f'{int(jobB):,}')
+                lbl_dif.content = '<span style="color:#22d3ee">A %s</span> <span style="opacity:0.3">/</span> <span style="color:#f59e0b">B %s</span>' % (_fmt_short(difA), _fmt_short(difB))
+                lbl_rat.content = '<span style="color:#22d3ee">A %.1f%%</span> <span style="opacity:0.3">/</span> <span style="color:#f59e0b">B %.1f%%</span>' % (pctA, pctB)
 
-                # Scheduler Ratio -- reads the averaged per-miner time-ratio
-                # directly from the Prometheus gauge.  This is instantaneous,
-                # stable, and reflects what the scheduler is actually doing.
-                _schedA = _prom_gauge_value(raw, "dpmp_scheduler_share", pool="A")
-                _schedB = _prom_gauge_value(raw, "dpmp_scheduler_share", pool="B")
-                if _schedA is not None and _schedB is not None:
-                    _spctA = 100.0 * _schedA
-                    _spctB = 100.0 * _schedB
-                    lbl_sched_rat.content = (
-                        f'<b>Scheduler Ratio</b>: '
-                        f'<span style="color:#22d3ee">A {_spctA:.1f}%</span>'
-                        f' / '
-                        f'<span style="color:#f59e0b">B {_spctB:.1f}%</span>'
-                    )
+                # -- Gauge updates: Scheduler Ratio + Recent Diff --
+                # Single-pool mode: pin both gauges to the active pool's extreme
+                if not _slider_usable:
+                    _pin = 1.0 if cfg_wA > 0 else 0.0
+                    _ppA = _pin * 100
+                    _ppB = (1 - _pin) * 100
+                    lbl_gauge_sr.content = _build_gauge_svg(_pin)
+                    lbl_sched_rat.content = '<span style="color:#22d3ee">A %.1f%%</span> <span style="opacity:0.3">/</span> <span style="color:#f59e0b">B %.1f%%</span>' % (_ppA, _ppB)
+                    lbl_gauge_rd.content = _build_gauge_svg(_pin)
+                    lbl_recent_rat.content = '<span style="color:#22d3ee">A %.1f%%</span> <span style="opacity:0.3">/</span> <span style="color:#f59e0b">B %.1f%%</span>' % (_ppA, _ppB)
                 else:
-                    lbl_sched_rat.content = "<b>Scheduler Ratio</b>: waiting for data..."
-
-                # Rolling recent diff -- exponentially weighted difficulty.
-                # Recent data is weighted much more heavily than old data,
-                # so the display responds to ratio changes within 1-2 minutes
-                # while still smoothing out noise from switching phases.
-                # Half-life of ~45 seconds means data from 3 minutes ago
-                # contributes only ~6% as much as current data.
-                _rdifA = difA  # already read above from dpmp_accepted_difficulty_sum_total
-                _rdifB = difB
-                now_mono = time.monotonic()
-                _recent_dif_history.append((now_mono, _rdifA, _rdifB))
-
-                # Trim entries older than the window
-                cutoff = now_mono - _RECENT_WINDOW_S
-                while _recent_dif_history and _recent_dif_history[0][0] < cutoff:
-                    _recent_dif_history.pop(0)
-
-                if len(_recent_dif_history) >= 2:
-                    # Compute exponentially-weighted difficulty deltas.
-                    # Each consecutive pair contributes (delta_A, delta_B),
-                    # weighted by exp(-age / half_life * ln2).
-                    _HL = 90.0  # half-life in seconds (covers ~1 full switching cycle)
-                    _LN2 = 0.6931
-                    _wsum_A = 0.0
-                    _wsum_B = 0.0
-                    _wsum_total = 0.0
-                    for i in range(1, len(_recent_dif_history)):
-                        _ts_prev, _a_prev, _b_prev = _recent_dif_history[i - 1]
-                        _ts_curr, _a_curr, _b_curr = _recent_dif_history[i]
-                        _da = _a_curr - _a_prev
-                        _db = _b_curr - _b_prev
-                        # Weight by midpoint age (average of the two timestamps)
-                        _mid_age = now_mono - (_ts_prev + _ts_curr) / 2.0
-                        _w = 2.0 ** (-_mid_age / _HL)
-                        _wsum_A += _da * _w
-                        _wsum_B += _db * _w
-                        _wsum_total += (_da + _db) * _w
-
-                    if _wsum_total > 0:
-                        rpctA = 100.0 * _wsum_A / _wsum_total
-                        rpctB = 100.0 * _wsum_B / _wsum_total
-                        window_s = now_mono - _recent_dif_history[0][0]
-                        lbl_recent_rat.content = (
-                            f'<b>Recent Diff ({int(window_s)}s)</b>: '
-                            f'<span style="color:#22d3ee">A {rpctA:.1f}%</span>'
-                            f' / '
-                            f'<span style="color:#f59e0b">B {rpctB:.1f}%</span>'
-                        )
+                    # Scheduler Ratio -- reads the averaged per-miner time-ratio
+                    # directly from the Prometheus gauge.  This is instantaneous,
+                    # stable, and reflects what the scheduler is actually doing.
+                    _schedA = _prom_gauge_value(raw, "dpmp_scheduler_share", pool="A")
+                    _schedB = _prom_gauge_value(raw, "dpmp_scheduler_share", pool="B")
+                    if _schedA is not None and _schedB is not None:
+                        _spctA = 100.0 * _schedA
+                        _spctB = 100.0 * _schedB
+                        lbl_gauge_sr.content = _build_gauge_svg(_schedA)
+                        lbl_sched_rat.content = '<span style="color:#22d3ee">A %.1f%%</span> <span style="opacity:0.3">/</span> <span style="color:#f59e0b">B %.1f%%</span>' % (_spctA, _spctB)
                     else:
-                        lbl_recent_rat.content = "<b>Recent Diff (5min)</b>: no new shares yet..."
-                else:
-                    lbl_recent_rat.content = "<b>Recent Diff (5min)</b>: collecting data..."
+                        lbl_gauge_sr.content = _build_gauge_svg(0.5)
+                        lbl_sched_rat.content = "waiting for data..."
+
+                    # Rolling recent diff -- exponentially weighted difficulty.
+                    # Recent data is weighted much more heavily than old data,
+                    # so the display responds to ratio changes within 1-2 minutes
+                    # while still smoothing out noise from switching phases.
+                    # Half-life of ~45 seconds means data from 3 minutes ago
+                    # contributes only ~6% as much as current data.
+                    _rdifA = difA  # already read above from dpmp_accepted_difficulty_sum_total
+                    _rdifB = difB
+                    now_mono = time.monotonic()
+                    _recent_dif_history.append((now_mono, _rdifA, _rdifB))
+
+                    # Trim entries older than the window
+                    cutoff = now_mono - _RECENT_WINDOW_S
+                    while _recent_dif_history and _recent_dif_history[0][0] < cutoff:
+                        _recent_dif_history.pop(0)
+
+                    if len(_recent_dif_history) >= 2:
+                        # Compute exponentially-weighted difficulty deltas.
+                        # Each consecutive pair contributes (delta_A, delta_B),
+                        # weighted by exp(-age / half_life * ln2).
+                        _HL = 90.0  # half-life in seconds (covers ~1 full switching cycle)
+                        _LN2 = 0.6931
+                        _wsum_A = 0.0
+                        _wsum_B = 0.0
+                        _wsum_total = 0.0
+                        for i in range(1, len(_recent_dif_history)):
+                            _ts_prev, _a_prev, _b_prev = _recent_dif_history[i - 1]
+                            _ts_curr, _a_curr, _b_curr = _recent_dif_history[i]
+                            _da = _a_curr - _a_prev
+                            _db = _b_curr - _b_prev
+                            # Weight by midpoint age (average of the two timestamps)
+                            _mid_age = now_mono - (_ts_prev + _ts_curr) / 2.0
+                            _w = 2.0 ** (-_mid_age / _HL)
+                            _wsum_A += _da * _w
+                            _wsum_B += _db * _w
+                            _wsum_total += (_da + _db) * _w
+
+                        if _wsum_total > 0:
+                            rpctA = 100.0 * _wsum_A / _wsum_total
+                            rpctB = 100.0 * _wsum_B / _wsum_total
+                            window_s = now_mono - _recent_dif_history[0][0]
+                            lbl_gauge_rd.content = _build_gauge_svg(_wsum_A / _wsum_total)
+                            lbl_recent_rat.content = '<span style="color:#22d3ee">A %.1f%%</span> <span style="opacity:0.3">/</span> <span style="color:#f59e0b">B %.1f%%</span> <span style="opacity:0.4;font-size:0.7rem;">(%ds)</span>' % (rpctA, rpctB, int(window_s))
+                        else:
+                            lbl_gauge_rd.content = _build_gauge_svg(0.5)
+                            lbl_recent_rat.content = "no new shares yet..."
+                    else:
+                        lbl_gauge_rd.content = _build_gauge_svg(0.5)
+                        lbl_recent_rat.content = "collecting data..."
 
             except Exception as e:
                 lbl_pool.content = "<b>Active pool</b>: error"
@@ -1462,32 +1584,48 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
         update_home_status()
         ui.timer(2.0, update_home_status)
 
-    # =====================================================================
-    # Stats Tab -- Per-worker miner metrics + per-pool summary
-    # =====================================================================
+
+
+    # ========================================================================
+    # Stats Tab -- Fleet metrics + per-worker miner metrics + per-pool summary
+    # ========================================================================
     with ui.tab_panel(t_stats):
 
+        # tuck title 10px after icon in ui.expansion()
+        ui.add_css("""
+        .stats-expansion.q-expansion-item .q-item__section--avatar {
+            min-width: 0 !important;
+            padding-right: 10px !important;
+        }
+        """)
+
+        # ---- Fleet Stats Card ----        
+        with ui.expansion("Fleet Stats", icon="groups", value=True).props("dense dense-toggle").classes("stats-expansion text-lg font-semibold w-full"):
+            with ui.card().classes("w-full").style("padding: 4px 8px 8px 8px"):
+                ui.label("Real-time scheduler view. Click column headers to sort.").classes("text-xs opacity-60").style("padding-left: 6px")
+                stats_fleet_html = ui.html("", sanitize=False).classes("w-full overflow-x-auto")
+                ui.label("* A pinned miner will only operate on the assigned pool, which may impact convergence at extreme ratios.").classes("text-xs opacity-60").style("padding-left: 6px")
+
         # ---- Miner Stats Card ----
-        with ui.card().classes("w-full"):
-            ui.label("Worker Stats").classes("text-lg font-semibold")
-            ui.label("Workers not seen for 5 minutes are automatically removed. Click column headers to sort.").classes("text-xs opacity-60")
-
-            # We use ui.html for the table so we have full control over formatting.
-            # NiceGUI's ui.table is fine but ui.html gives us tighter layout for mobile.
-            stats_miner_html = ui.html("", sanitize=False).classes("w-full overflow-x-auto")
-            ui.label("* Hashrate is best-estimate from work completed across both pools.").classes("text-xs opacity-60")
-
+        with ui.expansion("Worker Stats", icon="memory", value=True).props("dense dense-toggle").classes("stats-expansion text-lg font-semibold w-full"):
+            with ui.card().classes("w-full").style("padding: 4px 8px 8px 8px"):                
+                ui.label("Workers not seen for 5 minutes are automatically removed. Click column headers to sort.").classes("text-xs opacity-60").style("padding-left: 6px")             
+                stats_miner_html = ui.html("", sanitize=False).classes("w-full overflow-x-auto")
+                ui.label("* Hashrate is best-estimate from work completed across both pools.").classes("text-xs opacity-60").style("padding-left: 6px")
 
         # ---- Pool Stats Card ----
-        with ui.card().classes("w-full"):
-            ui.label("Pool Stats").classes("text-lg font-semibold")
-            ui.label("Click column headers to sort.").classes("text-xs opacity-60")
-            stats_pool_html = ui.html("", sanitize=False).classes("w-full overflow-x-auto")
-            ui.label("* May include data for workers not currently attached.").classes("text-xs opacity-60")
+        with ui.expansion("Pool Stats", icon="pool", value=True).props("dense dense-toggle").classes("stats-expansion w-full text-lg font-semibold"):
+            with ui.card().classes("w-full").style("padding: 4px 8px 8px 8px"):
+                ui.label("Click column headers to sort.").classes("text-xs opacity-60").style("padding-left: 6px")
+                stats_pool_html = ui.html("", sanitize=False).classes("w-full overflow-x-auto")
+                ui.label("* May include data for workers not currently attached.").classes("text-xs opacity-60").style("padding-left: 6px")
+
         # ---- Shared table styling (injected once) ----
         ui.add_head_html("""
         <style>
-        .stats-tbl { border-collapse: collapse; width: 100%; font-size: 0.82rem; }
+        .slider-card-height { min-height: 357px; }
+        @media (max-width: 768px) { .slider-card-height { min-height: auto; } }
+        .stats-tbl { border-collapse: collapse; font-size: 0.82rem; }
         .stats-tbl th { text-align: left; padding: 4px 8px; white-space: nowrap;
                         border-bottom: 2px solid rgba(110,147,214,0.4); color: #6E93D6;
                         font-weight: 600; cursor: pointer; user-select: none; }
@@ -1508,6 +1646,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
         # key = sort column key, reverse = True for descending.
         _miner_sort = {"key": "name", "reverse": False}
         _pool_sort = {"key": "pool_name", "reverse": False}
+        _fleet_sort = {"key": "worker_name", "reverse": False}
 
         # ---- Miner table column definitions ----
         # Each tuple: (key, header_label, css_class, format_fn)
@@ -1531,12 +1670,25 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             ("pool_name", "Pool",      "",    None),
             ("slot",      "Slot",      "",    None),
             ("chain",     "Coin",      "",    None),
+            ("en2_size",  "En2",       "num", lambda v: str(int(v)) if v else "--"),
+            ("ratio",     "Ratio",     "num", lambda v: f"{v:.0f}%"),
             ("latency",   "Latency",   "num", None),
             ("accepted",  "Accepted*",  "num", lambda v: f"{int(v):,}"),
             ("rejected",  "Rejected*",  "num", lambda v: f"{int(v):,}"),
             ("rej_pct",   "Rej%",      "num", lambda v: f"{v:.1f}%"),
             ("jobs",      "Jobs",      "num", lambda v: f"{int(v):,}"),
             ("tdiff",     "TotalDiff", "num", lambda v: fmt_diff(v)),
+        ]
+
+        _fleet_cols = [
+            ("worker_name",    "Worker",       "",    None),
+            ("current_pool",   "Pool",         "",    None),
+            ("pinned",         "Pinned*",       "",    None),
+            ("time_on_pool_s", "Time on Pool", "num", None),  # special: formatted like _fmt_ago
+            ("mode",           "Mode",         "",    lambda v: "Dynamic" if v == "time_slice" else "Static"),
+            ("switch_count",   "Switches",     "num", lambda v: f"{int(v):,}"),
+            ("contribution",   "Contribution", "num", lambda v: f"{v:.1%}"),
+            ("health",         "Health",       "num", lambda v: f"{v:.2f}"),
         ]
 
         def _fmt_ago(seconds_ago: float) -> str:
@@ -1559,10 +1711,12 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
 
         _sort_bridge_miner = ui.input("").style("display:none").props("dense")
         _sort_bridge_pool = ui.input("").style("display:none").props("dense")
+        _sort_bridge_fleet = ui.input("").style("display:none").props("dense")
 
         # Store NiceGUI element IDs for JS access
         _bridge_miner_id = _sort_bridge_miner.id
         _bridge_pool_id = _sort_bridge_pool.id
+        _bridge_fleet_id = _sort_bridge_fleet.id
 
         def _on_miner_header_click(e):
             val = e.args if isinstance(e.args, str) else (e.args or {}).get("key", "")
@@ -1590,6 +1744,20 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
 
         _sort_bridge_miner.on("sort_click", _on_miner_header_click)
         _sort_bridge_pool.on("sort_click", _on_pool_header_click)
+
+        def _on_fleet_header_click(e):
+            val = e.args if isinstance(e.args, str) else (e.args or {}).get("key", "")
+            if not val:
+                return
+            col_key = val
+            if _fleet_sort["key"] == col_key:
+                _fleet_sort["reverse"] = not _fleet_sort["reverse"]
+            else:
+                _fleet_sort["key"] = col_key
+                _fleet_sort["reverse"] = col_key not in ("worker_name", "current_pool", "can_switch")
+            update_stats()
+
+        _sort_bridge_fleet.on("sort_click", _on_fleet_header_click)
 
         def _sort_arrow(sort_state: dict, col_key: str) -> str:
             """Return sort arrow indicator for a column header."""
@@ -1654,6 +1822,9 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                             cls = f' class="{css}"' if css else ""
                             if key == "name":
                                 cells += f"<td{cls}>{val}</td>"
+                            elif key == "rejected":
+                                hc = "#f59e0b"
+                                cells += f'<td{cls} style="color:{hc}">{val}</td>'
                             elif key == "ago":
                                 cells += f'<td{cls}>{_fmt_ago(val)}</td>'
                             elif fmt_fn:
@@ -1665,6 +1836,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                     # Build totals row (sums for most columns, max for best, blank for rej%/seen/worker)
                     if len(row_data) > 1:
                         tot_style = ' style="border-top:2px solid rgba(110,147,214,0.4);font-weight:600;opacity:0.85"'
+                        tot_style_r = ' style="border-top:2px solid rgba(110,147,214,0.4);font-weight:600;opacity:0.85;color:rgba(245,158,11,0.95)"'
                         tot_cells = ""
                         for key, _, css, fmt_fn in _miner_cols:
                             cls = f' class="{css}"' if css else ""
@@ -1675,6 +1847,10 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                             elif key == "best":
                                 val = max(r[key] for r in row_data)
                                 tot_cells += f"<td{cls}{tot_style}>{fmt_fn(val)}</td>"
+                            elif key == "rejected":
+                                val = sum(r[key] for r in row_data)
+                                hc = "#ef4444"
+                                tot_cells += f"<td{cls}{tot_style_r}>{val}</td>"
                             else:
                                 val = sum(r[key] for r in row_data)
                                 if fmt_fn:
@@ -1701,15 +1877,44 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                     raw = ""
 
                 pool_data = []
+
+                # Get target ratio for the Ratio column.
+                # If oracle is active, read from Prometheus (oracle weights).
+                # If not available yet (startup), default to 50/50.
+                # If slider is active, read from weights_override.json.
+                _target_pctA = 50.0
+                if _mode.get("oracle_active", False):
+                    try:
+                        _owA = _prom_gauge_value(raw, "dpmp_oracle_weight", pool="A")
+                        _owB = _prom_gauge_value(raw, "dpmp_oracle_weight", pool="B")
+                        if _owA is not None and _owB is not None and (_owA + _owB) > 0:
+                            _target_pctA = _owA / (_owA + _owB) * 100.0
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        _ov = read_json(WEIGHTS_OVERRIDE_PATH)
+                        _wA = float(_ov.get("poolA_weight", 50))
+                        _wB = float(_ov.get("poolB_weight", 50))
+                        _target_pctA = _wA / (_wA + _wB) * 100.0
+                    except Exception:
+                        _wA, _wB = get_config_weights()
+                        _target_pctA = _wA / (_wA + _wB) * 100.0 if (_wA + _wB) > 0 else 50.0
+
+
                 for pk in ("A", "B"):
                     pi = pool_info.get(pk, {})
                     acc = _prom_gauge_value(raw, "dpmp_shares_accepted_total", pool=pk) or 0.0
                     rej = _prom_gauge_value(raw, "dpmp_shares_rejected_total", pool=pk) or 0.0
                     total = acc + rej
+                    _goal_pct = _target_pctA if pk == "A" else (100.0 - _target_pctA)
+                    _en2 = _prom_gauge_value(raw, "dpmp_extranonce2_size", pool=pk)
                     pool_data.append({
                         "pool_name": pi.get("name", f"Pool {pk}"),
                         "slot": pk,
                         "chain": pi.get("chain", "--"),
+                        "en2_size": int(_en2) if _en2 else 0,
+                        "ratio": _goal_pct,
                         "latency": pool_lat.get(pk, 0.0),
                         "accepted": acc,
                         "rejected": rej,
@@ -1753,6 +1958,87 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                     <tbody>{pool_rows}</tbody>
                 </table>"""
 
+                # --- Fleet Table ---
+                fm = read_fleet_metrics()
+                fleet_miners = fm.get("miners", {})
+
+                if fleet_miners:
+                    fleet_data = []
+                    for mname, mdata in fleet_miners.items():
+                        _can_sw = mdata.get("can_switch", True)
+                        fleet_data.append({
+                            "worker_name": mname,
+                            "current_pool": mdata.get("pool", "?"),
+                            "pinned": mdata.get("pool", "?") if not _can_sw else "--",
+                            "time_on_pool_s": mdata.get("time_on_pool_s", 0.0),
+                            "mode": mdata.get("mode", "static"),
+                            "switch_count": mdata.get("switch_count", 0),
+                            "contribution": mdata.get("contribution", 0.0),
+                            "health": mdata.get("health", 1.0),
+                        })
+
+                    # Sort
+                    fsk = _fleet_sort["key"]
+                    fleet_data.sort(
+                        key=lambda r: (r.get(fsk, "") if fsk in ("worker_name", "current_pool", "pinned", "mode") else r.get(fsk, 0)),
+                        reverse=_fleet_sort["reverse"])
+
+                    # Build header
+                    fhdr = ""
+                    for key, label, css, _ in _fleet_cols:
+                        sc = " sorted" if _fleet_sort["key"] == key else ""
+                        cls = f'class="{css}{sc}"' if (css or sc) else ""
+                        arrow = _sort_arrow(_fleet_sort, key)
+                        fhdr += f'<th {cls} data-sort="{key}" data-table="fleet">{label}{arrow}</th>'
+
+                    # Build rows
+                    fleet_rows = ""
+                    for r in fleet_data:
+                        cells = ""
+                        for key, _, css, fmt_fn in _fleet_cols:
+                            val = r[key]
+                            cls = f' class="{css}"' if css else ""
+                            if key == "health":
+                                # Color-code health: green >= 90%, yellow >= 70%, red < 70%
+                                hc = "#22c55e" if val >= 0.9 else "#f59e0b" if val >= 0.7 else "#ef4444"
+                                cells += f'<td{cls} style="color:{hc}">{fmt_fn(val)}</td>'
+                            elif key == "time_on_pool_s":
+                                cells += f'<td{cls}>{_fmt_ago(val)}</td>'
+                            elif key == "mode":
+                                mc = "#22d3ee" if val == "time_slice" else "#9ca3af"
+                                cells += f'<td{cls} style="color:{mc}">{fmt_fn(val)}</td>'
+                            elif fmt_fn:
+                                cells += f"<td{cls}>{fmt_fn(val)}</td>"
+                            else:
+                                cells += f"<td{cls}>{val}</td>"
+                        fleet_rows += f"<tr>{cells}</tr>"
+
+                    # Totals row
+                    if len(fleet_data) > 1:
+                        tot_style = ' style="border-top:2px solid rgba(110,147,214,0.4);font-weight:600;opacity:0.85"'
+                        tot_cells = ""
+                        for key, _, css, fmt_fn in _fleet_cols:
+                            cls = f' class="{css}"' if css else ""
+                            if key == "worker_name":
+                                tot_cells += f"<td{tot_style}>Total ({len(fleet_data)})</td>"
+                            elif key == "switch_count":
+                                val = sum(r[key] for r in fleet_data)
+                                tot_cells += f'<td{cls}{tot_style}>{int(val):,}</td>'
+                            elif key == "contribution":
+                                val = sum(r[key] for r in fleet_data)
+                                tot_cells += f'<td{cls}{tot_style}>{val:.1%}</td>'
+                            else:
+                                tot_cells += f"<td{cls}{tot_style}>--</td>"
+                        fleet_rows += f"<tr>{tot_cells}</tr>"
+
+                    stats_fleet_html.content = f"""
+                    <table class="stats-tbl">
+                        <thead><tr>{fhdr}</tr></thead>
+                        <tbody>{fleet_rows}</tbody>
+                    </table>"""
+                else:
+                    stats_fleet_html.content = '<span style="opacity:0.5">No fleet data available yet.</span>'
+
             except Exception as e:
                 stats_miner_html.content = f'<span style="color:#f87171">Error: {e}</span>'
 
@@ -1770,7 +2056,11 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             var key = th.getAttribute('data-sort');
             var table = th.getAttribute('data-table');
             if (!key || !table) return;
-            var eid = (table === 'miner') ? {_bridge_miner_id} : {_bridge_pool_id};
+            var eid;
+            if (table === 'miner') eid = {_bridge_miner_id};
+            else if (table === 'pool') eid = {_bridge_pool_id};
+            else if (table === 'fleet') eid = {_bridge_fleet_id};
+            else return;
             getElement(eid).$emit('sort_click', key);
         }});
         </script>
@@ -1784,6 +2074,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
         DEFAULT_DENY = [
             "authorize_rewrite","authorize_rewrite_other","authorize_rewrite_secondary",
             "bootstrap_reconnect_forced","bootstrap_skipped_handshake_pool",
+            "diff_coalesce_suppressed_pct","diff_coalesce_suppressed_time",
             "downstream_extranonce_check","downstream_extranonce_skip_already_in_subscribe",
             "downstream_extranonce_skip_no_data",
             "downstream_extranonce_skip_nochange","downstream_extranonce_skip_raw_subscribe",
@@ -1791,15 +2082,14 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             "downstream_notify_flushed_after_subscribe",
             "downstream_send_diff","downstream_send_extranonce","downstream_send_notify",
             "downstream_send_raw","downstream_subscribe_forwarded_raw","downstream_tx",
-            "handshake_response_dropped",
+            "handshake_pool_en2_prefer_larger","handshake_response_dropped",
             "id_response_seen",
             "job_forwarded","job_forwarded_diff_state",
             "miner_method",
-            "notify_clean_forced",
+            "notify_forwarded",
             "oracle_calc_result","oracle_data_age","oracle_mode_slider","oracle_next_poll",
             "oracle_override_written","oracle_poll_start","oracle_weights_applied",
             "pool_notify",
-            "pool_switch_skipped_en2_flagged",
             "post_auth_downstream_sync","post_auth_extranonce_skip_already_in_subscribe",
             "post_auth_extranonce_skip_raw_subscribe",
             "post_auth_push_diff","post_auth_push_extranonce",
@@ -1808,81 +2098,80 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             "scheduler_tick",
             "send_upstream_flush_done","send_upstream_flush_start","send_upstream_queued",
             "share_result",
-            "submit_local_sanity","submit_route","submit_snapshot",
+            "submit_route","submit_snapshot",
             "subscribe_id_response_skipped_duplicate","subscribe_result",
             "upstream_response_dup_observed","upstream_tx",
-            "weights_override_changed",
+            "vardiff_ramp_suppress",
         ]
 
         # --- all log events (canonical list; keep in sync with dpmpv2.py log("...") calls) ---
         ALL_EVENTS = [
-            "auth_result","authorize_rewrite","authorize_rewrite_other","authorize_rewrite_other_error",
+            "active_pool_from_en2_hint","assigner_deviation_recompute","assigner_duration_update",
+            "assigner_error","assigner_starting","assigner_task_started","assigner_update","auth_result",
+            "authorize_rewrite","authorize_rewrite_other","authorize_rewrite_other_error",
             "authorize_rewrite_secondary","authorize_secondary_send_error","authorize_skip_zero_weight_pool",
-            "bootstrap_handshake_from_en2_hint",
-            "bootstrap_reconnect_forced","bootstrap_skipped_handshake_pool",
-            "clear_pool_state_reset_last_downstream_extranonce","clear_pool_state_reset_raw_subscribe_flag",
-            "config_loaded","config_safety_max_deviation_clamped","config_safety_min_switch_clamped",
-            "config_safety_oracle_poll_clamped","config_safety_slice_clamped",
-            "configure_forward_both_error","configure_forwarded_both_pools","configure_skip_zero_weight_pool",
+            "best_shares_load_error","best_shares_loaded","best_shares_save_error",
+            "bootstrap_handshake_from_en2_hint","bootstrap_reconnect_forced",
+            "bootstrap_skipped_handshake_pool","clear_pool_state_reset_last_downstream_extranonce",
+            "clear_pool_state_reset_raw_subscribe_flag","config_loaded",
+            "config_safety_max_deviation_clamped","config_safety_min_switch_clamped",
+            "config_safety_oracle_poll_clamped","config_safety_slice_clamped","configure_forward_both_error",
+            "configure_forwarded_both_pools","configure_skip_zero_weight_pool",
+            "decay_seeded_from_share_log","diff_coalesce_suppressed_pct","diff_coalesce_suppressed_time",
             "downstream_diff_set","downstream_extranonce_check","downstream_extranonce_send_error",
             "downstream_extranonce_set","downstream_extranonce_size_change_hint",
-            "pool_switch_skipped_en2_flagged",
-            "downstream_extranonce_skip_already_in_subscribe",
-            "downstream_extranonce_skip_no_data",
+            "downstream_extranonce_skip_already_in_subscribe","downstream_extranonce_skip_no_data",
             "downstream_extranonce_skip_nochange","downstream_extranonce_skip_raw_subscribe",
-            "downstream_notify_flushed_after_subscribe","downstream_send_diff","downstream_send_extranonce",
-            "downstream_send_extranonce_error","downstream_send_notify","downstream_send_raw",
-            "downstream_subscribe_forwarded_raw","downstream_tx",
-            "dpmp_listening",
-            "failover_emergency_switch","failover_weight_override","fatal_crash",
-            "en2_force_disconnect_learned","en2_strike_recorded","en2_strikes_reset",
-            "handshake_pool_from_en2_hint","handshake_response_dropped",
-            "active_pool_from_en2_hint",
-            "id_response_seen",
-            "job_forwarded","job_forwarded_diff_state",
+            "downstream_notify_flushed_after_subscribe","downstream_send_diff",
+            "downstream_send_extranonce","downstream_send_extranonce_error",
+            "downstream_send_notify","downstream_send_raw","downstream_subscribe_forwarded_raw",
+            "downstream_tx","en2_auto_pin_reject_storm","en2_force_disconnect_learned",
+            "en2_force_reconnect","en2_force_reconnect_cooldown","en2_force_reconnect_error",
+            "en2_strike_recorded","en2_strikes_reset",
+            "failover_emergency_switch","fatal_crash","fleet_health_load_error","fleet_health_loaded",
+            "fleet_health_save_error","fleet_metrics_save_error","fleet_state_build_error",
+            "handshake_pool_en2_prefer_larger","handshake_pool_from_en2_hint","handshake_response_dropped",
+            "health_disconnect_near_switch","health_event","health_tick_error",
+            "id_response_seen","job_forwarded","job_forwarded_diff_state",
             "metrics_start_failed","metrics_started","miner_bad_json","miner_connected",
-            "miner_disconnect_for_reconnect","miner_disconnect_for_reconnect_failed",
-            "miner_disconnected","miner_method","miner_ready_for_jobs",
-            "notify_clean_force_error","notify_clean_forced",
+            "miner_disconnect_for_reconnect","miner_disconnect_for_reconnect_failed","miner_disconnected",
+            "miner_method","miner_ready_for_jobs","notify_forward_error","notify_forwarded",
             "oracle_bad_timestamps","oracle_calc_result","oracle_cancelled","oracle_config",
-            "oracle_data_age","oracle_disabled","oracle_disabled_bad_chain_config",
-            "oracle_disabled_invalid_chains",
+            "oracle_data_age","oracle_disabled_bad_chain_config","oracle_disabled_invalid_chains",
             "oracle_fallback_50_50","oracle_mode_file_deleted_on_startup","oracle_mode_slider",
-            "oracle_mode_switch_to_oracle","oracle_mode_switch_to_slider",
-            "oracle_next_poll","oracle_override_write_error",
-            "oracle_override_written","oracle_poll_error","oracle_poll_start",
-            "oracle_starting","oracle_startup_delay","oracle_task_cancelled",
+            "oracle_next_poll","oracle_override_write_error","oracle_override_written","oracle_poll_error",
+            "oracle_poll_start","oracle_starting","oracle_startup_delay","oracle_task_cancelled",
             "oracle_task_started","oracle_ts_parse_warning","oracle_weights_applied",
             "pool_bootstrap_auth_result","pool_bootstrap_authorize_sent","pool_bootstrap_error",
             "pool_bootstrap_subscribe_parse_error","pool_bootstrap_subscribe_result",
             "pool_bootstrap_subscribe_sent","pool_connected","pool_connecting","pool_diff","pool_down",
             "pool_initial_connect_failed","pool_notify","pool_reader_error","pool_reconnect_failed",
             "pool_reconnect_wait","pool_reconnected","pool_skipped_zero_weight","pool_state_cleared",
-            "pool_switched",
-            "post_auth_downstream_sync","post_auth_downstream_sync_error",
-            "post_auth_extranonce_skip_already_in_subscribe","post_auth_extranonce_skip_raw_subscribe",
-            "post_auth_push_diff",
-            "post_auth_push_extranonce","post_auth_push_notify_clean","post_auth_push_notify_clean_error",
-            "post_auth_push_setup_error","process_exiting",
-            "prune_internal_ids","prune_job_owner","prune_seen_upstream_ids","prune_submit_owner",
-            "resend_notify_clean","resend_notify_error","resend_notify_raw",
-            "resend_notify_skipped_no_cached",
-            "scheduler_config_validated","scheduler_tick",
-            "send_upstream_flush_done","send_upstream_flush_start","send_upstream_queued",
-            "session_error","share_result",
-            "shutdown_begin","shutdown_cancel_tasks","shutdown_done","shutdown_keyboard_interrupt",
-            "shutdown_serve_task_cancel_begin","shutdown_serve_task_cancel_done",
-            "shutdown_serve_task_cancel_timeout","shutdown_serve_task_error",
-            "shutdown_server_close_begin","shutdown_server_close_done","shutdown_server_close_error",
-            "shutdown_server_close_timeout","shutdown_signal","shutdown_timeout",
-            "submit_dedupe_error","submit_dropped_duplicate_fp","submit_dropped_extranonce_mismatch",
-            "submit_dropped_no_job_yet","submit_dropped_pool_dead","submit_dropped_unknown_jid",
-            "submit_extranonce_mismatch_grace_forward","submit_local_sanity","submit_local_sanity_error",
-            "submit_route","submit_snapshot",
+            "pool_switched","post_auth_downstream_sync","post_auth_downstream_sync_error",
+            "post_auth_extranonce_skip_already_in_subscribe",
+            "post_auth_extranonce_skip_raw_subscribe","post_auth_push_diff","post_auth_push_extranonce",
+            "post_auth_push_notify_clean","post_auth_push_notify_clean_error","post_auth_push_setup_error",
+            "process_exiting","prune_internal_ids","prune_job_owner","prune_seen_upstream_ids",
+            "prune_submit_owner","ratio_window_flushed","reject_suppressed_vardiff",
+            "reject_suppressed_vardiff_end","resend_notify_clean","resend_notify_error","resend_notify_raw",
+            "resend_notify_skipped_no_cached","scheduler_config_validated","scheduler_diag_error",
+            "scheduler_init","scheduler_tick","send_upstream_flush_done","send_upstream_flush_start",
+            "send_upstream_queued","session_error","share_diff_calc_bad_header_len","share_diff_calc_error",
+            "share_result","shutdown_begin","shutdown_cancel_tasks","shutdown_done",
+            "shutdown_keyboard_interrupt","shutdown_serve_task_cancel_begin",
+            "shutdown_serve_task_cancel_done","shutdown_serve_task_cancel_timeout",
+            "shutdown_serve_task_error","shutdown_server_close_begin","shutdown_server_close_done",
+            "shutdown_server_close_error","shutdown_server_close_timeout","shutdown_signal",
+            "shutdown_timeout","submit_dedupe_error","submit_dropped_duplicate_fp",
+            "submit_dropped_extranonce_mismatch","submit_dropped_no_job_yet","submit_dropped_pool_dead",
+            "submit_dropped_unknown_jid","submit_extranonce_mismatch_grace_forward",
+            "submit_grace_window_hit","submit_route","submit_snapshot",
+            "submit_suppressed_low_diff","submit_suppressed_low_diff_end",
             "subscribe_id_response_skipped_duplicate","subscribe_parse_error","subscribe_result",
-            "switch_skipped_no_cached_job",
-            "upstream_response_dup_observed","upstream_tx",
-            "weights_normalized","weights_override_changed","write_failed",
+            "switch_skipped_no_cached_job","upstream_response_dup_observed","upstream_tx",
+            "vardiff_ramp_suppress","vardiff_ramp_suppress_ended_accept",
+            "vardiff_ramp_suppress_ended_new_diff","weights_normalized",
+            "worker_stats_write_error","worker_stats_writer_started","write_failed",
         ]
 
         # --- controls (created first; populated by reload_cfg) ---
@@ -1953,9 +2242,9 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             poolA_name   = ui.input("Name").classes("w-64")
             poolA_port   = ui.number("Port", precision=0).props("step=1 min=1 max=65535").classes("w-64")
             poolA_wallet = ui.input("Wallet").classes("w-full")
-            poolA_chain  = ui.select(["BTC", "BCH", "None"], value="BTC", label="Chain").classes("w-64").tooltip(
-                "Which blockchain this pool mines. Set to 'None' if not applicable. "
-                "Required for Auto-Balance oracle to map weights correctly.")
+            poolA_chain  = ui.select(["BTC", "BCH", "BSV", "DGB", "XEC", "PPC", "None"], value="BTC", label="Chain").classes("w-64").tooltip(
+                "Which SHA-256 blockchain this pool mines. Set to 'None' if not applicable. "
+                "Oracle auto-balance requires one BTC and one BCH pool.")
 
         # Pool B
         with ui.expansion("Pool B Settings:", icon="settings").classes("w-full").tooltip("Settings for Pool B"):
@@ -1963,14 +2252,14 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             poolB_name   = ui.input("Name").classes("w-64")
             poolB_port   = ui.number("Port", precision=0).props("step=1 min=1 max=65535").classes("w-64")
             poolB_wallet = ui.input("Wallet").classes("w-full")
-            poolB_chain  = ui.select(["BTC", "BCH", "None"], value="BCH", label="Chain").classes("w-64").tooltip(
-                "Which blockchain this pool mines. Set to 'None' if not applicable. "
-                "Required for Auto-Balance oracle to map weights correctly.")
+            poolB_chain  = ui.select(["BTC", "BCH", "BSV", "DGB", "XEC", "PPC", "None"], value="BCH", label="Chain").classes("w-64").tooltip(
+                "Which SHA-256 blockchain this pool mines. Set to 'None' if not applicable. "
+                "Oracle auto-balance requires one BTC and one BCH pool.")
 
         # Scheduler
         with ui.expansion("Scheduler Settings:", icon="settings").classes("w-full").tooltip("Settings for the dual-pool scheduler"):
-            sch_min_switch = ui.number("Min Switch Seconds", precision=0).props("step=1 min=25 max=300").classes("w-64").tooltip("Minimum time before switching pools. Recommend between 30 seconds and 60 seconds.")
-            sch_slice      = ui.number("Slice Seconds",      precision=0).props("step=1 min=1 max=120").classes("w-64").tooltip("Duration of each mining slice before switching. Recommend you use ~60% of Min Switch Seconds.")
+            #sch_min_switch = ui.number("Min Switch Seconds", precision=0).props("step=1 min=25 max=300").classes("w-64").tooltip("Minimum time before switching pools. Recommend between 30 seconds and 60 seconds.")
+            sch_slice      = ui.number("Slice Seconds",      precision=0).props("step=1 min=1 max=120").classes("w-64").tooltip("Mininum duration of each dynamic mining slice before switching. Recommend you use a value between 10 and 30 seconds.")
 
             # Visual separator to avoid accidentally editing weights when changing timing fields
             ui.separator().classes("my-2")
@@ -1984,7 +2273,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             sch_auto_balance = ui.checkbox("Enable Auto-Balance").tooltip(
                 "When enabled, the oracle automatically adjusts Pool A/B weights based on real-time "
                 "BTC and BCH network hashrate. Manual weights and the slider are ignored. "
-                "Requires Pool A and Pool B to have different chain assignments (one BTC, one BCH).")
+                "Requires Pool A and Pool B to be assigned BTC and BCH (one each, in either order).")
             sch_max_deviation = ui.number("Max Deviation (%)", value=20, precision=0).props("step=1 min=5 max=45").classes("w-64").tooltip(
                 "Maximum percentage points the oracle can deviate from 50/50. "
                 "Example: 20 means weights can range from 30/70 to 70/30. "
@@ -2080,7 +2369,11 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             poolA_port.value   = _to_int(_safe_get(cfg, ["pools", "A", "port"], 3333), 3333)
             poolA_wallet.value = str(_safe_get(cfg, ["pools", "A", "wallet"], "") or "")
             _raw_chainA = str(_safe_get(cfg, ["pools", "A", "chain"], "") or "").strip().upper()
-            _chain_map = {"BTC": "BTC", "BCH": "BCH", "NONE": "None"}
+            _chain_map = {
+                "BTC": "BTC", "BCH": "BCH", "BSV": "BSV",
+                "DGB": "DGB", "XEC": "XEC", "PPC": "PPC",
+                "NONE": "None",
+            }
             poolA_chain.value = _chain_map.get(_raw_chainA, "BTC")
 
             # pools B
@@ -2092,7 +2385,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             poolB_chain.value = _chain_map.get(_raw_chainB, "BCH")
 
             # scheduler
-            sch_min_switch.value = _to_int(_safe_get(cfg, ["scheduler", "min_switch_seconds"], 30), 30)
+            #sch_min_switch.value = _to_int(_safe_get(cfg, ["scheduler", "min_switch_seconds"], 30), 30)
             sch_slice.value      = _to_int(_safe_get(cfg, ["scheduler", "slice_seconds"], 30), 30)
             sch_weightA.value    = _to_int(_safe_get(cfg, ["scheduler", "poolA_weight"], 50), 50)
             sch_weightB.value    = _to_int(_safe_get(cfg, ["scheduler", "poolB_weight"], 50), 50)
@@ -2152,7 +2445,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
 
             # scheduler
             cfg.setdefault("scheduler", {})
-            cfg["scheduler"]["min_switch_seconds"] = _to_int(sch_min_switch.value, 30)
+            #cfg["scheduler"]["min_switch_seconds"] = _to_int(sch_min_switch.value, 30)
             cfg["scheduler"]["slice_seconds"]      = _to_int(sch_slice.value, 30)
             cfg["scheduler"]["poolA_weight"]       = _to_int(sch_weightA.value, 50)
             cfg["scheduler"]["poolB_weight"]       = _to_int(sch_weightB.value, 50)
@@ -2213,18 +2506,22 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
 
         with ui.row().classes("items-center gap-3"):
             chk_redact = ui.checkbox("Redact Wallet Addresses").tooltip(
-                "Replace BTC/BCH wallet addresses with [REDACTED] before downloading")
+                "Replace BTC/BCH/BSV/DGB/XEC/PPC wallet addresses with [REDACTED] before downloading")
             btn_download = ui.button("Download Log (.zip)", icon="download").props("outline dense")
 
         def _redact_wallets(text: str) -> str:
-            """Replace BTC and BCH wallet addresses with [REDACTED].
+            """Replace cryptocurrency wallet addresses with [REDACTED].
 
             Patterns matched:
-              - BTC bech32:  bc1q... / bc1p...  (42-62 chars)
-              - BCH cashaddr: bitcoincash:q... / bitcoincash:p...
-              - BCH short:    q + 41 hex chars  (common in logs)
-              - Legacy P2PKH: 1 + 25-34 base58 chars
-              - Legacy P2SH:  3 + 25-34 base58 chars
+              - BTC bech32:     bc1q... / bc1p...  (42-62 chars)
+              - BCH cashaddr:   bitcoincash:q... / bitcoincash:p...
+              - BCH short:      q + 41 hex chars  (common in logs)
+              - XEC cashaddr:   ecash:q... / ecash:p...
+              - DGB bech32:     dgb1q... (42-62 chars)
+              - DGB legacy:     D + 25-34 base58 chars
+              - PPC legacy:     P + 25-34 base58 chars
+              - Legacy P2PKH:   1 + 25-34 base58 chars (BTC/BSV)
+              - Legacy P2SH:    3 + 25-34 base58 chars (BTC/BSV)
             """
             # BTC bech32 (mainnet)
             text = re.sub(r'\bbc1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{38,58}\b', '[REDACTED]', text)
@@ -2232,27 +2529,37 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             text = re.sub(r'\bbitcoincash:[qp][a-z0-9]{41,}\b', '[REDACTED]', text)
             # BCH short cashaddr (no prefix ... starts with q or p + 41 alnum)
             text = re.sub(r'\b[qp][a-z0-9]{41,55}\b', '[REDACTED]', text)
-            # Legacy addresses (1... or 3...)
+            # XEC cashaddr (with prefix)
+            text = re.sub(r'\becash:[qp][a-z0-9]{41,}\b', '[REDACTED]', text)
+            # DGB bech32
+            text = re.sub(r'\bdgb1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{38,58}\b', '[REDACTED]', text)
+            # DGB legacy (D...)
+            text = re.sub(r'\bD[a-km-zA-HJ-NP-Z1-9]{25,34}\b', '[REDACTED]', text)
+            # PPC legacy (P...)
+            text = re.sub(r'\bP[a-km-zA-HJ-NP-Z1-9]{25,34}\b', '[REDACTED]', text)
+            # Legacy addresses (1... or 3...) -- covers BTC, BSV
             text = re.sub(r'\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b', '[REDACTED]', text)
             return text
 
-        def _do_download():
+        def _prepare_log_zip(redact: bool) -> tuple:
+            """Heavy work: read log, optionally redact, zip. Runs in background thread."""
+            log_text = read_text_file(DPMP_LOG_PATH, max_bytes=100_000_000)
+            if redact:
+                log_text = _redact_wallets(log_text)
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("dpmpv2_run.log", log_text)
+            buf.seek(0)
+            return buf.getvalue()
+
+        async def _do_download():
             """Read the full log, optionally redact wallets, zip it, trigger browser download."""
             try:
-                # Read the FULL log (not truncated like the display)
-                log_text = read_text_file(DPMP_LOG_PATH, max_bytes=100_000_000)  # up to ~100 MB
+                btn_download.disable()
+                ui.notify("Preparing log file...", type="info")
+                redact = chk_redact.value
+                zip_bytes = await asyncio.to_thread(_prepare_log_zip, redact)
 
-                if chk_redact.value:
-                    log_text = _redact_wallets(log_text)
-
-                # Build zip in memory
-                buf = io.BytesIO()
-                with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                    zf.writestr("dpmpv2_run.log", log_text)
-                buf.seek(0)
-                zip_bytes = buf.getvalue()
-
-                # Generate filename with timestamp
                 ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
                 filename = f"dpmpv2_log_{ts}.zip"
 
@@ -2260,6 +2567,8 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                 ui.notify(f"Downloading {filename} ({len(zip_bytes)//1024} KB)", type="positive")
             except Exception as e:
                 ui.notify(f"Download failed: {e}", type="negative")
+            finally:
+                btn_download.enable()
 
         btn_download.on_click(_do_download)
 
