@@ -1,262 +1,385 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
-<meta charset="UTF-8">
-<title>Dual Pool Mining Proxy (DPMP)</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta charset="UTF-8">
+    <title>Dual Pool Mining Proxy (DPMP)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
 
-<style>
-body {
-    margin: 0;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    background: #f2f4f8;
-    color: #1a1a1a;
-    line-height: 1.6;
-}
+    <style>
+        body {
+            margin: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #f2f4f8;
+            color: #1a1a1a;
+            line-height: 1.6;
+        }
 
-.hero {
-    background: linear-gradient(135deg, #0f172a, #1e293b);
-    color: white;
-    padding: 50px 20px 50px 20px;
-    text-align: center;
-    position: relative;
-    overflow: hidden;
-}
+        .hero {
+            background: linear-gradient(135deg, #0f172a, #1e293b);
+            color: white;
+            padding: 60px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
 
-.hero h1 {
-    margin: 0;
-    font-size: 38px;
-    font-weight: 600;
-}
+        .hero-inner {
+            display: flex;
+            align-items: center;
+            gap: 30px;
+            max-width: 1100px;
+            width: 100%;
+        }
 
-.hero p {
-    margin-top: 15px;
-    font-size: 18px;
-    opacity: 0.9;
-}
+        .hero img {
+            width: 140px;
+            height: auto;
+            border-radius: 20px;
+            box-shadow: 0 8px 25px rgba(0,0,0,0.4);
+        }
 
-.section {
-    max-width: 1100px;
-    margin: 40px auto;
-    padding: 0 20px;
-}
+        .hero-text h1 {
+            margin: 0;
+            font-size: 38px;
+            font-weight: 600;
+        }
 
-.section h2 {
-    font-size: 24px;
-    margin-bottom: 20px;
-}
+        .hero-text p {
+            margin-top: 12px;
+            font-size: 18px;
+            opacity: 0.9;
+        }
 
-.card {
-    background: white;
-    padding: 25px;
-    border-radius: 8px;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.05);
-}
+        /* Mobile layout */
+        @media (max-width: 700px) {
+            .hero-inner {
+                flex-direction: column;
+                text-align: center;
+            }
 
-.grid {
-    display: grid;
-    gap: 25px;
-}
+            .hero img {
+                width: 120px;
+            }
+        }
 
-@media (min-width: 900px) {
-    .grid-2 {
-        grid-template-columns: 1fr 1fr;
-    }
-}
+        .section {
+            max-width: 1100px;
+            margin: 40px auto;
+            padding: 0 20px;
+        }
 
-.image-wrapper {
-    background: white;
-    padding: 10px;
-    border-radius: 8px;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.08);
-    cursor: pointer;
-    transition: transform 0.2s ease;
-}
+        .section h2 {
+            font-size: 24px;
+            margin-bottom: 20px;
+        }
 
-.image-wrapper:hover {
-    transform: translateY(-4px);
-}
+        .card {
+            background: white;
+            padding: 25px;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+        }
 
-.image-wrapper img {
-    width: 100%;
-    height: 420px;
-    object-fit: fill; 
-}
+        .grid {
+            display: grid;
+            gap: 25px;
+        }
 
-.caption {
-    font-size: 14px;
-    margin-top: 8px;
-    color: #555;
-}
+        @media (min-width: 900px) {
+            .grid-2 {
+                grid-template-columns: 1fr 1fr;
+            }
+        }
 
-/* Modal */
-.modal {
-    display: none;
-    position: fixed;
-    z-index: 999;
-    padding-top: 40px;
-    left: 0;
-    top: 0;
-    width: 100%;
-    height: 100%;
-    background: rgba(167, 159, 159, 0.9);
-}
+        .image-wrapper {
+            background: white;
+            padding: 10px;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+            cursor: pointer;
+            transition: transform 0.2s ease;
+        }
 
-.modal img {
-    margin: auto;
-    display: block;
-    max-width: 90%;
-    max-height: 85vh;
-}
+        .image-wrapper:hover {
+            transform: translateY(-4px);
+        }
 
-.modal:target {
-    display: block;
-}
+        .image-wrapper img {
+            width: 100%;
+            height: 100%;
+            object-fit: fill;
+        }
 
-.close {
-    position: absolute;
-    top: 20px;
-    right: 40px;
-    color: white;
-    font-size: 30px;
-    text-decoration: none;
-}
+        .caption {
+            font-size: 14px;
+            margin-top: 8px;
+            color: #555;
+        }
 
-footer {
-    text-align: center;
-    padding: 40px;
-    font-size: 12px;
-    color: #666;
-}
-</style>
+        /* Modal */
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 999;
+            padding-top: 40px;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(167, 159, 159, 0.9);
+        }
+
+        .modal img {
+            margin: auto;
+            display: block;
+            max-width: 90%;
+            max-height: 85vh;
+        }
+
+        .modal:target {
+            display: block;
+        }
+
+        .close {
+            position: absolute;
+            top: 20px;
+            right: 40px;
+            color: white;
+            font-size: 30px;
+            text-decoration: none;
+        }
+
+        footer {
+            text-align: center;
+            padding: 40px;
+            font-size: 12px;
+            color: #666;
+        }
+    </style>
 </head>
 
 <body>
 
-<div class="hero">
-    <h1>Dual Pool Mining Proxy (DPMP)</h1>
-    <p>Deterministic Stratum v1 infrastructure for intelligent dual-pool mining.</p>
-</div>
-
-<div class="section">
-    <h2>Overview</h2>
-    <div class="card">
-        <strong>DPMP</strong> is a lightweight, high-reliability&nbsp;<strong>Stratum v1 mining
-        proxy</strong>&nbsp;designed to sit between one or more miners and&nbsp;two upstream mining pools. It was
-        designed primarily for Bitcoin solo-miners who run one or more ASIC miners (SHA-256) and want to split hash power
-        across compatible coins/pools (i.e., BTC/BCH/DGB). Some miners, like the NerdQAxe++, have a built-in "dual pool
-        mining" feature but the majority of miners out there do not.</p>
-        <p>So if you have one or more miners that do NOT have a built-in dual-pool mining feature (such as the Canaan Avalon Q
-        or the Nano3S) and you would like, for example, to mine to a BTC pool and a Bitcoin Cash pool simultaneously, then
-        <strong>DPMP</strong> is for you.</p>
-
-
-    </div>
-</div>
-
-<div class="section">
-    <h2>Home Dashboard</h2>
-    <div class="grid grid-2">
-
-        <a href="#img1" class="image-wrapper">
-            <img src="images/1a.png" alt="Oracle Auto-Balance">
-            <div class="caption">Oracle Auto-Balance panel with real-time network hashrate tracking.</div>
-        </a>        
-
-        <a href="#img2" class="image-wrapper">
-            <img src="images/1b.png" alt="Hashrate Allocation Slider">
-            <div class="caption">Live Hashrate Allocation slider for manual control.</div>
-        </a>
-
-    </div>
-</div>
-
-<div class="section">
-    <div class="card">
-        <p>In terms of allocating hashrate between the two pools, <strong>DPMP</strong> offers two modes of operation: <strong>Oracle Auto-Balance</strong> and <strong>Manual Hashrate Allocation</strong>. The Oracle Auto-Balance mode uses real-time network hashrate data (currently, we support BTC and BCH only) to dynamically adjust pool weights to put more hash power on the coin/pool with the lower relative network hashrate, while the Manual Hashrate Allocation mode allows users to set a fixed percentage of hashrate to each pool using an intuitive slider interface.</p>
-
-        <p>The Manual Hashrate Allocation pane is always available regardless of the pools you are mining to. So, for example, you could be mining to a Bitcoin pool and a Bitcoin Cash pool, or a Bitcoin Cash pool and a Digibyte pool, or two different Bitcoin pools...it doesn't matter, the Manual Hashrate slider will always be available.</p>
-
-        <p>For the Oracle Auto-Balance pane to be available, you MUST be mining to a Bitcoin pool and a Bitcoin Cash pool because those are the only two coins that we currently measure realtime network hashrate for (we hope to add others in the future). When you first set up your pools on the <strong>DPMP</strong> Config tab (e.g., Pool A Settings and Pool B Settings), in the <i>Chain</i> dropdown box you must select BCH for your Bitcoin Cash pool and BTC for your Bitcoin pool. Then you must check the 'Enable Auto-Balance' box in the Scheduler settings section. Once you make those changes and click on the <strong>APPLY + RESTART</strong> button, you will see the Oracle Auto-Balance pane on the Home tab of the <strong>DPMP</strong> Dashboard.</p>
-
-        <p><strong>Note</strong>: You can switch between Auto-Balance and Manual Hashrate Allocation at any time by clicking on the button at the top-right of each pane, no restart required.</p>
-    </div>
-</div>
-
-<div class="section">
-    <h2>Metrics & Stats</h2>
-    <div class="grid grid-2">
-
-        <a href="#img3" class="image-wrapper">
-            <img src="images/2.png" alt="Stats">
-            <div class="caption">Worker and pool-level metrics with SumDiff tracking.</div>
-        </a>
-
-        <div class="card">
-            <h4>Worker & Pool Stats</h4>
-            <p>The <strong>Stats</strong> tab in the <strong>DPMP</strong> dashboard provides detailed metrics and statistics for each worker and pool. The Worker table includes hashrate, current difficulty, shares-per-second, best share, and rejected shares.</p>
-            <p>The Pool table shows pool name, slot, associated coin, latency, accepted/rejected shares, jobs, and total accepted difficulty (SumDiff).</p>
-            <p>Both tables can be sorted by clicking on any column header.</p>
+    <div class="hero">
+        <div class="hero-inner">
+            <img src="images/icond.png" alt="DPMP Icon">
+            <div class="hero-text">
+                <h1>Dual Pool Mining Proxy (DPMP)</h1>
+                <p>Deterministic Stratum v1 infrastructure for intelligent dual-pool mining.</p>
+            </div>
         </div>
-
     </div>
-</div>
 
-<div class="section">
-    <h2>Configuration & Logs</h2>
-    <div class="grid grid-2">
+    <div class="section">
+        <h2>Overview</h2>
+        <div class="card">
+            <strong>DPMP</strong> is a lightweight, high-reliability&nbsp;<strong>Stratum v1 mining
+                proxy</strong>&nbsp;designed to sit between one or more miners and&nbsp;two upstream mining pools. It
+            was
+            designed primarily for Bitcoin solo-miners who run one or more ASIC miners (SHA-256) and want to split hash
+            power
+            across compatible coins/pools (i.e., BTC/BCH/DGB). Some miners, like the NerdQAxe++, have a built-in "dual
+            pool
+            mining" feature but the majority of miners out there do not.</p>
+            <p>So if you have one or more miners that do NOT have a built-in dual-pool mining feature (such as the
+                Canaan Avalon Q
+                or the Nano3S) and you would like, for example, to mine to a BTC pool and a Bitcoin Cash pool
+                simultaneously, then
+                <strong>DPMP</strong> is for you.
+            </p>
+            <p>The sections below provide an introduction to <strong>DPMP</strong> and its features. For more detailed
+                information (including setup and configuration details) please see the <em>About</em> tab in the
+                Dashboard.</p>
 
-        <a href="#img4" class="image-wrapper">
-            <img src="images/3.png" alt="Config">
-            <div class="caption">Full configuration interface with scheduler controls.</div>
-        </a>
 
-        <a href="#img5" class="image-wrapper">
-            <img src="images/4.png" alt="Logs">
-            <div class="caption">Structured JSON logs with downloadable export.</div>
-        </a>
-
+        </div>
     </div>
-</div>
 
-<div class="section">
-    <div class="card">
-        <p>The <strong>Config</strong> tab is organized into sections, including Logging Settings, Pool Settings, and Scheduler Settings. Pool Settings is where you will define the two pools to be used in <strong>DPMP</strong>. If you want to utilize the Oracle Auto-Balance feature, you must configure a bitcoin-mining pool and a bitcoin-cash mining pool and assign the correct coin to each pool, and you must also check the 'Enable Auto-Balance' checkbox in the Scheduler Settings section.</p>
-        <p>The <strong>Logs</strong> tab provides a real-time view of <strong>DPMP</strong>'s structured JSON logs, which include detailed information about miner connections, share submissions, pool interactions, and any errors or warnings. Logs can be filtered by event name, and exported (in Zip format) for further analysis or troubleshooting. You can configure the specific logging events to display in the Logging Settings section of the Config tab.</p>
-        
-        <h4>Pool Configuration</h4>
-        <p>For each pool, you must supply a Host URL, the Port being used, and the Wallet Address you want to use with that pool. Optionally, you can assign a pool name (used only in the Pool Stats table on the Stats tab), and you can assign the associated coin in the Chain dropdown box. This is only necessary if you intend to use the Oracle Auto-Balance feature and, if you do, you will need to set up a Bitcoin and a Bitcoin Cash pool since those are the only two coins currently supported. When inputting your wallet addresses, be sure to double-check your work since any payouts will be sent to the wallet addresses that you define here.</p>
+    <div class="section">
+        <h2>Home Dashboard</h2>
+        <div class="grid grid-2">
 
-        <h4>Miner Configuration</h4>
-        <p>When setting up your miners, you should point them to the IP address of the box on which you are running the <strong>DPMP</strong> proxy and you should use port 3351. For the wallet address, you can use any address you like since it won't be used (the wallet addresses defined on the <strong>DPMP</strong> Config tab are the <strong>only</strong> wallet addresses that the pools will see). You should append your workername to the end of the wallet address using a period to separate the two (i.e., '<strong>[wallet-address].[workername]</strong>'). Once you begin mining, <strong>DPMP</strong> will ignore any wallet addresses sent by your miner(s) and will strip out just the workername. When communicating with each pool, <strong>DPMP</strong> will use only the wallet addresses you defined in Pool A Settings and Pool B Settings, and it will append the workername it obtained from each miner.</p>    
+            <a href="#img1" class="image-wrapper">
+                <img src="images/1a.png" alt="Oracle Auto-Balance">
+                <div class="caption">Oracle Auto-Balance panel with real-time network hashrate tracking.</div>
+            </a>
+
+            <a href="#img2" class="image-wrapper">
+                <img src="images/1b.png" alt="Hashrate Allocation Slider">
+                <div class="caption">Live Hashrate Allocation slider for manual control.</div>
+            </a>
+
+        </div>
     </div>
-</div>
 
-<div class="section">
-    <h2>Availability</h2>
-    <div class="card">
-        <p><strong>DPMP</strong> is currently available for one-click install (umbrelOS 1.5) in our <a href="https://github.com/ckryza/ckryza-umbrel-app-store">Umbrel Community App Store</a>. We also have a bare-metal install available in our <a href="https://github.com/ckryza/dpmpv2">dpmpv2 repo</a>.</p>
-        <hr />
-        <p>If you would like to support the <strong>DPMP</strong> project, please consider a donation to either of the following addresses:</p>
+    <div class="section">
+        <div class="card">
+            <p>In terms of allocating hashrate between the two pools, <strong>DPMP</strong> offers two modes of
+                operation: <strong>Oracle Auto-Balance</strong> and <strong>Manual Hashrate Allocation</strong>. The
+                Oracle Auto-Balance mode uses real-time blockchain network hashrate data (currently, we support BTC and
+                BCH only) to dynamically adjust pool weights to put more hash power on the coin/pool with the lower
+                relative network hashrate, while the Manual Hashrate Allocation mode allows users to set a fixed
+                percentage of hashrate to each pool using an intuitive slider interface.</p>
 
-        <p>Bitcoin (BTC): <strong>bc1q9qrn7lsdnpy8w33dsdnu6cr4jdpg53zexgxh59</strong><br>
-        Bitcoin Cash (BCH): <strong>bitcoincash:qqlldmmc978u5u7uzas8cakxgfftraquxvjhcc8a3q</strong></p>
+            <p>The Manual Hashrate Allocation pane is always available regardless of the pools you are mining to. So,
+                for example, you could be mining to a Bitcoin pool and a Bitcoin Cash pool, or a Bitcoin Cash pool and a
+                Digibyte pool, or two different Bitcoin pools...it doesn't matter, the Manual Hashrate slider will
+                always be available.</p>
 
-        <p>Questions or Comments? Contact us at: <a href="mailto:dpmp.project@gmail.com"><strong>dpmp.project@gmail.com</strong></a> </p>       
+            <p>For the Oracle Auto-Balance pane to be available, you MUST be mining to a Bitcoin pool and a Bitcoin Cash
+                pool because those are the only two coins that we currently measure realtime network hashrate for (we
+                hope to add others in the future). When you first set up your pools on the <strong>DPMP</strong> Config
+                tab (e.g., Pool A Settings and Pool B Settings), in the <i>Chain</i> dropdown box you must select BCH
+                for your Bitcoin Cash pool and BTC for your Bitcoin pool. Then you must check the 'Enable Auto-Balance'
+                box in the Scheduler Settings section. Once you make those changes and click on the <strong>APPLY +
+                    RESTART</strong> button, you will see the Oracle Auto-Balance pane on the Home tab of the
+                <strong>DPMP</strong> Dashboard.</p>
 
+            <p><strong>Note</strong>: You can switch between Auto-Balance and Manual Hashrate Allocation at any time by
+                clicking on the button at the top-right of each pane, no restart required.</p>
+        </div>
     </div>
-</div>
 
-<footer>
-© 2026 DPMP Project · Built with NiceGUI · Stratum Infrastructure Proxy
-</footer>
+    <div class="section">
+        <h2>Metrics & Stats</h2>
+        <div class="grid grid-2">
 
-<!-- Modals -->
-<div id="img1" class="modal"><a href="#img1a" class="close">&times;</a><img src="images/1a.png"></div>
-<div id="img2" class="modal"><a href="#img2a" class="close">&times;</a><img src="images/1b.png"></div>
-<div id="img3" class="modal"><a href="#img3a" class="close">&times;</a><img src="images/2.png"></div>
-<div id="img4" class="modal"><a href="#img4a" class="close">&times;</a><img src="images/3.png"></div>
-<div id="img5" class="modal"><a href="#img5a" class="close">&times;</a><img src="images/4.png"></div>
+            <a href="#img3" class="image-wrapper">
+                <img src="images/2.png" alt="Fleet Stats">
+                <div class="caption">Fleet and Worker metrics.</div>
+            </a>
+
+            <div class="card">
+                <h4>Fleet & Worker Stats</h4>
+                <p>The <strong>Stats</strong> tab in the <strong>DPMP</strong> dashboard provides detailed metrics and
+                    statistics for the fleet, for each worker, and for each pool.</p>
+                <p>The Fleet Stats table shows the breakdown between Dynamic and Static miners, time-on-pool, pinned
+                    status, total number of switches, fleet contribution, and health.</p>
+                <p>For optimal fleet operation, it is recommended that you set "Slice Seconds" in the Scheduler Section
+                    on the Config tab to 10 or 15 initially. See the About tab in the Dashboard for more information.
+                </p>
+                <p>The Worker Stats table includes hashrate, current difficulty, shares-per-second, best share, and
+                    rejected shares.</p>
+
+            </div>
+
+        </div>
+        <p></p>
+        <p></p><br>
+
+        <div class="grid grid-2">
+            <div class="card">
+                <h4>Pool Stats</h4>
+                <p>The Pool Stats table shows pool name, slot, associated coin, extranonce size, ratio, latency,
+                    accepted/rejected shares, jobs, and total accepted difficulty.</p>
+                <p>All tables can be sorted by clicking on any column header.</p>
+            </div>
+            <a href="#img33" class="image-wrapper">
+                <img src="images/2b.png" alt="Pool Stats">
+                <div class="caption">Pool metrics.</div>
+            </a>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Configuration & Logs</h2>
+        <div class="grid grid-2">
+
+            <a href="#img4" class="image-wrapper">
+                <img src="images/3.png" alt="Config">
+                <div class="caption">Full configuration interface.</div>
+            </a>
+
+            <a href="#img5" class="image-wrapper">
+                <img src="images/4.png" alt="Logs">
+                <div class="caption">Structured JSON logs with downloadable export.</div>
+            </a>
+
+        </div>
+    </div>
+
+    <div class="section">
+        <div class="card">
+            <p>The <strong>Config</strong> tab is organized into sections, including Logging Settings, Pool Settings,
+                and Scheduler Settings. Pool Settings is where you will define the two pools to be used in
+                <strong>DPMP</strong>. If you want to utilize the Oracle Auto-Balance feature, you must configure a
+                bitcoin-mining pool and a bitcoin-cash mining pool and assign the correct coin to each pool, and you
+                must also check the 'Enable Auto-Balance' checkbox in the Scheduler Settings section.</p>
+            <p>The <strong>Logs</strong> tab provides a real-time view of <strong>DPMP</strong>'s structured JSON logs,
+                which include detailed information about miner connections, share submissions, pool interactions, and
+                any errors or warnings. Logs can be filtered by event name, and exported (in Zip format) for further
+                analysis or troubleshooting. You can configure the specific logging events to display in the Logging
+                Settings section of the Config tab. Note that the logs are rotated at 50MB, and a maximum of 3 log files
+                are kept. The redact/download functionality only operates on the active log file.</p>
+            <hr />
+            <h4>Pool Configuration</h4>
+            <p>Using the Pool A Settings and Pool B Settings sections on the <strong>Config</strong> tab, for each pool
+                you must supply a Host URL, the Port being used, and the Wallet Address you want to use with that pool.
+                Optionally, you can assign a pool name (used only in the Pool Stats table on the Stats tab), and you can
+                assign the associated coin in the Chain dropdown box. This is only necessary if you intend to use the
+                Oracle Auto-Balance feature and, if you do, you will need to set up a Bitcoin and a Bitcoin Cash pool
+                since those are the only two coins currently supported. When inputting your wallet addresses, be sure to
+                double-check your work since any payouts will be sent to the wallet addresses that you define here.</p>
+
+            <h4>Scheduler Configuration</h4>
+            <p>Using the Scheduler Settings section on the <strong>Config</strong> tab, you can configure how
+                <strong>DPMP</strong> will assign work between the two pools.
+                You can set the default pool weights, turn on and configure the Auto-Balance feature, and set the "Slice
+                Seconds" parameter.
+                The most important setting is "Slice Seconds", which determines the minimum time, in seconds, that a
+                "Dynamic" miner must submit work on a pool before it can switch to the other pool. For optimal fleet
+                operation, it is recommended that you set "Slice Seconds" to 10 or 15 initially. See the About tab in
+                the Dashboard for more information.</p>
+            <p><strong>Note</strong>: If you are upgrading from an earlier version of <strong>DPMP</strong>, it is
+                likely that your "Slice Seconds" setting was 30 seconds or higher. You should change it to 10 or 15
+                seconds when running DPMP v3.0.3.</p>
+
+            <h4>Miner Configuration</h4>
+            <p>When setting up your miners, you should point them to the IP address of the box on which you are running
+                the <strong>DPMP</strong> proxy and you should use port 3351. For the wallet address, you can use any
+                address you like since it won't be used (the wallet addresses defined on the <strong>DPMP</strong>
+                Config tab are the <strong>only</strong> wallet addresses that the pools will see). You should append
+                your workername to the end of the wallet address using a period to separate the two (i.e.,
+                '<strong>[wallet-address].[workername]</strong>'). Once you begin mining, <strong>DPMP</strong> will
+                ignore any wallet addresses sent by your miner(s) and will strip out just the workername. When
+                communicating with each pool, <strong>DPMP</strong> will use only the wallet addresses you defined in
+                Pool A Settings and Pool B Settings, and it will append the workername it obtained from each miner.</p>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Availability</h2>
+        <div class="card">
+            <p><strong>DPMP</strong> is currently available for one-click install (umbrelOS 1.5) in our <a
+                    href="https://github.com/ckryza/ckryza-umbrel-app-store">Umbrel Community App Store</a>. We also
+                have a bare-metal install available in our <a href="https://github.com/ckryza/dpmpv2">dpmpv2 repo</a>.
+            </p>
+            <hr />
+            <p>If you would like to support the <strong>DPMP</strong> project, please consider a donation to either of
+                the following addresses:</p>
+
+            <p>Bitcoin (BTC): <strong>bc1q9qrn7lsdnpy8w33dsdnu6cr4jdpg53zexgxh59</strong><br>
+                Bitcoin Cash (BCH): <strong>bitcoincash:qqlldmmc978u5u7uzas8cakxgfftraquxvjhcc8a3q</strong></p>
+
+            <p>Questions or Comments? Contact us at: <a
+                    href="mailto:dpmp.project@gmail.com"><strong>dpmp.project@gmail.com</strong></a> </p>
+
+        </div>
+    </div>
+
+    <footer>
+        © 2026 DPMP Project · Built with NiceGUI · Stratum Infrastructure Proxy
+    </footer>
+
+    <!-- Modals -->
+    <div id="img1" class="modal"><a href="#img1a" class="close">&times;</a><img src="images/1a.png"></div>
+    <div id="img2" class="modal"><a href="#img2a" class="close">&times;</a><img src="images/1b.png"></div>
+    <div id="img3" class="modal"><a href="#img3a" class="close">&times;</a><img src="images/2.png"></div>
+    <div id="img33" class="modal"><a href="#img33a" class="close">&times;</a><img src="images/2b.png"></div>
+    <div id="img4" class="modal"><a href="#img4a" class="close">&times;</a><img src="images/3.png"></div>
+    <div id="img5" class="modal"><a href="#img5a" class="close">&times;</a><img src="images/4.png"></div>
 
 </body>
+
 </html>
