@@ -1672,6 +1672,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             ("chain",     "Coin",      "",    None),
             ("en2_size",  "En2",       "num", lambda v: str(int(v)) if v else "--"),
             ("ratio",     "Ratio",     "num", lambda v: f"{v:.0f}%"),
+            ("pool_hr",   "5m HR",     "num", lambda v: fmt_hashrate(v)),
             ("latency",   "Latency",   "num", None),
             ("accepted",  "Accepted*",  "num", lambda v: f"{int(v):,}"),
             ("rejected",  "Rejected*",  "num", lambda v: f"{int(v):,}"),
@@ -1901,6 +1902,18 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                         _wA, _wB = get_config_weights()
                         _target_pctA = _wA / (_wA + _wB) * 100.0 if (_wA + _wB) > 0 else 50.0
 
+                # Compute combined 5m hashrate per pool by cross-referencing
+                # fleet_metrics (worker -> pool mapping) with worker_stats
+                # (worker -> hr_5m).
+                _pool_hr = {"A": 0.0, "B": 0.0}
+                try:
+                    _fm_hr = read_fleet_metrics().get("miners", {})
+                    for _wname, _wdata in _fm_hr.items():
+                        _wpool = _wdata.get("pool", "")
+                        if _wpool in _pool_hr:
+                            _pool_hr[_wpool] += workers.get(_wname, {}).get("hr_5m", 0.0)
+                except Exception:
+                    pass
 
                 for pk in ("A", "B"):
                     pi = pool_info.get(pk, {})
@@ -1915,6 +1928,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                         "chain": pi.get("chain", "--"),
                         "en2_size": int(_en2) if _en2 else 0,
                         "ratio": _goal_pct,
+                        "pool_hr": _pool_hr.get(pk, 0.0),
                         "latency": pool_lat.get(pk, 0.0),
                         "accepted": acc,
                         "rejected": rej,
@@ -2071,108 +2085,11 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
         ui.label("DPMP Configuration").classes("text-lg font-semibold")
 
         # list of events that we generally do NOT want to log (default deny list)
-        DEFAULT_DENY = [
-            "authorize_rewrite","authorize_rewrite_other","authorize_rewrite_secondary",
-            "bootstrap_reconnect_forced","bootstrap_skipped_handshake_pool",
-            "diff_coalesce_suppressed_pct","diff_coalesce_suppressed_time",
-            "downstream_extranonce_check","downstream_extranonce_skip_already_in_subscribe",
-            "downstream_extranonce_skip_no_data",
-            "downstream_extranonce_skip_nochange","downstream_extranonce_skip_raw_subscribe",
-            "downstream_extranonce_set","downstream_diff_set",
-            "downstream_notify_flushed_after_subscribe",
-            "downstream_send_diff","downstream_send_extranonce","downstream_send_notify",
-            "downstream_send_raw","downstream_subscribe_forwarded_raw","downstream_tx",
-            "handshake_pool_en2_prefer_larger","handshake_response_dropped",
-            "id_response_seen",
-            "job_forwarded","job_forwarded_diff_state",
-            "miner_method",
-            "notify_forwarded",
-            "oracle_calc_result","oracle_data_age","oracle_mode_slider","oracle_next_poll",
-            "oracle_override_written","oracle_poll_start","oracle_weights_applied",
-            "pool_notify",
-            "post_auth_downstream_sync","post_auth_extranonce_skip_already_in_subscribe",
-            "post_auth_extranonce_skip_raw_subscribe",
-            "post_auth_push_diff","post_auth_push_extranonce",
-            "post_auth_push_notify_clean",
-            "prune_internal_ids","prune_job_owner","prune_seen_upstream_ids","prune_submit_owner",
-            "scheduler_tick",
-            "send_upstream_flush_done","send_upstream_flush_start","send_upstream_queued",
-            "share_result",
-            "submit_route","submit_snapshot",
-            "subscribe_id_response_skipped_duplicate","subscribe_result",
-            "upstream_response_dup_observed","upstream_tx",
-            "vardiff_ramp_suppress",
-        ]
-
-        # --- all log events (canonical list; keep in sync with dpmpv2.py log("...") calls) ---
-        ALL_EVENTS = [
-            "active_pool_from_en2_hint","assigner_deviation_recompute","assigner_duration_update",
-            "assigner_error","assigner_starting","assigner_task_started","assigner_update","auth_result",
-            "authorize_rewrite","authorize_rewrite_other","authorize_rewrite_other_error",
-            "authorize_rewrite_secondary","authorize_secondary_send_error","authorize_skip_zero_weight_pool",
-            "best_shares_load_error","best_shares_loaded","best_shares_save_error",
-            "bootstrap_handshake_from_en2_hint","bootstrap_reconnect_forced",
-            "bootstrap_skipped_handshake_pool","clear_pool_state_reset_last_downstream_extranonce",
-            "clear_pool_state_reset_raw_subscribe_flag","config_loaded",
-            "config_safety_max_deviation_clamped","config_safety_min_switch_clamped",
-            "config_safety_oracle_poll_clamped","config_safety_slice_clamped","configure_forward_both_error",
-            "configure_forwarded_both_pools","configure_skip_zero_weight_pool",
-            "decay_seeded_from_share_log","diff_coalesce_suppressed_pct","diff_coalesce_suppressed_time",
-            "downstream_diff_set","downstream_extranonce_check","downstream_extranonce_send_error",
-            "downstream_extranonce_set","downstream_extranonce_size_change_hint",
-            "downstream_extranonce_skip_already_in_subscribe","downstream_extranonce_skip_no_data",
-            "downstream_extranonce_skip_nochange","downstream_extranonce_skip_raw_subscribe",
-            "downstream_notify_flushed_after_subscribe","downstream_send_diff",
-            "downstream_send_extranonce","downstream_send_extranonce_error",
-            "downstream_send_notify","downstream_send_raw","downstream_subscribe_forwarded_raw",
-            "downstream_tx","en2_auto_pin_reject_storm","en2_force_disconnect_learned",
-            "en2_force_reconnect","en2_force_reconnect_cooldown","en2_force_reconnect_error",
-            "en2_strike_recorded","en2_strikes_reset",
-            "failover_emergency_switch","fatal_crash","fleet_health_load_error","fleet_health_loaded",
-            "fleet_health_save_error","fleet_metrics_save_error","fleet_state_build_error",
-            "handshake_pool_en2_prefer_larger","handshake_pool_from_en2_hint","handshake_response_dropped",
-            "health_disconnect_near_switch","health_event","health_tick_error",
-            "id_response_seen","job_forwarded","job_forwarded_diff_state",
-            "metrics_start_failed","metrics_started","miner_bad_json","miner_connected",
-            "miner_disconnect_for_reconnect","miner_disconnect_for_reconnect_failed","miner_disconnected",
-            "miner_method","miner_ready_for_jobs","notify_forward_error","notify_forwarded",
-            "oracle_bad_timestamps","oracle_calc_result","oracle_cancelled","oracle_config",
-            "oracle_data_age","oracle_disabled_bad_chain_config","oracle_disabled_invalid_chains",
-            "oracle_fallback_50_50","oracle_mode_file_deleted_on_startup","oracle_mode_slider",
-            "oracle_next_poll","oracle_override_write_error","oracle_override_written","oracle_poll_error",
-            "oracle_poll_start","oracle_starting","oracle_startup_delay","oracle_task_cancelled",
-            "oracle_task_started","oracle_ts_parse_warning","oracle_weights_applied",
-            "pool_bootstrap_auth_result","pool_bootstrap_authorize_sent","pool_bootstrap_error",
-            "pool_bootstrap_subscribe_parse_error","pool_bootstrap_subscribe_result",
-            "pool_bootstrap_subscribe_sent","pool_connected","pool_connecting","pool_diff","pool_down",
-            "pool_initial_connect_failed","pool_notify","pool_reader_error","pool_reconnect_failed",
-            "pool_reconnect_wait","pool_reconnected","pool_skipped_zero_weight","pool_state_cleared",
-            "pool_switched","post_auth_downstream_sync","post_auth_downstream_sync_error",
-            "post_auth_extranonce_skip_already_in_subscribe",
-            "post_auth_extranonce_skip_raw_subscribe","post_auth_push_diff","post_auth_push_extranonce",
-            "post_auth_push_notify_clean","post_auth_push_notify_clean_error","post_auth_push_setup_error",
-            "process_exiting","prune_internal_ids","prune_job_owner","prune_seen_upstream_ids",
-            "prune_submit_owner","ratio_window_flushed","reject_suppressed_vardiff",
-            "reject_suppressed_vardiff_end","resend_notify_clean","resend_notify_error","resend_notify_raw",
-            "resend_notify_skipped_no_cached","scheduler_config_validated","scheduler_diag_error",
-            "scheduler_init","scheduler_tick","send_upstream_flush_done","send_upstream_flush_start",
-            "send_upstream_queued","session_error","share_diff_calc_bad_header_len","share_diff_calc_error",
-            "share_result","shutdown_begin","shutdown_cancel_tasks","shutdown_done",
-            "shutdown_keyboard_interrupt","shutdown_serve_task_cancel_begin",
-            "shutdown_serve_task_cancel_done","shutdown_serve_task_cancel_timeout",
-            "shutdown_serve_task_error","shutdown_server_close_begin","shutdown_server_close_done",
-            "shutdown_server_close_error","shutdown_server_close_timeout","shutdown_signal",
-            "shutdown_timeout","submit_dedupe_error","submit_dropped_duplicate_fp",
-            "submit_dropped_extranonce_mismatch","submit_dropped_no_job_yet","submit_dropped_pool_dead",
-            "submit_dropped_unknown_jid","submit_extranonce_mismatch_grace_forward",
-            "submit_grace_window_hit","submit_route","submit_snapshot",
-            "submit_suppressed_low_diff","submit_suppressed_low_diff_end",
-            "subscribe_id_response_skipped_duplicate","subscribe_parse_error","subscribe_result",
-            "switch_skipped_no_cached_job","upstream_response_dup_observed","upstream_tx",
-            "vardiff_ramp_suppress","vardiff_ramp_suppress_ended_accept",
-            "vardiff_ramp_suppress_ended_new_diff","weights_normalized",
-            "worker_stats_write_error","worker_stats_writer_started","write_failed",
-        ]
+        # Logging level options:
+        #   Normal = important events only (errors, connects, switches, pins, health)
+        #   Full   = all events including per-share routing, scheduler ticks, etc.
+        #   None   = no logging at all
+        LOGGING_LEVELS = ["Normal", "Full", "None"]
 
         # --- controls (created first; populated by reload_cfg) ---
 
@@ -2187,47 +2104,16 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             listen_host = ui.input("Host").classes("w-64")
             listen_port = ui.number("Port", precision=0).props("step=1 min=1 max=65535").classes("w-64")
 
-        # Logging (checkbox per event; deny[] only; allow[] left empty)
+        # Logging
         with ui.expansion("Logging Settings:", icon="settings").classes("w-full"):
-            ui.label("Check the events that you want to log. Certain events, while useful for debugging purposes, can generate a lot of log output very quickly. When in doubt, just click on the Reset to Defaults button to return to standard 'maintenance-mode' logging.").classes("text-sm")
-            ui.label("Warning: Logging all events can create a very large log file quickly.").classes("text-sm text-red-600")
-
-            logging_event_cbs = {}  # event -> checkbox
-
-            if not ALL_EVENTS:
-                ui.label("No log events list available.").classes("text-sm text-orange-700")
-            else:
-                with ui.row().classes("items-center gap-2"):
-                    btn_all  = ui.button("Check All").props("dense outline").classes("text-xs")
-                    btn_none = ui.button("Uncheck All").props("dense outline").classes("text-xs")
-                    btn_reset = ui.button("Reset to Defaults").props("dense outline").classes("text-xs")
-
-                cols = 3
-                rows = (len(ALL_EVENTS) + cols - 1) // cols
-
-                # on desktop show 3 columns; on mobile, stack into 1 column
-                with ui.element('div').classes('grid grid-cols-1 sm:grid-cols-3 w-full gap-4 sm:gap-6'):
-                    for c in range(cols):
-                        with ui.column().classes("min-w-0"):
-                            for r in range(rows):
-                                idx = c * rows + r
-                                if idx >= len(ALL_EVENTS):
-                                    break
-                                ev = ALL_EVENTS[idx]
-                                logging_event_cbs[ev] = ui.checkbox(ev, value=True).classes("text-xs sm:text-sm")
-
-                def _set_all_events(val: bool):
-                    for cb in logging_event_cbs.values():
-                        cb.value = bool(val)
-
-                def _reset_defaults():
-                    deny = set(DEFAULT_DENY)
-                    for ev, cb in logging_event_cbs.items():
-                        cb.value = (ev not in deny)                        
-
-                btn_all.on("click", lambda: _set_all_events(True))
-                btn_none.on("click", lambda: _set_all_events(False))
-                btn_reset.on("click", lambda: _reset_defaults())
+            ui.label("Controls how much detail is written to the log file.").classes("text-sm")
+            with ui.column().classes("gap-1"):
+                ui.label("Normal: Important events only (connects, switches, pins, errors, health).").classes("text-xs text-gray-600")
+                ui.label("Full: All events including per-share routing, scheduler ticks, etc. Warning: creates large log files quickly.").classes("text-xs text-gray-600")
+                ui.label("None: No logging at all.").classes("text-xs text-gray-600")
+            logging_level_select = ui.select(
+                LOGGING_LEVELS, value="Normal", label="Log Level"
+            ).classes("w-64")
 
 
         # Metrics
@@ -2313,29 +2199,29 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
 
         def _ensure_logging_defaults(cfg: dict) -> None:
             cfg.setdefault("logging", {})
-            cfg["logging"].setdefault("allow", [])  # we keep this empty by design
+            cfg["logging"].setdefault("allow", [])
             cfg["logging"].setdefault("deny", [])
             cfg["logging"].setdefault("json", True)
-            cfg["logging"].setdefault("level", "INFO")
+            cfg["logging"].setdefault("level", "normal")
 
-        def _apply_logging_checkboxes(cfg: dict) -> None:
+        def _apply_logging_level(cfg: dict) -> None:
             _ensure_logging_defaults(cfg)
-            deny = []
-            for ev, cb in logging_event_cbs.items():
-                try:
-                    if not bool(cb.value):
-                        deny.append(ev)
-                except Exception:
-                    deny.append(ev)
-            deny.sort()
-            cfg["logging"]["allow"] = []   # explicit: leave empty
-            cfg["logging"]["deny"] = deny  # unchecked => denied
+            # Map UI label to config value
+            _level_map = {"Normal": "normal", "Full": "full", "None": "none"}
+            selected = str(logging_level_select.value or "Normal")
+            cfg["logging"]["level"] = _level_map.get(selected, "normal")
+            # Clear legacy deny/allow lists since level-based filtering
+            # is now handled entirely in dpmpv2.py
+            cfg["logging"]["allow"] = []
+            cfg["logging"]["deny"] = []
 
-        def _set_checkboxes_from_cfg(cfg: dict) -> None:
-            deny = _safe_get(cfg, ["logging", "deny"], []) or []
-            deny_set = set([str(x) for x in deny])
-            for ev, cb in logging_event_cbs.items():
-                cb.value = (ev not in deny_set)
+        def _set_logging_from_cfg(cfg: dict) -> None:
+            _level = str(_safe_get(cfg, ["logging", "level"], "normal") or "normal").strip().lower()
+            # Map config value to UI label
+            _ui_map = {"normal": "Normal", "info": "Normal",
+                       "full": "Full", "debug": "Full",
+                       "none": "None", "off": "None", "quiet": "None"}
+            logging_level_select.value = _ui_map.get(_level, "Normal")
 
         def reload_cfg():
             global state
@@ -2354,9 +2240,9 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             listen_host.value = str(_safe_get(cfg, ["listen", "host"], "0.0.0.0") or "")
             listen_port.value = _to_int(_safe_get(cfg, ["listen", "port"], 3351), 3351)
 
-            # logging (checkboxes -> from deny[])
+            # logging (level selector)
             _ensure_logging_defaults(cfg)
-            _set_checkboxes_from_cfg(cfg)
+            _set_logging_from_cfg(cfg)
 
             # metrics
             metrics_host.value    = str(_safe_get(cfg, ["metrics", "host"], "0.0.0.0") or "")
@@ -2418,8 +2304,8 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             cfg["listen"]["host"] = str(listen_host.value or "").strip()
             cfg["listen"]["port"] = _to_int(listen_port.value, 3351)
 
-            # logging (checkboxes -> deny[])
-            _apply_logging_checkboxes(cfg)
+            # logging (level selector)
+            _apply_logging_level(cfg)
 
             # metrics
             cfg.setdefault("metrics", {})

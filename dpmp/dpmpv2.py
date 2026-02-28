@@ -128,27 +128,79 @@ LOG_LEVEL = os.environ.get("DPMP_LOG_LEVEL", "info").strip().lower()
 LOG_ALLOW = set(x.strip() for x in os.environ.get("DPMP_LOG_ALLOW", "").split(",") if x.strip())
 LOG_DENY  = set(x.strip() for x in os.environ.get("DPMP_LOG_DENY", "").split(",") if x.strip())
 
-# Events considered "debug" level, also high-output events
+# Events considered "debug" level (verbose / high-output).
+# Filtered out when LOG_LEVEL is "normal" or "info".
+# Logged when LOG_LEVEL is "full" or "debug".
+# LOG_LEVEL "none"/"off"/"quiet" suppresses ALL events.
 _DEBUG_EVENTS = {
+    # Per-share / per-job routing (very high volume)
     "downstream_tx", "upstream_tx", "miner_method",
-    "submit_snapshot", "submit_local_sanity",
-    "job_forwarded_diff_state",
+    "submit_snapshot", "submit_local_sanity", "submit_route",
+    "job_forwarded", "job_forwarded_diff_state",
+    "share_result",
+    # Downstream notifications and difficulty changes
     "downstream_send_notify", "downstream_send_raw",
-    "downstream_send_diff", "scheduler_tick",
+    "downstream_send_diff", "downstream_send_extranonce",
+    "downstream_notify_flushed_after_subscribe",
+    # Extranonce plumbing
+    "downstream_extranonce_check", "downstream_extranonce_set",
+    "downstream_extranonce_skip_already_in_subscribe",
+    "downstream_extranonce_skip_no_data",
+    "downstream_extranonce_skip_nochange",
+    "downstream_extranonce_skip_raw_subscribe",
+    # Pool notifications
+    "pool_notify",
+    # Subscribe / authorize handshake internals
+    "authorize_rewrite", "authorize_rewrite_other",
+    "authorize_rewrite_secondary",
+    "bootstrap_reconnect_forced", "bootstrap_skipped_handshake_pool",
+    "handshake_pool_en2_prefer_larger", "handshake_response_dropped",
+    "id_response_seen", "subscribe_result",
+    "subscribe_id_response_skipped_duplicate",
+    "downstream_subscribe_forwarded_raw",
+    "configure_forwarded_both_pools",
+    # Difficulty coalescing
+    "diff_coalesce_suppressed_pct", "diff_coalesce_suppressed_time",
+    # Post-auth setup
+    "post_auth_downstream_sync",
+    "post_auth_extranonce_skip_already_in_subscribe",
+    "post_auth_extranonce_skip_raw_subscribe",
+    "post_auth_push_diff", "post_auth_push_extranonce",
+    "post_auth_push_notify_clean",
+    # Oracle polling details
+    "oracle_calc_result", "oracle_data_age", "oracle_mode_slider",
+    "oracle_next_poll", "oracle_override_written",
+    "oracle_poll_start", "oracle_weights_applied",
+    # Scheduler tick (every 0.1s when active)
+    "scheduler_tick",
+    # Upstream queue / flush
+    "send_upstream_flush_done", "send_upstream_flush_start",
+    "send_upstream_queued",
+    # Pruning
+    "prune_internal_ids", "prune_job_owner",
+    "prune_seen_upstream_ids", "prune_submit_owner",
+    # VarDiff suppression (per-reject)
+    "vardiff_ramp_suppress",
+    "reject_suppressed_vardiff",
+    # Upstream response dedup
+    "upstream_response_dup_observed",
 }
 
 # Structured logging function
 def log(event: str, **fields: Any) -> None:
-    # Allowlist/denylist first (highest priority)
+    # Allowlist/denylist first (highest priority, for advanced users)
     if LOG_ALLOW and event not in LOG_ALLOW:
         return
     if LOG_DENY and event in LOG_DENY:
         return
 
     # Level-based filtering
+    # "none"/"off"/"quiet" -> suppress ALL events
+    # "normal"/"info"      -> suppress _DEBUG_EVENTS (verbose/high-volume)
+    # "full"/"debug"       -> log everything
     if LOG_LEVEL in ("quiet", "off", "none"):
         return
-    if LOG_LEVEL in ("info", "warn", "warning", "error"):
+    if LOG_LEVEL in ("info", "normal", "warn", "warning", "error"):
         if event in _DEBUG_EVENTS:
             return
 
@@ -730,6 +782,43 @@ def _calc_hashrate_pair(difficulty: float, ts_latest: int,
 
 # End Hashrate Oracle 
 
+
+def _is_extranonce_mismatch_reject(err) -> bool:
+    """Detect if a reject error indicates an extranonce1 mismatch.
+
+    When a miner submits shares with the wrong extranonce1 (e.g., Pool A's
+    extranonce1 sent to Pool B), the pool computes a completely different
+    hash, resulting in near-zero difficulty values (typically 1e-8 or less).
+    Normal vardiff rejects show difficulty values much closer to the target.
+
+    MiningCore format: {"code":23,"message":"low difficulty share (1.8e-10)","data":null}
+    ckpool format:     [23,"Difficulty too low",""]
+
+    Returns True if the error pattern strongly suggests extranonce1 mismatch.
+    """
+    try:
+        # MiningCore: extract difficulty from "low difficulty share (X)" message
+        msg_str = ""
+        if isinstance(err, dict):
+            msg_str = str(err.get("message", ""))
+        elif isinstance(err, list) and len(err) >= 2:
+            msg_str = str(err[1]) if err[1] else ""
+
+        if "low difficulty share" in msg_str.lower():
+            # Extract the numeric value from parentheses
+            _start = msg_str.find("(")
+            _end = msg_str.find(")")
+            if _start >= 0 and _end > _start:
+                _diff_val = float(msg_str[_start + 1:_end])
+                # Near-zero difficulty (< 0.001) = extranonce mismatch
+                # Normal vardiff rejects are orders of magnitude higher
+                if _diff_val < 0.001:
+                    return True
+    except (ValueError, TypeError, IndexError):
+        pass
+    return False
+
+
 # Proxy session handling a single miner connection and two upstream pools
 class ProxySession:
     def __init__(self, cfg: AppCfg, miner_r: asyncio.StreamReader, miner_w: asyncio.StreamWriter, sid: str):
@@ -894,6 +983,7 @@ class ProxySession:
         self._health_last_continuous_credit: float = time.monotonic()
         self._post_switch_accepts: int = 0
         self._post_switch_rejects: int = 0
+        self._post_switch_en1_mismatch: int = 0  # count of near-zero diff rejects (extranonce1 mismatch)
 
         # VarDiff ramp suppression: track consecutive null-error rejects per pool.
         # When a pool raises its required diff before sending mining.set_difficulty,
@@ -2115,6 +2205,14 @@ class ProxySession:
                         # Only count accepts on the pool we switched TO, not the prior pool
                         if self.last_switch_mono is not None and p == self.active_pool:
                             self._post_switch_accepts += 1
+                            # Safety valve: if the miner got an accept after a switch,
+                            # it handled the extranonce change correctly.  Clear any
+                            # accumulated en1 mismatch count so it doesn't slowly
+                            # build toward a false pin over many sessions.
+                            if self._post_switch_en1_mismatch > 0:
+                                self._post_switch_en1_mismatch = 0
+                                dpmp_fleet.en1_mismatch_carry_clear(
+                                    self.worker or "unknown")
 
                         # Update this miner's fleet weight based on share difficulty.
                         dpmp_fleet.fleet_update_weight(str(self.sid), d)
@@ -2195,24 +2293,58 @@ class ProxySession:
                                     # we're suppressing the reject from the miner.
                                     if self.last_switch_mono is not None and p == self.active_pool:
                                         self._post_switch_rejects += 1
-                                        if (self._post_switch_rejects >= 10
+                                        if _is_extranonce_mismatch_reject(_err):
+                                            self._post_switch_en1_mismatch += 1
+                                        # Early pin: 3+ near-zero rejects (may span sessions)
+                                        # is conclusive evidence of extranonce1 mismatch.
+                                        # No need to wait for the 10-reject gate.
+                                        if (self._post_switch_en1_mismatch >= 3
                                                 and self._post_switch_accepts == 0):
-                                            # Only auto-pin if en2 sizes actually differ between pools.
-                                            # If sizes match, rejects are just VarDiff ramp -- not en2 issue.
+                                            try:
+                                                _peer2 = self.miner_w.get_extra_info("peername")
+                                                if _peer2 and not dpmp_fleet.en2_is_pinned(_peer2[0]):
+                                                    dpmp_fleet.en2_force_pin(_peer2[0])
+                                                    log("en2_auto_pin_reject_storm", sid=self.sid,
+                                                        miner_ip=_peer2[0], worker=self.worker or "unknown",
+                                                        rejects=self._post_switch_rejects,
+                                                        accepts=self._post_switch_accepts,
+                                                        en1_mismatch_count=self._post_switch_en1_mismatch,
+                                                        en2a=self.extranonce2_size.get("A"),
+                                                        en2b=self.extranonce2_size.get("B"),
+                                                        pin_reason="extranonce1_mismatch",
+                                                        reason="3+ near-zero rejects across sessions (via vardiff suppress)")
+                                                    _target = "B" if self.active_pool == "A" else "A"
+                                                    dpmp_fleet.en2_set_hint(_peer2[0], _target)
+                                                    log("en2_force_reconnect", sid=self.sid,
+                                                        to_pool=_target, miner_ip=_peer2[0],
+                                                        reason="auto-pin triggered, forcing reconnect to safe pool")
+                                                    self.miner_w.close()
+                                            except Exception:
+                                                pass
+                                        elif (self._post_switch_rejects >= 10
+                                                and self._post_switch_accepts == 0):
+                                            # Auto-pin if en2 sizes differ OR if near-zero
+                                            # difficulty rejects indicate extranonce1 mismatch
+                                            # (miner ignores mining.set_extranonce).
                                             _en2a = self.extranonce2_size.get("A")
                                             _en2b = self.extranonce2_size.get("B")
                                             _en2_mismatch = (_en2a is not None and _en2b is not None
                                                              and _en2a != _en2b)
-                                            if _en2_mismatch:
+                                            _en1_mismatch = self._post_switch_en1_mismatch >= 5
+                                            if _en2_mismatch or _en1_mismatch:
                                                 try:
                                                     _peer2 = self.miner_w.get_extra_info("peername")
                                                     if _peer2 and not dpmp_fleet.en2_is_pinned(_peer2[0]):
                                                         dpmp_fleet.en2_force_pin(_peer2[0])
+                                                        _pin_reason = ("en2_size_mismatch" if _en2_mismatch
+                                                                       else "extranonce1_mismatch")
                                                         log("en2_auto_pin_reject_storm", sid=self.sid,
                                                             miner_ip=_peer2[0], worker=self.worker or "unknown",
                                                             rejects=self._post_switch_rejects,
                                                             accepts=self._post_switch_accepts,
+                                                            en1_mismatch_count=self._post_switch_en1_mismatch,
                                                             en2a=_en2a, en2b=_en2b,
+                                                            pin_reason=_pin_reason,
                                                             reason="10+ rejects with 0 accepts after switch (via vardiff suppress)")
                                                         _target = "B" if self.active_pool == "A" else "A"
                                                         dpmp_fleet.en2_set_hint(_peer2[0], _target)
@@ -2227,8 +2359,9 @@ class ProxySession:
                                                     log("auto_pin_skipped_same_en2", sid=self.sid,
                                                         worker=self.worker or "unknown",
                                                         rejects=self._post_switch_rejects,
+                                                        en1_mismatch_count=self._post_switch_en1_mismatch,
                                                         en2a=_en2a, en2b=_en2b,
-                                                        reason="en2 sizes match, rejects are VarDiff ramp not en2 issue")
+                                                        reason="en2 sizes match and no extranonce1 mismatch detected")
                                     continue
 
                         # Reset vardiff suppression counter outside grace window
@@ -2272,24 +2405,55 @@ class ProxySession:
                                 # we're suppressing the reject from the miner.
                                 if self.last_switch_mono is not None and p == self.active_pool:
                                     self._post_switch_rejects += 1
-                                    if (self._post_switch_rejects >= 10
+                                    if _is_extranonce_mismatch_reject(_err):
+                                        self._post_switch_en1_mismatch += 1
+                                    # Early pin: 3+ near-zero rejects (may span sessions)
+                                    if (self._post_switch_en1_mismatch >= 3
                                             and self._post_switch_accepts == 0):
-                                        # Only auto-pin if en2 sizes actually differ between pools.
-                                        # If sizes match, rejects are just VarDiff ramp -- not en2 issue.
+                                        try:
+                                            _peer2 = self.miner_w.get_extra_info("peername")
+                                            if _peer2 and not dpmp_fleet.en2_is_pinned(_peer2[0]):
+                                                dpmp_fleet.en2_force_pin(_peer2[0])
+                                                log("en2_auto_pin_reject_storm", sid=self.sid,
+                                                    miner_ip=_peer2[0], worker=self.worker or "unknown",
+                                                    rejects=self._post_switch_rejects,
+                                                    accepts=self._post_switch_accepts,
+                                                    en1_mismatch_count=self._post_switch_en1_mismatch,
+                                                    en2a=self.extranonce2_size.get("A"),
+                                                    en2b=self.extranonce2_size.get("B"),
+                                                    pin_reason="extranonce1_mismatch",
+                                                    reason="3+ near-zero rejects across sessions (via ramp suppress)")
+                                                _target = "B" if self.active_pool == "A" else "A"
+                                                dpmp_fleet.en2_set_hint(_peer2[0], _target)
+                                                log("en2_force_reconnect", sid=self.sid,
+                                                    to_pool=_target, miner_ip=_peer2[0],
+                                                    reason="auto-pin triggered, forcing reconnect to safe pool")
+                                                self.miner_w.close()
+                                        except Exception:
+                                            pass
+                                    elif (self._post_switch_rejects >= 10
+                                            and self._post_switch_accepts == 0):
+                                        # Auto-pin if en2 sizes differ OR if near-zero
+                                        # difficulty rejects indicate extranonce1 mismatch.
                                         _en2a = self.extranonce2_size.get("A")
                                         _en2b = self.extranonce2_size.get("B")
                                         _en2_mismatch = (_en2a is not None and _en2b is not None
                                                          and _en2a != _en2b)
-                                        if _en2_mismatch:
+                                        _en1_mismatch = self._post_switch_en1_mismatch >= 5
+                                        if _en2_mismatch or _en1_mismatch:
                                             try:
                                                 _peer2 = self.miner_w.get_extra_info("peername")
                                                 if _peer2 and not dpmp_fleet.en2_is_pinned(_peer2[0]):
                                                     dpmp_fleet.en2_force_pin(_peer2[0])
+                                                    _pin_reason = ("en2_size_mismatch" if _en2_mismatch
+                                                                   else "extranonce1_mismatch")
                                                     log("en2_auto_pin_reject_storm", sid=self.sid,
                                                         miner_ip=_peer2[0], worker=self.worker or "unknown",
                                                         rejects=self._post_switch_rejects,
                                                         accepts=self._post_switch_accepts,
+                                                        en1_mismatch_count=self._post_switch_en1_mismatch,
                                                         en2a=_en2a, en2b=_en2b,
+                                                        pin_reason=_pin_reason,
                                                         reason="10+ rejects with 0 accepts after switch (via ramp suppress)")
                                                     _target = "B" if self.active_pool == "A" else "A"
                                                     dpmp_fleet.en2_set_hint(_peer2[0], _target)
@@ -2304,8 +2468,9 @@ class ProxySession:
                                                 log("auto_pin_skipped_same_en2", sid=self.sid,
                                                     worker=self.worker or "unknown",
                                                     rejects=self._post_switch_rejects,
+                                                    en1_mismatch_count=self._post_switch_en1_mismatch,
                                                     en2a=_en2a, en2b=_en2b,
-                                                    reason="en2 sizes match, rejects are VarDiff ramp not en2 issue")
+                                                    reason="en2 sizes match and no extranonce1 mismatch detected")
                                 continue
 
                         # Only count as a real reject if NOT suppressed
@@ -2317,24 +2482,56 @@ class ProxySession:
                         # AND the en2 sizes differ between pools, pin it.
                         if self.last_switch_mono is not None and p == self.active_pool:
                             self._post_switch_rejects += 1
-                            if (self._post_switch_rejects >= 10
+                            _err_raw = msg.get("error")
+                            if _is_extranonce_mismatch_reject(_err_raw):
+                                self._post_switch_en1_mismatch += 1
+                            # Early pin: 3+ near-zero rejects (may span sessions)
+                            if (self._post_switch_en1_mismatch >= 3
                                     and self._post_switch_accepts == 0):
-                                # Only auto-pin if en2 sizes actually differ between pools.
+                                try:
+                                    _peer = self.miner_w.get_extra_info("peername")
+                                    if _peer and not dpmp_fleet.en2_is_pinned(_peer[0]):
+                                        dpmp_fleet.en2_force_pin(_peer[0])
+                                        log("en2_auto_pin_reject_storm", sid=self.sid,
+                                            miner_ip=_peer[0], worker=self.worker or "unknown",
+                                            rejects=self._post_switch_rejects,
+                                            accepts=self._post_switch_accepts,
+                                            en1_mismatch_count=self._post_switch_en1_mismatch,
+                                            en2a=self.extranonce2_size.get("A"),
+                                            en2b=self.extranonce2_size.get("B"),
+                                            pin_reason="extranonce1_mismatch",
+                                            reason="3+ near-zero rejects across sessions")
+                                        _target = "B" if self.active_pool == "A" else "A"
+                                        dpmp_fleet.en2_set_hint(_peer[0], _target)
+                                        log("en2_force_reconnect", sid=self.sid,
+                                            to_pool=_target, miner_ip=_peer[0],
+                                            reason="auto-pin triggered, forcing reconnect to safe pool")
+                                        self.miner_w.close()
+                                except Exception:
+                                    pass
+                            elif (self._post_switch_rejects >= 10
+                                    and self._post_switch_accepts == 0):
+                                # Auto-pin if en2 sizes differ OR if near-zero
+                                # difficulty rejects indicate extranonce1 mismatch.
                                 _en2a = self.extranonce2_size.get("A")
                                 _en2b = self.extranonce2_size.get("B")
                                 _en2_mismatch = (_en2a is not None and _en2b is not None
                                                  and _en2a != _en2b)
-                                if _en2_mismatch:
+                                _en1_mismatch = self._post_switch_en1_mismatch >= 5
+                                if _en2_mismatch or _en1_mismatch:
                                     try:
                                         _peer = self.miner_w.get_extra_info("peername")
                                         if _peer and not dpmp_fleet.en2_is_pinned(_peer[0]):
                                             dpmp_fleet.en2_force_pin(_peer[0])
-
+                                            _pin_reason = ("en2_size_mismatch" if _en2_mismatch
+                                                           else "extranonce1_mismatch")
                                             log("en2_auto_pin_reject_storm", sid=self.sid,
                                                 miner_ip=_peer[0], worker=self.worker or "unknown",
                                                 rejects=self._post_switch_rejects,
                                                 accepts=self._post_switch_accepts,
+                                                en1_mismatch_count=self._post_switch_en1_mismatch,
                                                 en2a=_en2a, en2b=_en2b,
+                                                pin_reason=_pin_reason,
                                                 reason="10+ rejects with 0 accepts after switch")
                                             # Force reconnect to the SAFE pool (opposite of reject pool)
                                             _target = "B" if self.active_pool == "A" else "A"
@@ -2351,8 +2548,9 @@ class ProxySession:
                                         log("auto_pin_skipped_same_en2", sid=self.sid,
                                             worker=self.worker or "unknown",
                                             rejects=self._post_switch_rejects,
+                                            en1_mismatch_count=self._post_switch_en1_mismatch,
                                             en2a=_en2a, en2b=_en2b,
-                                            reason="en2 sizes match, rejects are VarDiff ramp not en2 issue")
+                                            reason="en2 sizes match and no extranonce1 mismatch detected")
 
                         # --- Health: post-switch reject tracking (Phase 1b) ---
                         # Only count rejects for shares SUBMITTED within 4s of a switch.
@@ -2660,13 +2858,32 @@ class ProxySession:
                 # TCP connection.  Every miner handles a dropped connection
                 # by reconnecting and doing a fresh subscribe handshake,
                 # which picks up the new extranonce naturally.
-                try:
-                    log("miner_disconnect_for_reconnect", sid=self.sid, pool=pool_key,
-                        reason="pool_reconnected_new_extranonce")
-                    self.miner_w.close()
-                    await self.miner_w.wait_closed()
-                except Exception as e:
-                    log("miner_disconnect_for_reconnect_failed", sid=self.sid, pool=pool_key, err=str(e))
+                #
+                # EXCEPTION: pinned miners that are NOT on the reconnecting
+                # pool do not need to re-handshake -- they never use that
+                # pool's extranonce, so forcing a disconnect just causes
+                # unnecessary reject cycles (e.g. Gekko on Pool A when
+                # Pool B reconnects).
+                _peer_dc = self.miner_w.get_extra_info("peername")
+                _miner_ip_dc = _peer_dc[0] if _peer_dc else None
+                _is_pinned = _miner_ip_dc and dpmp_fleet.en2_is_pinned(_miner_ip_dc)
+
+                if _is_pinned and pool_key != self.active_pool:
+                    log("miner_disconnect_skipped_pinned", sid=self.sid,
+                        pool=pool_key, active_pool=self.active_pool,
+                        miner_ip=_miner_ip_dc,
+                        reason="pinned_miner_not_on_reconnecting_pool")
+                else:
+                    try:
+                        log("miner_disconnect_for_reconnect", sid=self.sid,
+                            pool=pool_key,
+                            reason="pool_reconnected_new_extranonce",
+                            pinned=bool(_is_pinned))
+                        self.miner_w.close()
+                        await self.miner_w.wait_closed()
+                    except Exception as e:
+                        log("miner_disconnect_for_reconnect_failed",
+                            sid=self.sid, pool=pool_key, err=str(e))
 
                 break  # exit reconnect loop -- back to Phase 1 (pool_reader)
 
@@ -2680,10 +2897,17 @@ class ProxySession:
         last_switch_ts = time.monotonic()
 
         # Register this miner in the global fleet tracker
-        dpmp_fleet.fleet_register(str(self.sid), current_pool,
+        # fleet_register returns the actual stored switch_count, which
+        # may include carried-over switches from a previous session
+        # (miner reconnected).
+        self.switch_count = dpmp_fleet.fleet_register(str(self.sid), current_pool,
                         worker_name=self.worker or "unknown",
                         switch_count=0,
                         last_switch_mono=time.monotonic())
+
+        # Restore carried en1 mismatch count from a previous session
+        self._post_switch_en1_mismatch = dpmp_fleet.en1_mismatch_carry_restore(
+            self.worker or "unknown")
 
         log("scheduler_init", sid=self.sid, pool=current_pool,
             worker=self.worker or "unknown", scheduler="v3")
@@ -2860,11 +3084,10 @@ class ProxySession:
                 try:
                     _peer = self.miner_w.get_extra_info("peername")
                     if _peer and dpmp_fleet.en2_is_pinned(_peer[0]):
-                        # Check if the switch would actually cause an en2_size change
-                        _curr_en2s = self.extranonce2_size.get(current_pool)
-                        _pick_en2s = self.extranonce2_size.get(pick)
-                        if _curr_en2s is not None and _pick_en2s is not None and _curr_en2s != _pick_en2s:
-                            _skip_en2 = True
+                        # Pinned miners are blocked from switching unconditionally.
+                        # The pin means the miner can't handle pool changes
+                        # (en2 size mismatch or extranonce1 incompatibility).
+                        _skip_en2 = True
                 except Exception:
                     pass
 
@@ -2911,14 +3134,14 @@ class ProxySession:
                     ACTIVE_POOL.labels(pool="B").set(1 if pick == "B" else 0)
                     current_pool = pick
                     last_switch_ts = now
+                    self.switch_count += 1
+                    self.last_switch_mono = time.monotonic()
                     dpmp_fleet.fleet_register(str(self.sid), pick,
                                     worker_name=self.worker or "unknown",
                                     switch_count=self.switch_count,
                                     last_switch_mono=self.last_switch_mono)
                     log("pool_switched", sid=self.sid, to_pool=pick)
                     switched_this_tick = True
-                    self.last_switch_mono = time.monotonic()
-                    self.switch_count += 1
 
                     # --- Health: start tracking this switch (Phase 1b) ---
                     self._health_post_switch_rejects = 0
@@ -2926,6 +3149,7 @@ class ProxySession:
                     self._health_clean_switch_pending = time.monotonic()
                     self._post_switch_accepts = 0
                     self._post_switch_rejects = 0
+                    self._post_switch_en1_mismatch = 0
 
                     # Immediately sync extranonce+diff and resend clean notify after switch.
                     # resend_active_notify_clean() handles extranonce+diff+notify internally,
@@ -3148,6 +3372,11 @@ async def handle_miner(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
 
         # Remove miner from fleet tracking (Phase 1c)
         try:
+            # Save en1 mismatch count before unregister clears session data
+            _wname = getattr(sess, "worker", "") or "unknown"
+            _en1_mc = getattr(sess, "_post_switch_en1_mismatch", 0)
+            if _en1_mc > 0:
+                dpmp_fleet.en1_mismatch_carry_save(_wname, _en1_mc)
             dpmp_fleet.fleet_unregister(str(sess.sid))
         except Exception:
             pass
@@ -3181,7 +3410,7 @@ async def main():
         best_shares_path=_best_shares_path,
         fleet_health_path=_fleet_health_path,
         fleet_metrics_path=_fleet_metrics_path,
-        scheduler_diag_path=_scheduler_diag_path,
+        scheduler_diag_path=None,  # disabled -- set to _scheduler_diag_path to re-enable
     )
     dpmp_fleet.load_best_shares()
     dpmp_fleet.load_fleet_health()

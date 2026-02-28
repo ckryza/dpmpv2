@@ -136,6 +136,8 @@ _fleet_shareA: dict[str, float] = {}  # sid_str -> current per-session shareA ra
 _fleet_sid_worker: dict[str, str] = {}  # sid_str -> worker name (for fleet state builder)
 _fleet_switch_count: dict[str, int] = {}   # sid_str -> cumulative pool switch count
 _fleet_last_switch: dict[str, float] = {}  # sid_str -> monotonic time of last pool switch
+_fleet_worker_switch_carry: dict[str, int] = {}  # worker_name -> switch count carried from previous session
+_fleet_worker_en1_mismatch_carry: dict[str, int] = {}  # worker_name -> en1 mismatch count carried from previous session
 _fleet_last_switch_mono: float = 0.0
 _FLEET_SWITCH_COOLDOWN_S = 3.0  # seconds between consecutive miner switches
 _fleet_next_pool_idx: int = 0  # round-robin counter for initial pool assignment
@@ -914,8 +916,14 @@ def pool_record_result_time(msg_id: Any) -> None:
 def fleet_register(sid_str: str, pool: str, weight: float = 1.0,
                     worker_name: str = "",
                     switch_count: int | None = None,
-                    last_switch_mono: float | None = None) -> None:
-    """Register or update a miner's current pool assignment and weight."""
+                    last_switch_mono: float | None = None) -> int:
+    """Register or update a miner's current pool assignment and weight.
+
+    Returns:
+        The switch_count actually stored (may be higher than the input
+        if a carried count from a previous session was restored).
+    """
+    _stored_sc = 0
     with _fleet_lock:
         _fleet_pool[sid_str] = pool
         if weight > 0:
@@ -923,9 +931,17 @@ def fleet_register(sid_str: str, pool: str, weight: float = 1.0,
         if worker_name:
             _fleet_sid_worker[sid_str] = worker_name
         if switch_count is not None:
-            _fleet_switch_count[sid_str] = switch_count
+            # If registering with 0, check for a carried count from a
+            # previous session (miner reconnected).
+            if switch_count == 0 and worker_name:
+                _carried = _fleet_worker_switch_carry.pop(worker_name, 0)
+                _fleet_switch_count[sid_str] = _carried
+            else:
+                _fleet_switch_count[sid_str] = switch_count
+            _stored_sc = _fleet_switch_count[sid_str]
         if last_switch_mono is not None:
             _fleet_last_switch[sid_str] = last_switch_mono
+    return _stored_sc
 
 def fleet_update_weight(sid_str: str, weight: float) -> None:
     """Update a miner's hashrate weight (called on accepted shares)."""
@@ -951,12 +967,43 @@ def _fleet_avg_share() -> tuple[float, float]:
 def fleet_unregister(sid_str: str) -> None:
     """Remove a miner from fleet tracking (on disconnect)."""
     with _fleet_lock:
+        # Carry forward switch count by worker name so it survives reconnects
+        _wname = _fleet_sid_worker.get(sid_str, "")
+        _sc = _fleet_switch_count.get(sid_str, 0)
+        if _wname and _sc > 0:
+            _fleet_worker_switch_carry[_wname] = _sc
         _fleet_pool.pop(sid_str, None)
         _fleet_weight.pop(sid_str, None)
         _fleet_shareA.pop(sid_str, None)
         _fleet_sid_worker.pop(sid_str, None)
         _fleet_switch_count.pop(sid_str, None)
         _fleet_last_switch.pop(sid_str, None)
+
+
+def en1_mismatch_carry_save(worker_name: str, count: int) -> None:
+    """Save en1 mismatch count for a worker so it survives reconnects."""
+    if worker_name and count > 0:
+        with _fleet_lock:
+            _fleet_worker_en1_mismatch_carry[worker_name] = count
+
+
+def en1_mismatch_carry_restore(worker_name: str) -> int:
+    """Restore and consume the carried en1 mismatch count for a worker.
+
+    Returns:
+        The carried count (0 if none).
+    """
+    if not worker_name:
+        return 0
+    with _fleet_lock:
+        return _fleet_worker_en1_mismatch_carry.pop(worker_name, 0)
+
+
+def en1_mismatch_carry_clear(worker_name: str) -> None:
+    """Clear the carried en1 mismatch count (called after a successful switch)."""
+    if worker_name:
+        with _fleet_lock:
+            _fleet_worker_en1_mismatch_carry.pop(worker_name, None)
 
 def _fleet_ratio() -> tuple[float, float]:
     """Return (hashrate_on_A, hashrate_on_B) across all active miners.

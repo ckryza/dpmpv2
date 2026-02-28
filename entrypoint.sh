@@ -38,15 +38,21 @@ GUI_PID=$!
 # clean shutdown handler (disconnect miners before exit).
 trap 'kill -TERM "$DPMP_PID" "$GUI_PID" 2>/dev/null; wait "$DPMP_PID" "$GUI_PID" 2>/dev/null; exit 0' TERM INT
 
-# If either dies, exit non-zero so container restarts
+# If either dies, log details and exit non-zero so container restarts
 n=0
 while true; do
   if ! kill -0 "$DPMP_PID" 2>/dev/null; then
-    echo "dpmpv2 exited" >&2
+    wait "$DPMP_PID" 2>/dev/null
+    DPMP_EXIT=$?
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') dpmpv2 exited with code $DPMP_EXIT (pid=$DPMP_PID)" >&2
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') dpmpv2 exited with code $DPMP_EXIT (pid=$DPMP_PID)" >> /data/entrypoint_crash.log
     exit 1
   fi
   if ! kill -0 "$GUI_PID" 2>/dev/null; then
-    echo "nicegui exited" >&2
+    wait "$GUI_PID" 2>/dev/null
+    GUI_EXIT=$?
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') nicegui exited with code $GUI_EXIT (pid=$GUI_PID)" >&2
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') nicegui exited with code $GUI_EXIT (pid=$GUI_PID)" >> /data/entrypoint_crash.log
     exit 1
   fi
   n=$((n + 1))

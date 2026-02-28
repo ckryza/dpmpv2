@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.0.4 - 2026-02-28
+- pinned-miner disconnect exemption
+- fix switch-count logic for Fleet table
+- disable scheduler debug log (grows fast, so update your version!)
+- add 5m HR column to Pool table
+- add entrypoint crash log
+- modify logging options
+
 ## 3.0.3 - 2026-02-26
 - finalize fleet implementation
 - add Fleet table to Stats tab
