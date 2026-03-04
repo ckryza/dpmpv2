@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.0.5 - 2026-03-04
+- add on/off toggle in worker table
+- adjust pool switching logic
+- add config A/B swap button
+- fix possible blocking on startup
+
 ## 3.0.4 - 2026-02-28
 - pinned-miner disconnect exemption
 - fix switch-count logic for Fleet table

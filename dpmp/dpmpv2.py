@@ -70,8 +70,34 @@ _active_miner_writers: set = set()
 WEIGHTS_OVERRIDE_PATH = None  # set in main() from config path
 # Path to oracle mode file (written by GUI switch button, polled by oracle task)
 ORACLE_MODE_PATH = None       # set in main() from config path
+# Path to miner pause file (written by GUI toggle, polled by scheduler)
+MINER_PAUSED_PATH = None      # set in main() from config path
 MAX_CACHED_NOTIFY_AGE_S = 20.0  # don't switch into pool if cached notify older than this
 MAX_CONVERGE_DEVIATION = 0.05 # default max deviation (5%) to trigger urgent pool switch
+
+# Cached reader for miner_paused.json -- avoids disk I/O on every 0.1s tick.
+# Re-reads the file at most every 2 seconds.
+_paused_miners_cache: set = set()
+_paused_miners_cache_ts: float = 0.0
+
+def get_paused_miners() -> set:
+    """Return the set of paused worker names, re-reading file at most every 2s."""
+    global _paused_miners_cache, _paused_miners_cache_ts
+    now = time.monotonic()
+    if now - _paused_miners_cache_ts < 2.0:
+        return _paused_miners_cache
+    _paused_miners_cache_ts = now
+    if MINER_PAUSED_PATH is None:
+        return _paused_miners_cache
+    try:
+        with open(MINER_PAUSED_PATH, "rb") as f:
+            obj = json.loads(f.read())
+        _paused_miners_cache = set(obj.get("paused", []))
+    except FileNotFoundError:
+        _paused_miners_cache = set()
+    except Exception:
+        pass  # keep previous cache on read error
+    return _paused_miners_cache
 
 # Read weight override file if it exists (written by GUI slider)
 def read_weight_override() -> tuple[int, int] | None:
@@ -154,7 +180,7 @@ _DEBUG_EVENTS = {
     "authorize_rewrite", "authorize_rewrite_other",
     "authorize_rewrite_secondary",
     "bootstrap_reconnect_forced", "bootstrap_skipped_handshake_pool",
-    "handshake_pool_en2_prefer_larger", "handshake_response_dropped",
+    "handshake_pool_en2_prefer_smaller", "handshake_response_dropped",
     "id_response_seen", "subscribe_result",
     "subscribe_id_response_skipped_duplicate",
     "downstream_subscribe_forwarded_raw",
@@ -819,6 +845,61 @@ def _is_extranonce_mismatch_reject(err) -> bool:
     return False
 
 
+async def _handle_switch_failure(session, peer_ip: str, pin_reason: str,
+                                 reason_detail: str) -> None:
+    """Handle a miner that failed to switch pools after set_extranonce.
+
+    Implements a two-stage escalation:
+      Stage 1: Force a clean reconnect so the miner gets the target pool's
+               extranonce via a fresh subscribe handshake.
+      Stage 2: If the miner already failed a reconnect-switch attempt for
+               this target pool, permanently pin it (last resort).
+
+    Args:
+        session:       The ProxySession instance.
+        peer_ip:       The miner's IP address string.
+        pin_reason:    Short tag like "extranonce1_mismatch" or "en2_size_mismatch".
+        reason_detail: Human-readable description for the log.
+    """
+    # Which pool were we trying to switch TO?
+    _target = "B" if session.active_pool == "A" else "A"
+
+    if dpmp_fleet.reconnect_switch_should_pin(peer_ip, _target):
+        # Stage 2: already tried reconnect-switch, escalate to pin
+        dpmp_fleet.en2_force_pin(peer_ip)
+        log("en2_auto_pin_reject_storm", sid=session.sid,
+            miner_ip=peer_ip, worker=session.worker or "unknown",
+            rejects=session._post_switch_rejects,
+            accepts=session._post_switch_accepts,
+            en1_mismatch_count=session._post_switch_en1_mismatch,
+            en2a=session.extranonce2_size.get("A"),
+            en2b=session.extranonce2_size.get("B"),
+            pin_reason=pin_reason,
+            reason=reason_detail + " (reconnect already tried, pinning)")
+        # Reconnect to the safe pool (the one the miner was on before)
+        _safe = session.active_pool  # current pool is the "safe" one
+        dpmp_fleet.en2_set_hint(peer_ip, _safe)
+        log("en2_force_reconnect", sid=session.sid,
+            to_pool=_safe, miner_ip=peer_ip,
+            reason="pin triggered, reconnecting to safe pool")
+        session.miner_w.close()
+    else:
+        # Stage 1: try a reconnect-switch to the target pool
+        dpmp_fleet.reconnect_switch_record_attempt(peer_ip, _target)
+        dpmp_fleet.en2_set_hint(peer_ip, _target)
+        log("en2_reconnect_switch", sid=session.sid,
+            miner_ip=peer_ip, worker=session.worker or "unknown",
+            target_pool=_target,
+            rejects=session._post_switch_rejects,
+            accepts=session._post_switch_accepts,
+            en1_mismatch_count=session._post_switch_en1_mismatch,
+            en2a=session.extranonce2_size.get("A"),
+            en2b=session.extranonce2_size.get("B"),
+            pin_reason=pin_reason,
+            reason=reason_detail + " (trying reconnect-switch first)")
+        session.miner_w.close()
+
+
 # Proxy session handling a single miner connection and two upstream pools
 class ProxySession:
     def __init__(self, cfg: AppCfg, miner_r: asyncio.StreamReader, miner_w: asyncio.StreamWriter, sid: str):
@@ -849,6 +930,16 @@ class ProxySession:
         self.last_notify_mono: Dict[str, float | None] = {"A": None, "B": None}
         self.extranonce1: Dict[str, Optional[str]] = {"A": None, "B": None}
         self.extranonce2_size: Dict[str, Optional[int]] = {"A": None, "B": None}
+
+        # Locked en2_size: set once from the FIRST subscribe response seen in
+        # this session, then never changed.  All downstream communication
+        # (subscribe rewrite, mining.set_extranonce) uses this value so the
+        # miner never sees an en2_size change mid-session.
+        self.locked_en2_size: Optional[int] = None
+
+        # Switch safety: suppress submits during the brief window between
+        # sending set_extranonce and the new pool's clean notify.
+        self.block_submits: bool = False
 
         self.latest_diff: Dict[str, Optional[float]] = {"A": None, "B": None}
         self.last_downstream_diff_by_pool: Dict[str, Optional[float]] = {"A": None, "B": None}
@@ -984,6 +1075,15 @@ class ProxySession:
         self._post_switch_accepts: int = 0
         self._post_switch_rejects: int = 0
         self._post_switch_en1_mismatch: int = 0  # count of near-zero diff rejects (extranonce1 mismatch)
+
+        # Grace period after a pool switch: do not count rejects toward
+        # the auto-pin threshold for this many seconds.  Miners need time
+        # to flush old work and start producing shares on the new pool.
+        # Miners that CAN switch (AvalonQ, BM101) will produce accepts
+        # within this window, clearing the mismatch counter.  Miners that
+        # CANNOT switch (Gekko) will still hit the threshold after the
+        # grace period expires because they never produce accepts.
+        self._pin_grace_period_s: float = 5.0
 
         # VarDiff ramp suppression: track consecutive null-error rejects per pool.
         # When a pool raises its required diff before sending mining.set_difficulty,
@@ -1219,7 +1319,10 @@ class ProxySession:
 
         async with self.downstream_setup_lock:
             new_en1 = str(en1)
-            new_en2s = int(en2s)
+            # Always use the session-locked en2_size so the miner never sees
+            # a different value mid-session.  Fall back to pool's actual en2s
+            # only if locked_en2_size is not yet set (shouldn't happen).
+            new_en2s = self.locked_en2_size if self.locked_en2_size is not None else int(en2s)
             
             # Force send if the miner's current extranonce context is for a
             # DIFFERENT pool than the one we're switching to.  This is the only
@@ -1234,6 +1337,8 @@ class ProxySession:
             log("downstream_extranonce_check", sid=self.sid, pool=pool_key,
                 handshake=handshake, last_en_pool=last_en_pool, force_send=force_send,
                 new_en1=new_en1, new_en2s=new_en2s,
+                locked_en2_size=self.locked_en2_size,
+                upstream_en2s=int(en2s),
                 last_en1=self.last_downstream_en1, last_en2s=self.last_downstream_en2s)
             
             # Only skip if NOT force_send AND values unchanged
@@ -1244,26 +1349,7 @@ class ProxySession:
                     force_send=force_send, handshake=handshake, last_en_pool=last_en_pool)
                 return
 
-            # If extranonce2_size is changing, some miners (e.g., Braiins BM-101)
-            # may disconnect after receiving mining.set_extranonce with a different
-            # en2_size.  We pre-write a handshake hint so that IF the miner
-            # disconnects, the next session lands on the correct pool automatically.
-            # Miners flagged via the strike system never reach this code because
-            # forward_jobs blocks the pool switch entirely for them.
-            if (self.last_downstream_en2s is not None
-                    and new_en2s != self.last_downstream_en2s):
-                try:
-                    peer = self.miner_w.get_extra_info("peername")
-                    if peer:
-                        dpmp_fleet.en2_set_hint(peer[0], pool_key)
-                except Exception:
-                    pass
-                log("downstream_extranonce_size_change_hint", sid=self.sid,
-                    pool=pool_key, old_en2s=self.last_downstream_en2s,
-                    new_en2s=new_en2s, new_en1=new_en1,
-                    reason="en2_size changing, hint written for potential reconnect")
-
-            # Send the extranonce
+            # Send the extranonce (en2_size is always the locked session value)
             msg = {"method": "mining.set_extranonce", "params": [new_en1, new_en2s]}
             try:
                 await write_line(self.miner_w, dumps_json(msg), "downstream")
@@ -1275,7 +1361,9 @@ class ProxySession:
             self.last_downstream_en1 = new_en1
             self.last_downstream_en2s = new_en2s
             self.last_downstream_extranonce_pool = pool_key
-            log("downstream_extranonce_set", sid=self.sid, pool=pool_key, extranonce1=new_en1, extranonce2_size=new_en2s,
+            log("downstream_extranonce_set", sid=self.sid, pool=pool_key,
+                extranonce1=new_en1, extranonce2_size=new_en2s,
+                locked_en2_size=self.locked_en2_size,
                 force_send=force_send, handshake=handshake)
 
 
@@ -1372,14 +1460,44 @@ class ProxySession:
                 nm2 = sanitize_downstream_notification(nm)
                 log("downstream_send_notify", payload=nm2,
                     clean_jobs=bool(params[-1]) if len(params) >= 9 else None)
-                # Ensure diff context is re-asserted before notify (prevents low-diff bursts)
-                await self.maybe_send_downstream_extranonce(pool_key)
-                await self.maybe_send_downstream_diff(pool_key, force=True)
-                # Removed: 250ms sleep between diff and notify.
-                # That gap caused miners to submit old-diff shares that got rejected.
 
+                # Safe switch sequence:
+                # 1) Block submits so stale shares during the switch are swallowed
+                # 2) Send set_extranonce (with locked en2_size)
+                # 3) Brief delay to let the miner process the new extranonce
+                # 4) Send difficulty
+                # 5) Send clean notify from new pool
+                # 6) Unblock submits
+                self.block_submits = True
+                try:
+                    # This is how we were switching pools originally but it sounds like
+                    # it might be too aggressive for some miners that don't handle rapid 
+                    # extranonce/diff changes well (e.g. Gekko).
 
-                await write_line(self.miner_w, dumps_json(nm2), "downstream")
+                    #await self.maybe_send_downstream_extranonce(pool_key)
+                    #await asyncio.sleep(0.05)  # 50ms for miner to absorb extranonce
+                    #await self.maybe_send_downstream_diff(pool_key, force=True)
+                    #await write_line(self.miner_w, dumps_json(nm2), "downstream")
+
+                    # 1) Flush: send the NEW pool's notify with clean_jobs=True
+                    #    This tells the miner to drop all old work
+                    await write_line(self.miner_w, dumps_json(nm2), "downstream")
+                    await asyncio.sleep(0.1)
+
+                    # 2) Send new extranonce (with locked en2_size)
+                    await self.maybe_send_downstream_extranonce(pool_key)
+                    await asyncio.sleep(0.1)
+
+                    # 3) Reassert difficulty
+                    await self.maybe_send_downstream_diff(pool_key, force=True)
+                    await asyncio.sleep(0.1)
+
+                    # 4) Send the real notify again with clean_jobs=True
+                    #    Now the miner has correct extranonce + diff + fresh job
+                    await write_line(self.miner_w, dumps_json(nm2), "downstream")
+
+                finally:
+                    self.block_submits = False
                 # Commit forwarded-job state for submit routing (resend path must mirror scheduler forward path)
                 self.last_forwarded_pool = pool_key
                 self.last_forwarded_jobid = jid
@@ -1450,18 +1568,22 @@ class ProxySession:
                         elif wB <= 0 and wA > 0:
                             self.handshake_pool = "A"
                         else:
-                            # Both pools active -- check en2_sizes
+                            # Both pools active -- check en2_sizes.
+                            # Prefer the SMALLER en2_size for handshake so that
+                            # pool switches are always extension (small->large).
+                            # Real-world testing shows miners handle extension
+                            # (4->8 bytes) much better than truncation (8->4).
                             _en2a = self.extranonce2_size.get("A")
                             _en2b = self.extranonce2_size.get("B")
                             if _en2a is not None and _en2b is not None and _en2a != _en2b:
-                                if _en2b > _en2a:
-                                    self.handshake_pool = "B"
-                                    log("handshake_pool_en2_prefer_larger", sid=self.sid,
-                                        pool="B", en2a=_en2a, en2b=_en2b)
-                                else:
+                                if _en2a < _en2b:
                                     self.handshake_pool = "A"
-                                    log("handshake_pool_en2_prefer_larger", sid=self.sid,
+                                    log("handshake_pool_en2_prefer_smaller", sid=self.sid,
                                         pool="A", en2a=_en2a, en2b=_en2b)
+                                else:
+                                    self.handshake_pool = "B"
+                                    log("handshake_pool_en2_prefer_smaller", sid=self.sid,
+                                        pool="B", en2a=_en2a, en2b=_en2b)
                             elif wB > wA:
                                 self.handshake_pool = "B"
                             else:
@@ -1522,14 +1644,14 @@ class ProxySession:
                         _en2a = self.extranonce2_size.get("A")
                         _en2b = self.extranonce2_size.get("B")
                         if _en2a is not None and _en2b is not None and _en2a != _en2b:
-                            if _en2b > _en2a:
-                                self.handshake_pool = "B"
-                                log("handshake_pool_en2_prefer_larger", sid=self.sid,
-                                    pool="B", en2a=_en2a, en2b=_en2b)
-                            else:
+                            if _en2a < _en2b:
                                 self.handshake_pool = "A"
-                                log("handshake_pool_en2_prefer_larger", sid=self.sid,
+                                log("handshake_pool_en2_prefer_smaller", sid=self.sid,
                                     pool="A", en2a=_en2a, en2b=_en2b)
+                            else:
+                                self.handshake_pool = "B"
+                                log("handshake_pool_en2_prefer_smaller", sid=self.sid,
+                                    pool="B", en2a=_en2a, en2b=_en2b)
                         elif wB > wA:
                             self.handshake_pool = "B"
                         else:
@@ -1560,14 +1682,14 @@ class ProxySession:
                         _en2a = self.extranonce2_size.get("A")
                         _en2b = self.extranonce2_size.get("B")
                         if _en2a is not None and _en2b is not None and _en2a != _en2b:
-                            if _en2b > _en2a:
-                                self.handshake_pool = "B"
-                                log("handshake_pool_en2_prefer_larger", sid=self.sid,
-                                    pool="B", en2a=_en2a, en2b=_en2b)
-                            else:
+                            if _en2a < _en2b:
                                 self.handshake_pool = "A"
-                                log("handshake_pool_en2_prefer_larger", sid=self.sid,
+                                log("handshake_pool_en2_prefer_smaller", sid=self.sid,
                                     pool="A", en2a=_en2a, en2b=_en2b)
+                            else:
+                                self.handshake_pool = "B"
+                                log("handshake_pool_en2_prefer_smaller", sid=self.sid,
+                                    pool="B", en2a=_en2a, en2b=_en2b)
                         elif wB > wA:
                             self.handshake_pool = "B"
                         else:
@@ -1636,6 +1758,25 @@ class ProxySession:
                 # stays happy and the reject counters stay clean.
                 if not self._session_ready:
                     log("submit_swallowed_not_ready", sid=self.sid,
+                        mid=msg.get("id"), jid=jobid_from_submit(msg))
+                    await write_line(self.miner_w, dumps_json({
+                        "id": msg.get("id"), "result": True, "error": None
+                    }), "downstream")
+                    continue
+
+                # Soft-paused miners: swallow shares with fake "accepted"
+                # so the miner stays happy but hashrate drops to zero.
+                if self.worker and self.worker in get_paused_miners():
+                    await write_line(self.miner_w, dumps_json({
+                        "id": msg.get("id"), "result": True, "error": None
+                    }), "downstream")
+                    continue
+
+                # Submit suppression during pool switch: shares submitted in the
+                # brief window between set_extranonce and the new clean notify
+                # are almost always stale.  Swallow them with a fake "accepted".
+                if self.block_submits:
+                    log("submit_suppressed_during_switch", sid=self.sid,
                         mid=msg.get("id"), jid=jobid_from_submit(msg))
                     await write_line(self.miner_w, dumps_json({
                         "id": msg.get("id"), "result": True, "error": None
@@ -2033,8 +2174,11 @@ class ProxySession:
                                 if en2s is not None:
                                     self.extranonce2_size[pool_key] = int(en2s)
                                     EN2_SIZE.labels(pool=pool_key).set(int(en2s))
+
                                 log("pool_bootstrap_subscribe_result", sid=self.sid, pool=pool_key,
-                                    extranonce1=self.extranonce1[pool_key], extranonce2_size=self.extranonce2_size[pool_key])
+                                    extranonce1=self.extranonce1[pool_key],
+                                    extranonce2_size=self.extranonce2_size[pool_key],
+                                    locked_en2_size=self.locked_en2_size)
                         except Exception as e:
                             log("pool_bootstrap_subscribe_parse_error", sid=self.sid, pool=pool_key, err=str(e))
                     if getattr(self, "_internal_authorize_id", {}).get(pool_key) == mid:
@@ -2045,11 +2189,73 @@ class ProxySession:
                 # Capture per-pool subscribe response (extranonce context)
                 if self.subscribe_id is not None and mid == self.subscribe_id:
 
+                    # Parse extranonce data from this pool's subscribe result
+                    _sub_en1 = None
+                    _sub_en2s = None
+                    try:
+                        res = msg.get("result")
+                        if isinstance(res, list) and len(res) >= 3:
+                            _sub_en1 = res[1]
+                            _sub_en2s = res[2]
+                            if _sub_en1 is not None:
+                                self.extranonce1[pool_key] = str(_sub_en1)
+                            if _sub_en2s is not None:
+                                self.extranonce2_size[pool_key] = int(_sub_en2s)
+                                EN2_SIZE.labels(pool=pool_key).set(int(_sub_en2s))
+
+                            # Lock en2_size to the LARGER of the two pools' values.
+                            # The miner will use this size for all work in this session.
+                            # Larger is safer: miners handle extension (padding with
+                            # zeros) better than truncation, and pools generally accept
+                            # submissions with en2 longer than advertised.
+                            if self.locked_en2_size is None:
+                                other_pool = "B" if pool_key == "A" else "A"
+                                other_en2 = self.extranonce2_size.get(other_pool)
+                                this_en2 = int(_sub_en2s)
+                                if other_en2 is not None:
+                                    self.locked_en2_size = max(this_en2, int(other_en2))
+                                else:
+                                    # Other pool hasn't subscribed yet; lock to this one
+                                    self.locked_en2_size = this_en2
+                                log("en2_size_locked", sid=self.sid, pool=pool_key,
+                                    locked_en2_size=self.locked_en2_size,
+                                    this_pool_en2=this_en2,
+                                    other_pool=other_pool,
+                                    other_pool_en2=other_en2)
+
+                            log("subscribe_result", pool=pool_key,
+                                extranonce1=self.extranonce1[pool_key],
+                                extranonce2_size=self.extranonce2_size[pool_key],
+                                locked_en2_size=self.locked_en2_size)
+                    except Exception as e:
+                        log("subscribe_parse_error", pool=pool_key, err=str(e))
+
                     # Raw-forward subscribe result for the active pool (pool-agnostic)
+                    # BUT rewrite en2_size to the locked session value if different.
                     active = self.last_forwarded_pool or self.handshake_pool
                     if active == pool_key:
-                        await write_line(self.miner_w, raw, "downstream")
-                        log("downstream_subscribe_forwarded_raw", sid=self.sid, pool=pool_key)
+                        # Rewrite en2_size in the subscribe result before forwarding
+                        if (self.locked_en2_size is not None and _sub_en2s is not None
+                                and int(_sub_en2s) != self.locked_en2_size):
+                            try:
+                                rewritten = dict(msg)
+                                rr = list(rewritten.get("result", []))
+                                if len(rr) >= 3:
+                                    rr[2] = self.locked_en2_size
+                                    rewritten["result"] = rr
+                                    await write_line(self.miner_w, dumps_json(rewritten), "downstream")
+                                    log("downstream_subscribe_forwarded_rewritten", sid=self.sid,
+                                        pool=pool_key, upstream_en2s=int(_sub_en2s),
+                                        locked_en2s=self.locked_en2_size)
+                                else:
+                                    await write_line(self.miner_w, raw, "downstream")
+                                    log("downstream_subscribe_forwarded_raw", sid=self.sid, pool=pool_key)
+                            except Exception:
+                                await write_line(self.miner_w, raw, "downstream")
+                                log("downstream_subscribe_forwarded_raw", sid=self.sid, pool=pool_key)
+                        else:
+                            await write_line(self.miner_w, raw, "downstream")
+                            log("downstream_subscribe_forwarded_raw", sid=self.sid, pool=pool_key)
                         self.raw_subscribe_forwarded_pool = pool_key
 
                         # If we had to buffer a notify waiting for subscribe, flush it now.
@@ -2060,40 +2266,6 @@ class ProxySession:
                                 log("downstream_notify_flushed_after_subscribe", sid=self.sid, pool=pool_key)
                         except Exception:
                             pass
-
-                    try:
-                        res = msg.get("result")
-                        # Typical subscribe result: [ [..], extranonce1, extranonce2_size ]
-                        if isinstance(res, list) and len(res) >= 3:
-                            en1 = res[1]
-                            en2s = res[2]
-                            if en1 is not None:
-                                self.extranonce1[pool_key] = str(en1)
-                            if en2s is not None:
-                                self.extranonce2_size[pool_key] = int(en2s)
-                                EN2_SIZE.labels(pool=pool_key).set(int(en2s))
-                            log("subscribe_result", pool=pool_key, extranonce1=self.extranonce1[pool_key], extranonce2_size=self.extranonce2_size[pool_key])
-
-                            # Immediately provide extranonce context to the miner for the active pool.
-                            # BUT skip if we just raw-forwarded the subscribe response -- the miner
-                            # already has the extranonce from that response.  Sending mining.set_extranonce
-                            # to miners that don't support it (NerdAxe, NerdMiner, etc.) causes them
-                            # to disconnect or reboot in a loop.
-                            try:
-                                active = self.last_forwarded_pool or self.handshake_pool
-                                if active == pool_key and self.extranonce1.get(pool_key) is not None and self.extranonce2_size.get(pool_key) is not None:
-                                    if getattr(self, "raw_subscribe_forwarded_pool", None) == pool_key:
-                                        log("downstream_extranonce_skip_already_in_subscribe", sid=self.sid, pool=pool_key,
-                                            extranonce1=self.extranonce1[pool_key], extranonce2_size=int(self.extranonce2_size[pool_key]))
-                                    else:
-                                        en_msg = {"method": "mining.set_extranonce", "params": [self.extranonce1[pool_key], int(self.extranonce2_size[pool_key])]}
-                                        log("downstream_send_extranonce", sid=self.sid, pool=pool_key, extranonce1=self.extranonce1[pool_key], extranonce2_size=int(self.extranonce2_size[pool_key]))
-                                        await write_line(self.miner_w, dumps_json(en_msg), "downstream")
-                            except Exception as e:
-                                log("downstream_send_extranonce_error", sid=self.sid, pool=pool_key, err=str(e))
-
-                    except Exception as e:
-                        log("subscribe_parse_error", pool=pool_key, err=str(e))
 
                 if self.authorize_id is not None and mid == self.authorize_id:
                     ok_auth = bool(msg.get("result"))
@@ -2113,13 +2285,17 @@ class ProxySession:
                             # disconnect/reboot loops.
                             en1 = self.extranonce1.get(pool_key)
                             en2s = self.extranonce2_size.get(pool_key)
-                            if en1 is not None and en2s is not None:
+                            # Use locked en2_size for downstream consistency
+                            _en2s_downstream = self.locked_en2_size if self.locked_en2_size is not None else (int(en2s) if en2s is not None else None)
+                            if en1 is not None and _en2s_downstream is not None:
                                 if getattr(self, "raw_subscribe_forwarded_pool", None) == pool_key:
                                     log("post_auth_extranonce_skip_already_in_subscribe", sid=self.sid, pool=pool_key,
-                                        extranonce1=str(en1), extranonce2_size=int(en2s))
+                                        extranonce1=str(en1), extranonce2_size=_en2s_downstream)
                                 else:
-                                    en_msg = {"method": "mining.set_extranonce", "params": [str(en1), int(en2s)]}
-                                    log("post_auth_push_extranonce", sid=self.sid, pool=pool_key, extranonce1=str(en1), extranonce2_size=int(en2s))
+                                    en_msg = {"method": "mining.set_extranonce", "params": [str(en1), _en2s_downstream]}
+                                    log("post_auth_push_extranonce", sid=self.sid, pool=pool_key,
+                                        extranonce1=str(en1), extranonce2_size=_en2s_downstream,
+                                        locked_en2_size=self.locked_en2_size)
                                     await write_line(self.miner_w, dumps_json(en_msg), "downstream")
 
                             # Difficulty (use downstream_diff_policy to respect
@@ -2213,6 +2389,14 @@ class ProxySession:
                                 self._post_switch_en1_mismatch = 0
                                 dpmp_fleet.en1_mismatch_carry_clear(
                                     self.worker or "unknown")
+                            # Also clear reconnect-switch tracking -- the miner
+                            # successfully switched, so it doesn't need pinning.
+                            try:
+                                _peer_ok = self.miner_w.get_extra_info("peername")
+                                if _peer_ok:
+                                    dpmp_fleet.reconnect_switch_clear(_peer_ok[0])
+                            except Exception:
+                                pass
 
                         # Update this miner's fleet weight based on share difficulty.
                         dpmp_fleet.fleet_update_weight(str(self.sid), d)
@@ -2291,41 +2475,31 @@ class ProxySession:
                                     }), "downstream")
                                     # Still count toward auto-pin detection even though
                                     # we're suppressing the reject from the miner.
-                                    if self.last_switch_mono is not None and p == self.active_pool:
+                                    # BUT skip counting during the grace period after a
+                                    # switch -- miners need time to flush old work.
+                                    _switch_age = (time.monotonic() - self.last_switch_mono
+                                                   if self.last_switch_mono else 999.0)
+                                    if (self.last_switch_mono is not None
+                                            and p == self.active_pool
+                                            and _switch_age >= self._pin_grace_period_s):
                                         self._post_switch_rejects += 1
                                         if _is_extranonce_mismatch_reject(_err):
                                             self._post_switch_en1_mismatch += 1
-                                        # Early pin: 3+ near-zero rejects (may span sessions)
+                                        # Early detection: 3+ near-zero rejects (may span sessions)
                                         # is conclusive evidence of extranonce1 mismatch.
-                                        # No need to wait for the 10-reject gate.
                                         if (self._post_switch_en1_mismatch >= 3
                                                 and self._post_switch_accepts == 0):
                                             try:
                                                 _peer2 = self.miner_w.get_extra_info("peername")
                                                 if _peer2 and not dpmp_fleet.en2_is_pinned(_peer2[0]):
-                                                    dpmp_fleet.en2_force_pin(_peer2[0])
-                                                    log("en2_auto_pin_reject_storm", sid=self.sid,
-                                                        miner_ip=_peer2[0], worker=self.worker or "unknown",
-                                                        rejects=self._post_switch_rejects,
-                                                        accepts=self._post_switch_accepts,
-                                                        en1_mismatch_count=self._post_switch_en1_mismatch,
-                                                        en2a=self.extranonce2_size.get("A"),
-                                                        en2b=self.extranonce2_size.get("B"),
-                                                        pin_reason="extranonce1_mismatch",
-                                                        reason="3+ near-zero rejects across sessions (via vardiff suppress)")
-                                                    _target = "B" if self.active_pool == "A" else "A"
-                                                    dpmp_fleet.en2_set_hint(_peer2[0], _target)
-                                                    log("en2_force_reconnect", sid=self.sid,
-                                                        to_pool=_target, miner_ip=_peer2[0],
-                                                        reason="auto-pin triggered, forcing reconnect to safe pool")
-                                                    self.miner_w.close()
+                                                    await _handle_switch_failure(
+                                                        self, _peer2[0],
+                                                        "extranonce1_mismatch",
+                                                        "3+ near-zero rejects across sessions (via vardiff suppress)")
                                             except Exception:
                                                 pass
                                         elif (self._post_switch_rejects >= 10
                                                 and self._post_switch_accepts == 0):
-                                            # Auto-pin if en2 sizes differ OR if near-zero
-                                            # difficulty rejects indicate extranonce1 mismatch
-                                            # (miner ignores mining.set_extranonce).
                                             _en2a = self.extranonce2_size.get("A")
                                             _en2b = self.extranonce2_size.get("B")
                                             _en2_mismatch = (_en2a is not None and _en2b is not None
@@ -2335,23 +2509,12 @@ class ProxySession:
                                                 try:
                                                     _peer2 = self.miner_w.get_extra_info("peername")
                                                     if _peer2 and not dpmp_fleet.en2_is_pinned(_peer2[0]):
-                                                        dpmp_fleet.en2_force_pin(_peer2[0])
                                                         _pin_reason = ("en2_size_mismatch" if _en2_mismatch
                                                                        else "extranonce1_mismatch")
-                                                        log("en2_auto_pin_reject_storm", sid=self.sid,
-                                                            miner_ip=_peer2[0], worker=self.worker or "unknown",
-                                                            rejects=self._post_switch_rejects,
-                                                            accepts=self._post_switch_accepts,
-                                                            en1_mismatch_count=self._post_switch_en1_mismatch,
-                                                            en2a=_en2a, en2b=_en2b,
-                                                            pin_reason=_pin_reason,
-                                                            reason="10+ rejects with 0 accepts after switch (via vardiff suppress)")
-                                                        _target = "B" if self.active_pool == "A" else "A"
-                                                        dpmp_fleet.en2_set_hint(_peer2[0], _target)
-                                                        log("en2_force_reconnect", sid=self.sid,
-                                                            to_pool=_target, miner_ip=_peer2[0],
-                                                            reason="auto-pin triggered, forcing reconnect to safe pool")
-                                                        self.miner_w.close()
+                                                        await _handle_switch_failure(
+                                                            self, _peer2[0],
+                                                            _pin_reason,
+                                                            "10+ rejects with 0 accepts after switch (via vardiff suppress)")
                                                 except Exception:
                                                     pass
                                             else:
@@ -2403,38 +2566,30 @@ class ProxySession:
                                 }), "downstream")
                                 # Still count toward auto-pin detection even though
                                 # we're suppressing the reject from the miner.
-                                if self.last_switch_mono is not None and p == self.active_pool:
+                                # BUT skip counting during the grace period after a
+                                # switch -- miners need time to flush old work.
+                                _switch_age2 = (time.monotonic() - self.last_switch_mono
+                                                if self.last_switch_mono else 999.0)
+                                if (self.last_switch_mono is not None
+                                        and p == self.active_pool
+                                        and _switch_age2 >= self._pin_grace_period_s):
                                     self._post_switch_rejects += 1
                                     if _is_extranonce_mismatch_reject(_err):
                                         self._post_switch_en1_mismatch += 1
-                                    # Early pin: 3+ near-zero rejects (may span sessions)
+                                    # Early detection: 3+ near-zero rejects (may span sessions)
                                     if (self._post_switch_en1_mismatch >= 3
                                             and self._post_switch_accepts == 0):
                                         try:
                                             _peer2 = self.miner_w.get_extra_info("peername")
                                             if _peer2 and not dpmp_fleet.en2_is_pinned(_peer2[0]):
-                                                dpmp_fleet.en2_force_pin(_peer2[0])
-                                                log("en2_auto_pin_reject_storm", sid=self.sid,
-                                                    miner_ip=_peer2[0], worker=self.worker or "unknown",
-                                                    rejects=self._post_switch_rejects,
-                                                    accepts=self._post_switch_accepts,
-                                                    en1_mismatch_count=self._post_switch_en1_mismatch,
-                                                    en2a=self.extranonce2_size.get("A"),
-                                                    en2b=self.extranonce2_size.get("B"),
-                                                    pin_reason="extranonce1_mismatch",
-                                                    reason="3+ near-zero rejects across sessions (via ramp suppress)")
-                                                _target = "B" if self.active_pool == "A" else "A"
-                                                dpmp_fleet.en2_set_hint(_peer2[0], _target)
-                                                log("en2_force_reconnect", sid=self.sid,
-                                                    to_pool=_target, miner_ip=_peer2[0],
-                                                    reason="auto-pin triggered, forcing reconnect to safe pool")
-                                                self.miner_w.close()
+                                                await _handle_switch_failure(
+                                                    self, _peer2[0],
+                                                    "extranonce1_mismatch",
+                                                    "3+ near-zero rejects across sessions (via ramp suppress)")
                                         except Exception:
                                             pass
                                     elif (self._post_switch_rejects >= 10
                                             and self._post_switch_accepts == 0):
-                                        # Auto-pin if en2 sizes differ OR if near-zero
-                                        # difficulty rejects indicate extranonce1 mismatch.
                                         _en2a = self.extranonce2_size.get("A")
                                         _en2b = self.extranonce2_size.get("B")
                                         _en2_mismatch = (_en2a is not None and _en2b is not None
@@ -2444,23 +2599,12 @@ class ProxySession:
                                             try:
                                                 _peer2 = self.miner_w.get_extra_info("peername")
                                                 if _peer2 and not dpmp_fleet.en2_is_pinned(_peer2[0]):
-                                                    dpmp_fleet.en2_force_pin(_peer2[0])
                                                     _pin_reason = ("en2_size_mismatch" if _en2_mismatch
                                                                    else "extranonce1_mismatch")
-                                                    log("en2_auto_pin_reject_storm", sid=self.sid,
-                                                        miner_ip=_peer2[0], worker=self.worker or "unknown",
-                                                        rejects=self._post_switch_rejects,
-                                                        accepts=self._post_switch_accepts,
-                                                        en1_mismatch_count=self._post_switch_en1_mismatch,
-                                                        en2a=_en2a, en2b=_en2b,
-                                                        pin_reason=_pin_reason,
-                                                        reason="10+ rejects with 0 accepts after switch (via ramp suppress)")
-                                                    _target = "B" if self.active_pool == "A" else "A"
-                                                    dpmp_fleet.en2_set_hint(_peer2[0], _target)
-                                                    log("en2_force_reconnect", sid=self.sid,
-                                                        to_pool=_target, miner_ip=_peer2[0],
-                                                        reason="auto-pin triggered, forcing reconnect to safe pool")
-                                                    self.miner_w.close()
+                                                    await _handle_switch_failure(
+                                                        self, _peer2[0],
+                                                        _pin_reason,
+                                                        "10+ rejects with 0 accepts after switch (via ramp suppress)")
                                             except Exception:
                                                 pass
                                         else:
@@ -2480,39 +2624,31 @@ class ProxySession:
                         # Post-switch reject tracking (for auto-pin detection).
                         # If a miner gets 10+ rejects with zero accepts after a switch,
                         # AND the en2 sizes differ between pools, pin it.
-                        if self.last_switch_mono is not None and p == self.active_pool:
+                        # BUT skip counting during the grace period after a
+                        # switch -- miners need time to flush old work.
+                        _switch_age3 = (time.monotonic() - self.last_switch_mono
+                                        if self.last_switch_mono else 999.0)
+                        if (self.last_switch_mono is not None
+                                and p == self.active_pool
+                                and _switch_age3 >= self._pin_grace_period_s):
                             self._post_switch_rejects += 1
                             _err_raw = msg.get("error")
                             if _is_extranonce_mismatch_reject(_err_raw):
                                 self._post_switch_en1_mismatch += 1
-                            # Early pin: 3+ near-zero rejects (may span sessions)
+                            # Early detection: 3+ near-zero rejects (may span sessions)
                             if (self._post_switch_en1_mismatch >= 3
                                     and self._post_switch_accepts == 0):
                                 try:
                                     _peer = self.miner_w.get_extra_info("peername")
                                     if _peer and not dpmp_fleet.en2_is_pinned(_peer[0]):
-                                        dpmp_fleet.en2_force_pin(_peer[0])
-                                        log("en2_auto_pin_reject_storm", sid=self.sid,
-                                            miner_ip=_peer[0], worker=self.worker or "unknown",
-                                            rejects=self._post_switch_rejects,
-                                            accepts=self._post_switch_accepts,
-                                            en1_mismatch_count=self._post_switch_en1_mismatch,
-                                            en2a=self.extranonce2_size.get("A"),
-                                            en2b=self.extranonce2_size.get("B"),
-                                            pin_reason="extranonce1_mismatch",
-                                            reason="3+ near-zero rejects across sessions")
-                                        _target = "B" if self.active_pool == "A" else "A"
-                                        dpmp_fleet.en2_set_hint(_peer[0], _target)
-                                        log("en2_force_reconnect", sid=self.sid,
-                                            to_pool=_target, miner_ip=_peer[0],
-                                            reason="auto-pin triggered, forcing reconnect to safe pool")
-                                        self.miner_w.close()
+                                        await _handle_switch_failure(
+                                            self, _peer[0],
+                                            "extranonce1_mismatch",
+                                            "3+ near-zero rejects across sessions")
                                 except Exception:
                                     pass
                             elif (self._post_switch_rejects >= 10
                                     and self._post_switch_accepts == 0):
-                                # Auto-pin if en2 sizes differ OR if near-zero
-                                # difficulty rejects indicate extranonce1 mismatch.
                                 _en2a = self.extranonce2_size.get("A")
                                 _en2b = self.extranonce2_size.get("B")
                                 _en2_mismatch = (_en2a is not None and _en2b is not None
@@ -2522,25 +2658,12 @@ class ProxySession:
                                     try:
                                         _peer = self.miner_w.get_extra_info("peername")
                                         if _peer and not dpmp_fleet.en2_is_pinned(_peer[0]):
-                                            dpmp_fleet.en2_force_pin(_peer[0])
                                             _pin_reason = ("en2_size_mismatch" if _en2_mismatch
                                                            else "extranonce1_mismatch")
-                                            log("en2_auto_pin_reject_storm", sid=self.sid,
-                                                miner_ip=_peer[0], worker=self.worker or "unknown",
-                                                rejects=self._post_switch_rejects,
-                                                accepts=self._post_switch_accepts,
-                                                en1_mismatch_count=self._post_switch_en1_mismatch,
-                                                en2a=_en2a, en2b=_en2b,
-                                                pin_reason=_pin_reason,
-                                                reason="10+ rejects with 0 accepts after switch")
-                                            # Force reconnect to the SAFE pool (opposite of reject pool)
-                                            _target = "B" if self.active_pool == "A" else "A"
-                                            dpmp_fleet.en2_set_hint(_peer[0], _target)
-                                            log("en2_force_reconnect", sid=self.sid,
-                                                to_pool=_target, miner_ip=_peer[0],
-                                                reason="auto-pin triggered, forcing reconnect to safe pool")
-                                            self.miner_w.close()
-
+                                            await _handle_switch_failure(
+                                                self, _peer[0],
+                                                _pin_reason,
+                                                "10+ rejects with 0 accepts after switch")
                                     except Exception:
                                         pass
                                 else:
@@ -2905,9 +3028,16 @@ class ProxySession:
                         switch_count=0,
                         last_switch_mono=time.monotonic())
 
-        # Restore carried en1 mismatch count from a previous session
-        self._post_switch_en1_mismatch = dpmp_fleet.en1_mismatch_carry_restore(
-            self.worker or "unknown")
+        # The en1 mismatch carry is no longer needed -- the 5-second grace
+        # period after each switch gives miners time to produce accepted
+        # shares before rejects are counted.  Starting fresh each session
+        # prevents false pin accumulation across sessions.
+        # (Was: self._post_switch_en1_mismatch = dpmp_fleet.en1_mismatch_carry_restore(...))
+        _carried = dpmp_fleet.en1_mismatch_carry_restore(self.worker or "unknown")
+        if _carried > 0:
+            log("en1_mismatch_carry_discarded", sid=self.sid,
+                worker=self.worker or "unknown", carried=_carried,
+                reason="grace period makes carry unnecessary")
 
         log("scheduler_init", sid=self.sid, pool=current_pool,
             worker=self.worker or "unknown", scheduler="v3")
@@ -2973,8 +3103,15 @@ class ProxySession:
             # Read this miner's assignment from the global assigner table.
             # The assigner runs every ~3 seconds and computes optimal fleet
             # placement.  Each miner just executes its assignment.
-            with dpmp_fleet.assignments_lock:
-                _my_assignment = dpmp_fleet.assignments.get(str(self.sid), {})
+            # Use timeout to avoid blocking the event loop if the stats
+            # writer thread holds the lock during _fleet_state_build().
+            if dpmp_fleet.assignments_lock.acquire(timeout=0.2):
+                try:
+                    _my_assignment = dpmp_fleet.assignments.get(str(self.sid), {})
+                finally:
+                    dpmp_fleet.assignments_lock.release()
+            else:
+                _my_assignment = {}  # safe fallback: no assignment = hold current pool
 
             # --- Rolling ratio window gauge (v3 Phase 1a) ---
             _rw_a, _rw_b = dpmp_fleet.get_actual_ratio()
@@ -3000,10 +3137,13 @@ class ProxySession:
                         self._health_last_continuous_credit = now
                         # Keep last_seen fresh so this miner doesn't vanish
                         # from Fleet/Worker Stats during share droughts.
-                        with dpmp_fleet.worker_stats_lock:
-                            ws = dpmp_fleet.worker_stats.get(_wn)
-                            if ws:
-                                ws["last_seen"] = time.time()
+                        if dpmp_fleet.worker_stats_lock.acquire(timeout=0.2):
+                            try:
+                                ws = dpmp_fleet.worker_stats.get(_wn)
+                                if ws:
+                                    ws["last_seen"] = time.time()
+                            finally:
+                                dpmp_fleet.worker_stats_lock.release()
             except Exception as _health_err:
                 log("health_tick_error", sid=self.sid, err=str(_health_err))
 
@@ -3159,6 +3299,14 @@ class ProxySession:
                 pick = current_pool
 
             pick = current_pool
+
+            # Soft-pause: if the GUI has toggled this miner off, skip notify
+            # forwarding.  The miner stays connected but stops getting new work.
+            # Shares from old work are still accepted (handled in submit path).
+            if self.worker and self.worker in get_paused_miners():
+                await asyncio.sleep(0.10)
+                continue
+
             raw = self.latest_notify_raw.get(pick)
             jid = self.latest_jobid.get(pick)
             if raw is not None:
@@ -3372,11 +3520,8 @@ async def handle_miner(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
 
         # Remove miner from fleet tracking (Phase 1c)
         try:
-            # Save en1 mismatch count before unregister clears session data
-            _wname = getattr(sess, "worker", "") or "unknown"
-            _en1_mc = getattr(sess, "_post_switch_en1_mismatch", 0)
-            if _en1_mc > 0:
-                dpmp_fleet.en1_mismatch_carry_save(_wname, _en1_mc)
+            # en1 mismatch carry save disabled -- grace period makes it
+            # unnecessary and carrying caused false pins across sessions.
             dpmp_fleet.fleet_unregister(str(sess.sid))
         except Exception:
             pass
@@ -3386,11 +3531,20 @@ async def handle_miner(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
 
 # Main entry point
 async def main():
-    global WEIGHTS_OVERRIDE_PATH, ORACLE_MODE_PATH
+    global WEIGHTS_OVERRIDE_PATH, ORACLE_MODE_PATH, MINER_PAUSED_PATH
     cfg_path = os.environ.get("DPMP_CONFIG", os.path.join(os.path.dirname(__file__), "config_v2.json"))
 
     WEIGHTS_OVERRIDE_PATH = os.path.join(os.path.dirname(cfg_path), "weights_override.json")
     ORACLE_MODE_PATH = os.path.join(os.path.dirname(cfg_path), "oracle_mode.json")
+    MINER_PAUSED_PATH = os.path.join(os.path.dirname(cfg_path), "miner_paused.json")
+
+    # Reset all miners to "on" on startup by removing the pause file.
+    try:
+        os.remove(MINER_PAUSED_PATH)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
 
     # --- Stats tab: set up file paths and initialize fleet module ---
     _data_dir = os.path.dirname(cfg_path)
@@ -3411,6 +3565,7 @@ async def main():
         fleet_health_path=_fleet_health_path,
         fleet_metrics_path=_fleet_metrics_path,
         scheduler_diag_path=None,  # disabled -- set to _scheduler_diag_path to re-enable
+        get_paused_fn=get_paused_miners,
     )
     dpmp_fleet.load_best_shares()
     dpmp_fleet.load_fleet_health()

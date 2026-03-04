@@ -35,11 +35,12 @@ _log_fn = None              # log(event, **kwargs) from dpmpv2
 _read_weights_fn = None     # read_weight_override() from dpmpv2
 _read_oracle_fn = None      # read_oracle_mode(config_auto_balance) from dpmpv2
 _health_gauge = None        # Prometheus MINER_HEALTH Gauge from dpmpv2
+_get_paused_fn = None       # get_paused_miners() -> set from dpmpv2
 
 
 def init(*, log_fn, read_weights_fn, read_oracle_fn, health_gauge,
          worker_stats_path, best_shares_path, fleet_health_path,
-         fleet_metrics_path, scheduler_diag_path):
+         fleet_metrics_path, scheduler_diag_path, get_paused_fn=None):
     """Wire up external dependencies. Called once from dpmpv2.main().
 
     Args:
@@ -52,14 +53,16 @@ def init(*, log_fn, read_weights_fn, read_oracle_fn, health_gauge,
         fleet_health_path: path to fleet_health.json
         fleet_metrics_path: path to fleet_metrics.json
         scheduler_diag_path: path to scheduler_diag.csv
+        get_paused_fn:     get_paused_miners() -> set of paused worker names
     """
     global _log_fn, _read_weights_fn, _read_oracle_fn, _health_gauge
     global WORKER_STATS_PATH, BEST_SHARES_PATH, FLEET_HEALTH_PATH
-    global FLEET_METRICS_PATH, SCHEDULER_DIAG_PATH
+    global FLEET_METRICS_PATH, SCHEDULER_DIAG_PATH, _get_paused_fn
     _log_fn = log_fn
     _read_weights_fn = read_weights_fn
     _read_oracle_fn = read_oracle_fn
     _health_gauge = health_gauge
+    _get_paused_fn = get_paused_fn
     WORKER_STATS_PATH = worker_stats_path
     BEST_SHARES_PATH = best_shares_path
     FLEET_HEALTH_PATH = fleet_health_path
@@ -823,37 +826,50 @@ def _worker_build_stats_snapshot() -> dict:
     _decay_idle_all(now)
 
     workers = {}
+    # Snapshot worker_stats under lock as quickly as possible, then
+    # do all computation OUTSIDE the lock to minimize contention with
+    # the async event loop (worker_record_share, fleet_update_weight, etc.).
     with worker_stats_lock:
-        for wname, ws in worker_stats.items():
-            sl = ws.get("share_log", [])
-            acc = ws.get("accepted", 0)
-            rej = ws.get("rejected", 0)
-            total = acc + rej
+        ws_snap = {wname: {
+            "share_log": list(ws.get("share_log", [])),
+            "accepted": ws.get("accepted", 0),
+            "rejected": ws.get("rejected", 0),
+            "difficulty": ws.get("difficulty", 0.0),
+            "last_seen": ws.get("last_seen", 0.0),
+        } for wname, ws in worker_stats.items()}
 
-            # Shares per second from 5-minute window
-            cutoff_5m = now - 300
-            shares_in_5m = sum(1 for entry in sl if entry[0] >= cutoff_5m)
-            elapsed_5m = min(300.0, now - sl[0][0]) if sl and sl[0][0] >= cutoff_5m else 300.0
-            sps = shares_in_5m / max(1.0, elapsed_5m) if shares_in_5m > 0 else 0.0
+    with _best_shares_lock:
+        best_snap = dict(_best_shares)
 
-            # Read hashrate from ckpool-style decay state
-            hr_1m, hr_5m, hr_60m, hr_24h = _decay_get_hashrates(wname)
+    for wname, ws in ws_snap.items():
+        sl = ws["share_log"]
+        acc = ws["accepted"]
+        rej = ws["rejected"]
+        total = acc + rej
 
-            with _best_shares_lock:
-                best = _best_shares.get(wname, 0.0)
+        # Shares per second from 5-minute window
+        cutoff_5m = now - 300
+        shares_in_5m = sum(1 for entry in sl if entry[0] >= cutoff_5m)
+        elapsed_5m = min(300.0, now - sl[0][0]) if sl and sl[0][0] >= cutoff_5m else 300.0
+        sps = shares_in_5m / max(1.0, elapsed_5m) if shares_in_5m > 0 else 0.0
 
-            workers[wname] = {
-                "hr_5m": round(hr_5m, 2),
-                "hr_60m": round(hr_60m, 2),
-                "hr_24h": round(hr_24h, 2),
-                "sps": round(sps, 4),
-                "diff": ws.get("difficulty", 0.0),
-                "shares": acc,
-                "best": best,
-                "rejected": rej,
-                "rej_pct": round(rej / total * 100, 2) if total > 0 else 0.0,
-                "last_seen": ws.get("last_seen", 0.0),
-            }
+        # Read hashrate from ckpool-style decay state
+        hr_1m, hr_5m, hr_60m, hr_24h = _decay_get_hashrates(wname)
+
+        best = best_snap.get(wname, 0.0)
+
+        workers[wname] = {
+            "hr_5m": round(hr_5m, 2),
+            "hr_60m": round(hr_60m, 2),
+            "hr_24h": round(hr_24h, 2),
+            "sps": round(sps, 4),
+            "diff": ws["difficulty"],
+            "shares": acc,
+            "best": best,
+            "rejected": rej,
+            "rej_pct": round(rej / total * 100, 2) if total > 0 else 0.0,
+            "last_seen": ws["last_seen"],
+        }
 
     return {
         "workers": workers,
@@ -1273,6 +1289,49 @@ assignments: dict[str, dict] = {}
 # }
 
 
+def _snap_assignments() -> dict:
+    """Return a shallow copy of the assignments dict, holding the lock briefly.
+
+    This is the ONLY way assigner_loop should read assignments.
+    Uses a timeout to prevent blocking the asyncio event loop indefinitely
+    if the stats-writer thread holds assignments_lock during a slow
+    _fleet_state_build() cycle.  Returns an empty dict on timeout rather
+    than freezing the event loop.
+    """
+    if assignments_lock.acquire(timeout=0.5):
+        try:
+            return dict(assignments)
+        finally:
+            assignments_lock.release()
+    else:
+        log("assignments_lock_timeout", caller="_snap_assignments",
+            reason="could not acquire lock within 0.5s, returning empty snapshot")
+        return {}
+
+
+def _put_assignments(new: dict, clear_first: bool = True) -> None:
+    """Write to the global assignments dict, holding the lock briefly.
+
+    This is the ONLY way assigner_loop should write assignments.
+    Uses a timeout to prevent blocking the asyncio event loop.
+
+    Args:
+        new:          The new assignments dict to write.
+        clear_first:  If True, clear existing entries before writing.
+                      If False, merge (update) into existing entries.
+    """
+    if assignments_lock.acquire(timeout=0.5):
+        try:
+            if clear_first:
+                assignments.clear()
+            assignments.update(new)
+        finally:
+            assignments_lock.release()
+    else:
+        log("assignments_lock_timeout", caller="_put_assignments",
+            reason="could not acquire lock within 0.5s, skipping write")
+
+
 
 def _fleet_state_build() -> dict:
     """Build a snapshot of the entire fleet state.
@@ -1333,8 +1392,26 @@ def _fleet_state_build() -> dict:
     with assignments_lock:
         assignments_snap = dict(assignments)
 
+    # Snapshot worker_stats ONCE before the loop to minimize lock
+    # contention with the async event loop.
+    with worker_stats_lock:
+        ws_snap = {}
+        for wn, ws in worker_stats.items():
+            ws_snap[wn] = {
+                "accepted": ws.get("accepted", 0),
+                "diff_sum": ws.get("diff_sum", 0.0),
+                "last_seen": ws.get("last_seen", 0.0),
+                "share_log": list(ws.get("share_log", [])),
+            }
+
     for sid_str, pool in fleet_snapshot.items():
         worker_name = sid_worker_snap.get(sid_str, "unknown")
+
+        # Paused miners are completely excluded from fleet state --
+        # they vanish from the Fleet table as if they don't exist.
+        if _get_paused_fn and worker_name:
+            if worker_name in _get_paused_fn():
+                continue
 
         # Hashrate from ckpool-style exponential decay (5-minute EWMA).
         # Falls back to raw share_log calculation if decay state not yet
@@ -1343,12 +1420,11 @@ def _fleet_state_build() -> dict:
         shares_total = 0
         diff_sum = 0.0
         _last_seen = 0.0
-        with worker_stats_lock:
-            ws = worker_stats.get(worker_name)
-            if ws:
-                shares_total = ws.get("accepted", 0)
-                diff_sum = ws.get("diff_sum", 0.0)
-                _last_seen = ws.get("last_seen", 0.0)
+        ws = ws_snap.get(worker_name)
+        if ws:
+            shares_total = ws.get("accepted", 0)
+            diff_sum = ws.get("diff_sum", 0.0)
+            _last_seen = ws.get("last_seen", 0.0)
 
         # Read smoothed hashrate from decay state (updated on every share)
         _, hr_5m, _, _ = _decay_get_hashrates(worker_name)
@@ -1370,7 +1446,7 @@ def _fleet_state_build() -> dict:
         # Health from _fleet_health
         health = _health_get(worker_name)
 
-        # Can this miner switch pools?  False if en2-pinned.
+        # Can this miner switch pools?  False if en2-pinned or soft-paused.
         can_switch = True
         try:
             # Extract IP from sid_str like "('192.168.0.55', 56208)"
@@ -1379,6 +1455,10 @@ def _fleet_state_build() -> dict:
                 can_switch = False
         except Exception:
             pass
+        # Soft-paused miners (toggled off in GUI) should not be switched
+        if can_switch and _get_paused_fn and worker_name:
+            if worker_name in _get_paused_fn():
+                can_switch = False
 
         # Mode from global assigner (static or time_slice)
         mode = assignments_snap.get(sid_str, {}).get("mode", "static")
@@ -1606,6 +1686,23 @@ def _compute_assignments(fleet: dict, min_slice_s: float) -> dict:
     if not miners_data:
         return assignments
 
+    # Identify paused miners -- they get a static assignment on their
+    # current pool but are excluded from all ratio/hashrate calculations.
+    _paused = _get_paused_fn() if _get_paused_fn else set()
+    active_miners = {}
+    for sid_str, m in miners_data.items():
+        wname = m.get("worker_name", "")
+        if wname and wname in _paused:
+            assignments[sid_str] = {
+                "mode": "static",
+                "pool": m.get("current_pool", "A"),
+            }
+        else:
+            active_miners[sid_str] = m
+
+    if not active_miners:
+        return assignments
+
     # Determine minority pool (the one wanting less hashrate)
     if target_a <= target_b:
         minority_pool = "A"
@@ -1616,26 +1713,12 @@ def _compute_assignments(fleet: dict, min_slice_s: float) -> dict:
         majority_pool = "A"
         minority_frac = target_b
 
-    # Total fleet hashrate
-    total_ths = sum(m.get("hashrate_ths", 0.0) for m in miners_data.values())
+    # Total fleet hashrate (active miners only, excludes paused)
+    total_ths = sum(m.get("hashrate_ths", 0.0) for m in active_miners.values())
     if total_ths <= 0:
         # No hashrate data yet -- assign all miners static to majority pool
-        for sid_str in miners_data:
+        for sid_str in active_miners:
             assignments[sid_str] = {"mode": "static", "pool": majority_pool}
-        return assignments
-
-    # Startup stability guard: if the dominant miner doesn't have reliable
-    # hashrate data yet (e.g., less than 1 TH/s when it should be 80 TH/s),
-    # the bin-packing algorithm will make wildly wrong placements.
-    # Wait until the largest miner has at least 5 TH/s before making
-    # fleet-wide decisions.  Until then, hold each miner on its current pool.
-    max_hr = max(m.get("hashrate_ths", 0.0) for m in miners_data.values())
-    if max_hr < 5.0 and len(miners_data) > 1:
-        for sid_str, m in miners_data.items():
-            assignments[sid_str] = {
-                "mode": "static",
-                "pool": m.get("current_pool", majority_pool),
-            }
         return assignments
 
     # How much hashrate the minority pool needs
@@ -1645,7 +1728,7 @@ def _compute_assignments(fleet: dict, min_slice_s: float) -> dict:
     switchable = []   # (sid_str, hashrate_ths, health)
     pinned = []       # (sid_str, current_pool)
 
-    for sid_str, m in miners_data.items():
+    for sid_str, m in active_miners.items():
         hr = m.get("hashrate_ths", 0.0)
         if not m.get("can_switch", True):
             pinned.append((sid_str, m.get("current_pool", majority_pool)))
@@ -1658,7 +1741,7 @@ def _compute_assignments(fleet: dict, min_slice_s: float) -> dict:
     for sid_str, pool in pinned:
         assignments[sid_str] = {"mode": "static", "pool": pool}
         if pool == minority_pool:
-            hr = miners_data[sid_str].get("hashrate_ths", 0.0)
+            hr = active_miners[sid_str].get("hashrate_ths", 0.0)
             pinned_minority_ths += hr
 
     # Remaining deficit after pinned miners
@@ -1760,8 +1843,8 @@ def _compute_assignments(fleet: dict, min_slice_s: float) -> dict:
                 best_sid = sid_str
 
         if best_sid is not None:
-            slicer_hr = miners_data[best_sid].get("hashrate_ths", 1.0)
-            slicer_health = miners_data[best_sid].get("health", 1.0)
+            slicer_hr = active_miners[best_sid].get("hashrate_ths", 1.0)
+            slicer_health = active_miners[best_sid].get("health", 1.0)
 
             # What fraction of time should the slicer spend on minority pool?
             slice_frac = min(1.0, max(0.0, remaining_deficit / slicer_hr))
@@ -1811,10 +1894,10 @@ def _compute_assignments(fleet: dict, min_slice_s: float) -> dict:
             slicer_hr_covered = 0.0
             for s, a in assignments.items():
                 if a.get("mode") == "time_slice":
-                    shr = miners_data.get(s, {}).get("hashrate_ths", 0.0)
+                    shr = active_miners.get(s, {}).get("hashrate_ths", 0.0)
                     slicer_hr_covered += shr * a.get("slice_frac", 0.0)
             total_static_minority = sum(
-                miners_data.get(s, {}).get("hashrate_ths", 0.0)
+                active_miners.get(s, {}).get("hashrate_ths", 0.0)
                 for s, a in assignments.items()
                 if a.get("mode") == "static" and a.get("pool") == minority_pool
             )
@@ -1895,8 +1978,17 @@ async def assigner_loop(cfg):
 
     while True:
         try:
-            # Build fresh fleet state
-            state = _fleet_state_build()
+            # Yield to the event loop before doing any lock-acquiring work.
+            # This ensures pending miner I/O is processed even if the
+            # assigner cycle involves brief blocking lock acquisitions.
+            await asyncio.sleep(0)
+
+            # Build fresh fleet state in a thread pool executor so that
+            # the threading.Lock acquisitions inside _fleet_state_build()
+            # cannot block the asyncio event loop.  This is the primary
+            # fix for the intermittent deadlock-on-restart issue.
+            loop = asyncio.get_running_loop()
+            state = await loop.run_in_executor(None, _fleet_state_build)
             miners = state.get("miners", {})
 
             if not miners:
@@ -1940,10 +2032,12 @@ async def assigner_loop(cfg):
                         target_A=round(target.get("A", 0.5), 4))
                 # Also recompute if we don't have a slicer but need one
                 # (e.g. all static when ratio requires time-slicing)
-                with assignments_lock:
-                    _has_slicer = any(
-                        a.get("mode") == "time_slice"
-                        for a in assignments.values())
+                # NOTE: use _snap_assignments() to avoid blocking the event
+                # loop on the threading.Lock (see deadlock fix comments).
+                _assign_snap = _snap_assignments()
+                _has_slicer = any(
+                    a.get("mode") == "time_slice"
+                    for a in _assign_snap.values())
                 if not _has_slicer and abs(_curr_target[0] - 0.5) > 0.03:
                     _deviation_recompute = True
 
@@ -1966,9 +2060,7 @@ async def assigner_loop(cfg):
                 new_assignments = _compute_assignments(state, min_slice)
 
                 # Write to global table
-                with assignments_lock:
-                    assignments.clear()
-                    assignments.update(new_assignments)
+                _put_assignments(new_assignments)
 
                 _prev_target = _curr_target
                 _prev_miner_set = _curr_miner_set
@@ -2027,8 +2119,7 @@ async def assigner_loop(cfg):
                     await asyncio.sleep(interval)
                     continue
 
-                with assignments_lock:
-                    _current = dict(assignments)
+                _current = _snap_assignments()
 
                 _updated = False
                 for sid_str, a in _current.items():
@@ -2082,8 +2173,7 @@ async def assigner_loop(cfg):
                         _updated = True
 
                 if _updated:
-                    with assignments_lock:
-                        assignments.update(_current)
+                    _put_assignments(_current, clear_first=False)
                     # Log the duration update
                     _parts = []
                     for sid_str, a in sorted(_current.items()):
@@ -2100,8 +2190,7 @@ async def assigner_loop(cfg):
 
             # Write scheduler diagnostic snapshot (self-throttles to every 10s)
             try:
-                with assignments_lock:
-                    _diag_assignments = dict(assignments)
+                _diag_assignments = _snap_assignments()
                 _write_scheduler_diag(state, _diag_assignments)
             except Exception:
                 pass
@@ -2235,6 +2324,85 @@ def en2_is_pinned(miner_ip: str) -> bool:
         True if the miner is in the en2_force_disconnect set.
     """
     return miner_ip in _en2_force_disconnect
+    #return False #TEMP: disble pinning for testing
+
+
+# ---------------------------------------------------------------------------
+# Force-reconnect switch: try a clean reconnect before resorting to pinning.
+# ---------------------------------------------------------------------------
+# When a miner fails set_extranonce (en1 mismatch rejects detected), we
+# first try forcing a reconnect so the miner gets the new pool's en1 via
+# a fresh subscribe handshake.  Only if the miner fails AGAIN after the
+# reconnect do we escalate to a permanent pin.
+#
+# _reconnect_switch_attempts tracks how many times we have tried the
+# reconnect-switch approach for each miner IP.  When the count reaches
+# _RECONNECT_SWITCH_MAX_ATTEMPTS, the next failure triggers a pin.
+#
+# _reconnect_switch_last_pool tracks which pool the last reconnect-switch
+# was targeting, so we can tell if the miner failed on the same target.
+
+_reconnect_switch_attempts: dict[str, int] = {}
+_reconnect_switch_last_pool: dict[str, str] = {}
+_RECONNECT_SWITCH_MAX_ATTEMPTS = 3  # try reconnect once, pin on second failure (was 1)
+
+
+def reconnect_switch_should_pin(miner_ip: str, target_pool: str) -> bool:
+    """Check whether we should pin this miner or try a reconnect-switch.
+
+    Returns True if we have already exhausted reconnect-switch attempts
+    for this miner targeting this pool, meaning the next step is to pin.
+    Returns False if we should try a reconnect-switch first.
+
+    Args:
+        miner_ip:    The miner's IP address string.
+        target_pool: "A" or "B" -- the pool we are trying to switch to.
+    """
+    attempts = _reconnect_switch_attempts.get(miner_ip, 0)
+    last_pool = _reconnect_switch_last_pool.get(miner_ip)
+    # If target pool changed since last attempt, reset the counter --
+    # the miner might work fine switching in the other direction.
+    if last_pool is not None and last_pool != target_pool:
+        _reconnect_switch_attempts[miner_ip] = 0
+        return False
+    return attempts >= _RECONNECT_SWITCH_MAX_ATTEMPTS
+
+
+def reconnect_switch_record_attempt(miner_ip: str, target_pool: str) -> None:
+    """Record that we are attempting a reconnect-switch for this miner.
+
+    Called just before closing the miner connection to force a reconnect.
+
+    Args:
+        miner_ip:    The miner's IP address string.
+        target_pool: "A" or "B" -- the pool we are reconnecting toward.
+    """
+    _reconnect_switch_attempts[miner_ip] = (
+        _reconnect_switch_attempts.get(miner_ip, 0) + 1
+    )
+    _reconnect_switch_last_pool[miner_ip] = target_pool
+    log("reconnect_switch_attempt", miner_ip=miner_ip,
+        target_pool=target_pool,
+        attempts=_reconnect_switch_attempts[miner_ip],
+        max_attempts=_RECONNECT_SWITCH_MAX_ATTEMPTS)
+
+
+def reconnect_switch_clear(miner_ip: str) -> None:
+    """Clear reconnect-switch tracking for a miner (successful switch).
+
+    Called when a miner produces accepted shares after a pool switch,
+    proving it can handle pool changes (at least via reconnect).
+
+    Args:
+        miner_ip: The miner's IP address string.
+    """
+    if miner_ip in _reconnect_switch_attempts:
+        prev = _reconnect_switch_attempts.pop(miner_ip, 0)
+        _reconnect_switch_last_pool.pop(miner_ip, None)
+        if prev > 0:
+            log("reconnect_switch_cleared", miner_ip=miner_ip,
+                previous_attempts=prev,
+                reason="miner accepted shares after pool switch")
 
 
 def next_pool_round_robin() -> str:

@@ -29,6 +29,7 @@ ORACLE_CHART_HISTORY_PATH = os.path.join(os.path.dirname(os.environ.get("DPMP_CO
 ORACLE_MODE_PATH = os.path.join(os.path.dirname(os.environ.get("DPMP_CONFIG_PATH", os.path.expanduser("~/dpmp/dpmp/config_v2.json"))), "oracle_mode.json")
 WORKER_STATS_PATH = os.path.join(os.path.dirname(os.environ.get("DPMP_CONFIG_PATH", os.path.expanduser("~/dpmp/dpmp/config_v2.json"))), "worker_stats.json")
 FLEET_METRICS_PATH = os.path.join(os.path.dirname(os.environ.get("DPMP_CONFIG_PATH", os.path.expanduser("~/dpmp/dpmp/config_v2.json"))), "fleet_metrics.json")
+MINER_PAUSED_PATH = os.path.join(os.path.dirname(os.environ.get("DPMP_CONFIG_PATH", os.path.expanduser("~/dpmp/dpmp/config_v2.json"))), "miner_paused.json")
 HOST = os.environ.get("NICEGUI_HOST", "0.0.0.0")
 PORT = int(os.environ.get("NICEGUI_PORT", "8845"))
 POLL_S = float(os.environ.get("NICEGUI_POLL_S", "2.0"))
@@ -390,6 +391,22 @@ def delete_oracle_mode() -> None:
         pass
     except Exception:
         pass
+
+# miner_paused.json helpers (soft-pause individual miners from GUI)
+def read_paused_miners() -> list:
+    """Read miner_paused.json. Returns a list of paused worker names, or [] on error."""
+    try:
+        with open(MINER_PAUSED_PATH, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return list(obj.get("paused", []))
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []
+
+def write_paused_miners(paused_list: list) -> None:
+    """Write miner_paused.json with the current list of paused worker names."""
+    write_json_atomic(MINER_PAUSED_PATH, {"paused": paused_list})
 
 # write JSON file atomically
 def write_json_atomic(path: str, obj: Dict[str, Any]) -> None:
@@ -1663,6 +1680,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             ("rejected", "Rej",     "num", lambda v: f"{v:,}"),
             ("rej_pct",  "Rej%",    "num", lambda v: f"{v:.1f}%"),
             ("ago",      "Seen",    "num", None),  # special: computed from last_seen
+            ("toggle",   "",        "",    None),  # special: on/off toggle button
         ]
 
         # ---- Pool table column definitions ----
@@ -1718,6 +1736,27 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
         _bridge_miner_id = _sort_bridge_miner.id
         _bridge_pool_id = _sort_bridge_pool.id
         _bridge_fleet_id = _sort_bridge_fleet.id
+
+        # Hidden bridge for miner on/off toggle clicks (same pattern as sort bridges)
+        _toggle_bridge = ui.input("").style("display:none").props("dense")
+        _bridge_toggle_id = _toggle_bridge.id
+
+        # In-memory set of paused worker names; seeded from miner_paused.json
+        _paused_miners = set(read_paused_miners())
+
+        def _on_toggle_click(e):
+            """Toggle a miner's paused state when the on/off button is clicked."""
+            worker = e.args if isinstance(e.args, str) else ""
+            if not worker:
+                return
+            if worker in _paused_miners:
+                _paused_miners.discard(worker)
+            else:
+                _paused_miners.add(worker)
+            write_paused_miners(sorted(_paused_miners))
+            update_stats()
+
+        _toggle_bridge.on("toggle_miner", _on_toggle_click)
 
         def _on_miner_header_click(e):
             val = e.args if isinstance(e.args, str) else (e.args or {}).get("key", "")
@@ -1782,8 +1821,11 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                 row_data = []
                 for name, data in workers.items():
                     last_seen = data.get("last_seen", 0)
-                    if last_seen <= 0 or (now - last_seen) >= stale_cutoff:
-                        continue
+                    # Paused miners stay in the table indefinitely so the
+                    # toggle button remains accessible to turn them back on.
+                    if name not in _paused_miners:
+                        if last_seen <= 0 or (now - last_seen) >= stale_cutoff:
+                            continue
                     ago = now - last_seen
                     row = {
                         "name": name,
@@ -1809,6 +1851,10 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                     # Build header
                     hdr = ""
                     for key, label, css, _ in _miner_cols:
+                        if key == "toggle":
+                            # Toggle column: no sort, no arrow, just empty header
+                            hdr += '<th style="text-align:center;width:50px"></th>'
+                            continue
                         sc = " sorted" if _miner_sort["key"] == key else ""
                         cls = f'class="{css}{sc}"' if (css or sc) else ""
                         arrow = _sort_arrow(_miner_sort, key)
@@ -1818,20 +1864,47 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                     rows_html = ""
                     for r in row_data:
                         cells = ""
+                        wname = r["name"]
+                        is_paused = wname in _paused_miners
                         for key, _, css, fmt_fn in _miner_cols:
+                            if key == "toggle":
+                                # Render on/off toggle button
+                                if is_paused:
+                                    bg = "rgba(120,120,120,0.35)"
+                                    clr = "#999"
+                                    lbl = "OFF"
+                                else:
+                                    bg = "rgba(34,197,94,0.25)"
+                                    clr = "#22c55e"
+                                    lbl = "ON"
+                                btn = (
+                                    f'<span data-toggle="{wname}" '
+                                    f'style="cursor:pointer;padding:2px 8px;border-radius:4px;'
+                                    f'font-size:0.7rem;font-weight:600;'
+                                    f'background:{bg};color:{clr};user-select:none">'
+                                    f'{lbl}</span>'
+                                )
+                                cells += f'<td style="text-align:center">{btn}</td>'
+                                continue
                             val = r[key]
                             cls = f' class="{css}"' if css else ""
                             if key == "name":
-                                cells += f"<td{cls}>{val}</td>"
+                                # Dim the worker name if paused
+                                op = ' style="opacity:0.45"' if is_paused else ""
+                                cells += f"<td{cls}{op}>{val}</td>"
                             elif key == "rejected":
                                 hc = "#f59e0b"
-                                cells += f'<td{cls} style="color:{hc}">{val}</td>'
+                                op = ";opacity:0.45" if is_paused else ""
+                                cells += f'<td{cls} style="color:{hc}{op}">{val}</td>'
                             elif key == "ago":
-                                cells += f'<td{cls}>{_fmt_ago(val)}</td>'
+                                op = ' style="opacity:0.45"' if is_paused else ""
+                                cells += f'<td{cls}{op}>{_fmt_ago(val)}</td>'
                             elif fmt_fn:
-                                cells += f"<td{cls}>{fmt_fn(val)}</td>"
+                                op = ' style="opacity:0.45"' if is_paused else ""
+                                cells += f"<td{cls}{op}>{fmt_fn(val)}</td>"
                             else:
-                                cells += f"<td{cls}>{val}</td>"
+                                op = ' style="opacity:0.45"' if is_paused else ""
+                                cells += f"<td{cls}{op}>{val}</td>"
                         rows_html += f"<tr>{cells}</tr>"
 
                     # Build totals row (sums for most columns, max for best, blank for rej%/seen/worker)
@@ -1841,7 +1914,9 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                         tot_cells = ""
                         for key, _, css, fmt_fn in _miner_cols:
                             cls = f' class="{css}"' if css else ""
-                            if key == "name":
+                            if key == "toggle":
+                                tot_cells += f"<td{tot_style}></td>"
+                            elif key == "name":
                                 tot_cells += f"<td{tot_style}>Total</td>"
                             elif key in ("rej_pct", "ago"):
                                 tot_cells += f"<td{cls}{tot_style}>--</td>"
@@ -2066,16 +2141,25 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
         <script>
         document.addEventListener('click', function(e) {{
             var th = e.target.closest('th[data-sort]');
-            if (!th) return;
-            var key = th.getAttribute('data-sort');
-            var table = th.getAttribute('data-table');
-            if (!key || !table) return;
-            var eid;
-            if (table === 'miner') eid = {_bridge_miner_id};
-            else if (table === 'pool') eid = {_bridge_pool_id};
-            else if (table === 'fleet') eid = {_bridge_fleet_id};
-            else return;
-            getElement(eid).$emit('sort_click', key);
+            if (th) {{
+                var key = th.getAttribute('data-sort');
+                var table = th.getAttribute('data-table');
+                if (!key || !table) return;
+                var eid;
+                if (table === 'miner') eid = {_bridge_miner_id};
+                else if (table === 'pool') eid = {_bridge_pool_id};
+                else if (table === 'fleet') eid = {_bridge_fleet_id};
+                else return;
+                getElement(eid).$emit('sort_click', key);
+                return;
+            }}
+            var tog = e.target.closest('[data-toggle]');
+            if (tog) {{
+                var worker = tog.getAttribute('data-toggle');
+                if (worker) {{
+                    getElement({_bridge_toggle_id}).$emit('toggle_miner', worker);
+                }}
+            }}
         }});
         </script>
         """
@@ -2121,6 +2205,37 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             metrics_host    = ui.input("Host").classes("w-64")
             metrics_port    = ui.number("Port", precision=0).props("step=1 min=1 max=65535").classes("w-64")
             metrics_enabled = ui.checkbox("Enabled")
+
+        # Swap A/B button -- swaps Pool A and Pool B field values in the GUI.
+        # Does NOT write to config or restart; user must click Apply+Restart.
+        def _swap_pools():
+            """Swap all Pool A and Pool B field values in the Config tab."""
+            # Read current values
+            a_host, b_host = poolA_host.value, poolB_host.value
+            a_name, b_name = poolA_name.value, poolB_name.value
+            a_port, b_port = poolA_port.value, poolB_port.value
+            a_wallet, b_wallet = poolA_wallet.value, poolB_wallet.value
+            a_chain, b_chain = poolA_chain.value, poolB_chain.value
+            a_dmin, b_dmin = dd_poolA_min.value, dd_poolB_min.value
+            # Swap
+            poolA_host.set_value(b_host)
+            poolB_host.set_value(a_host)
+            poolA_name.set_value(b_name)
+            poolB_name.set_value(a_name)
+            poolA_port.set_value(b_port)
+            poolB_port.set_value(a_port)
+            poolA_wallet.set_value(b_wallet)
+            poolB_wallet.set_value(a_wallet)
+            poolA_chain.set_value(b_chain)
+            poolB_chain.set_value(a_chain)
+            dd_poolA_min.set_value(b_dmin)
+            dd_poolB_min.set_value(a_dmin)
+            ui.notify("Pool A and Pool B settings swapped. Review and click Apply + Restart when ready.", type="info")
+
+        ui.button("Swap Pool A / Pool B", icon="swap_horiz", on_click=_swap_pools).props(
+            "flat dense no-caps"
+        ).classes("text-sm").style("color: #6E93D6").tooltip(
+            "Swap all Pool A and Pool B settings. Does not apply changes -- you must click Apply + Restart.")
 
         # Pool A
         with ui.expansion("Pool A Settings:", icon="settings").classes("w-full").tooltip("Settings for Pool A"):

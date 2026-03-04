@@ -7,7 +7,8 @@
     across compatible coins/pools (i.e., BTC/BCH/DGB). Some miners, like the NerdQAxe++, have a built-in "dual pool
     mining" feature but the majority of miners out there do not.
 </p>
-<p dir="auto">So if you have one or more miners that do NOT have a built-in dual-pool mining feature (such as the Canaan Avalon Q
+<p dir="auto">So if you have one or more miners that do NOT have a built-in dual-pool mining feature (such as the Canaan
+    Avalon Q
     or the Nano3S) and you would like, for example, to mine to a BTC pool and a Bitcoin Cash pool simultaneously, then
     <strong>DPMP</strong> is for you.&nbsp;
 </p>
@@ -35,29 +36,31 @@
     or aware that <strong>DPMP</strong> is in the middle.</p>
 <p dir="auto">Please visit the <strong>DPMP</strong> landing page at: <a href="https://ckryza.github.io/dpmpv2/"
         target="_blank" rel="noopener noreferrer"><b>https://ckryza.github.io/dpmpv2/</b></a>.</p>
-
-
-
 <hr />
 <h4>Fleet-Aware Scheduling</h4>
-<p dir="auto"><strong>DPMP</strong>'s scheduler uses a fleet-aware assignment strategy that evaluates each miner's hashrate, health
+<p dir="auto"><strong>DPMP</strong>'s scheduler uses a fleet-aware assignment strategy that evaluates each miner's
+    hashrate, health
     score, and firmware capabilities to determine the optimal role for every miner in the fleet. Rather than switching
     all miners simultaneously between pools — which causes dramatic ratio oscillations, reject storms, and unnecessary
     wear on sensitive devices — the scheduler divides the fleet into Static and Dynamic categories.</p>
-<p dir="auto">Small miners are assigned statically to whichever pool needs their hashrate to meet the target weight ratio, where
+<p dir="auto">Small miners are assigned statically to whichever pool needs their hashrate to meet the target weight
+    ratio, where
     they mine continuously without ever switching. Only the minimum number of miners necessary are designated as Dynamic
     time-slicers, and these are chosen based on hashrate fit and health score to ensure the most capable and reliable
     miners handle the switching workload.</p>
-<p dir="auto">This approach eliminates the "herding behavior" of the original implementation, where the entire fleet would stampede
+<p dir="auto">This approach eliminates the "herding behavior" of the original implementation, where the entire fleet
+    would stampede
     from one pool to the other and back again, producing wild swings in the actual ratio and floods of rejected shares.
     Instead, the target ratio is maintained smoothly by one or two Dynamic miners alternating between pools on
     calculated time intervals, while the rest of the fleet mines undisturbed.</p>
-<p dir="auto">The result is faster convergence to the target weights, dramatically lower fleet-wide reject rates, and graceful
+<p dir="auto">The result is faster convergence to the target weights, dramatically lower fleet-wide reject rates, and
+    graceful
     handling of mixed fleets containing miners with varying capabilities and firmware quirks.</p>
 <hr />
 
 <h4>Pool Compatibility and Miner Protection</h4>
-<p dir="auto"><strong>DPMP</strong> presents itself as a ckpool-compatible Stratum v1 proxy to all connected miners, regardless of
+<p dir="auto"><strong>DPMP</strong> presents itself as a ckpool-compatible Stratum v1 proxy to all connected miners,
+    regardless of
     what upstream pool types are configured. This means your miners see a single, consistent mining endpoint — they
     never need to know that Pool A might be running MiningCore while Pool B runs Bassin (ckpool). Behind the scenes,
     <strong>DPMP</strong> handles the translation between different pool behaviors, including differences in difficulty
@@ -65,7 +68,8 @@
     independent connection to both upstream pools through <strong>DPMP</strong>, and the scheduler seamlessly routes
     work and shares to the correct pool based on the current allocation weights.
 </p>
-<p dir="auto">From the miner's perspective, it is simply connected to one stable pool that occasionally sends new work — exactly as
+<p dir="auto">From the miner's perspective, it is simply connected to one stable pool that occasionally sends new work —
+    exactly as
     a direct ckpool-type connection would behave.</p>
 
 <hr />
@@ -74,10 +78,12 @@
 <p dir="auto">Some miners cannot handle mid-session changes to
     their extranonce parameters, which is required when switching between pools that use different extranonce sizes (for
     example, a 4-byte pool and an 8-byte pool).</p>
-<p dir="auto">When <strong>DPMP</strong> detects this incompatibility, it adapts automatically. On the first pool switch attempt,
+<p dir="auto">When <strong>DPMP</strong> detects this incompatibility, it adapts automatically. On the first pool switch
+    attempt,
     if a miner accumulates 10 or more consecutive rejected shares with zero accepts, <strong>DPMP</strong> flags that
     miner's IP as extranonce-sensitive and immediately reconnects it back to its original pool.</p>
-<p dir="auto">On all subsequent switch attempts, rather than trying to change the extranonce mid-session (which the miner would
+<p dir="auto">On all subsequent switch attempts, rather than trying to change the extranonce mid-session (which the
+    miner would
     ignore, producing invalid shares), <strong>DPMP</strong> gracefully closes the miner's connection and sets a
     handshake hint pointing to the target pool. The miner reconnects within about one second, performs a fresh handshake
     directly with the new pool, and begins mining immediately with the correct parameters — no rejected shares, no
@@ -88,7 +94,8 @@
 
 <hr />
 <h4>Dynamic Miner Reject Rates and Pool Switching</h4>
-<p dir="auto">Miners assigned to the "Dynamic" (time_slice) category will typically show a higher reject rate in their individual
+<p dir="auto">Miners assigned to the "Dynamic" (time_slice) category will typically show a higher reject rate in their
+    individual
     dashboards compared to statically-assigned miners. This is a normal and expected side effect of how
     <strong>DPMP</strong> operates. When a Dynamic miner receives a pool switch command, it must flush its internal work
     pipeline — any shares it has already computed but not yet submitted were built using the previous pool's job data,
@@ -96,25 +103,30 @@
     because the new pool has no knowledge of the old pool's work templates. The new pool will reject these stale shares
     as invalid, even though the miner performed legitimate work.
 </p>
-<p dir="auto">From the miner's perspective, it did everything correctly; the rejects are simply a consequence of the pool context
+<p dir="auto">From the miner's perspective, it did everything correctly; the rejects are simply a consequence of the
+    pool context
     changing underneath it. <strong>DPMP</strong> mitigates this by suppressing many of these transient rejects
     internally — intercepting them before they reach the miner and returning fake "accepted" responses — but a small
     number may still pass through during the brief transition window.</p>
-<p dir="auto">Importantly, these rejects do not represent lost hashrate or wasted electricity in any meaningful sense; the miner
+<p dir="auto">Importantly, these rejects do not represent lost hashrate or wasted electricity in any meaningful sense;
+    the miner
     immediately begins productive work on the new pool within one to two seconds of the switch.</p>
 
 <hr />
 <h4>The Relationship Between Slice Duration and Reject Rate</h4>
-<p dir="auto">There is a direct inverse relationship between the "Slice Seconds" configuration value and the reject rate seen on
+<p dir="auto">There is a direct inverse relationship between the "Slice Seconds" configuration value and the reject rate
+    seen on
     Dynamic miners. Each pool switch carries a roughly fixed cost of a few rejected shares during the transition,
     regardless of how long the miner stays on a given pool. If "Slice Seconds"" is set low (for example, 10 seconds),
     the miner switches more frequently, and those fixed-cost rejects accumulate as a larger percentage of total shares
     submitted.</p>
-<p dir="auto">Conversely, a higher "Slice Seconds" (for example, 30 seconds) means fewer switches per hour and a proportionally
+<p dir="auto">Conversely, a higher "Slice Seconds" (for example, 30 seconds) means fewer switches per hour and a
+    proportionally
     lower reject rate, since the miner spends more time doing productive work between each transition. For most
     configurations, a "Slice Seconds" value between 20 and 30 seconds strikes a good balance between responsive weight
     tracking and acceptable reject rates, typically keeping the Dynamic miner's dashboard reject rate below 2-3%.</p>
-<p dir="auto">It is important to keep in mind when configuring <strong>DPMP</strong> that the higher the "Slice Seconds" value, the
+<p dir="auto">It is important to keep in mind when configuring <strong>DPMP</strong> that the higher the "Slice Seconds"
+    value, the
     more stable the miner's performance will be (e.g., lower reject percentage), but it will take longer for the system
     to respond to pool ratio changes. We recommend that you start with a value of 10 for the "Slice Seconds" setting. If
     you see a spike in reject rate on any Dynamic miner, consider increasing the "Slice Seconds" value to 20 or 25 to
@@ -170,6 +182,50 @@
     the network hashrate charts only update if the data points (e.g. short-term and long-term) change. So even though
     the default polling interval is every 10 minutes, the charts may not update on every polling cycle if the network
     hashrate values do not change. If one of the values change, the charts will definitely update.</p>
+
+<hr />
+<h4>Stats Tab</h4>
+
+<p>The Stats tab provides real-time visibility into every aspect of your mining fleet. It is organized into three
+    collapsible sections, each containing a sortable table that updates every five seconds. Click any column header to
+    sort the table by that column, and click again to reverse the sort order.</p>
+
+<h4>Fleet Stats</h4>
+
+<p>The Fleet Stats table gives you a scheduler-level view of your entire fleet. Each connected miner appears as a row
+    showing its current pool assignment (A or B), how long it has been mining on that pool, and whether the scheduler
+    has assigned it as <em>Static</em> (locked to one pool) or <em>Dynamic</em> (actively time-slicing between both
+    pools to achieve the target ratio). The <em>Pinned</em> column indicates whether a miner has been automatically
+    pinned to a single pool due to hardware incompatibility with mid-session pool switching. The <em>Switches</em>
+    column tracks how many times each miner has changed pools since it connected, while <em>Contribution</em> shows each
+    miner's share of total accepted difficulty across the fleet as a percentage. The <em>Health</em> column displays a
+    reliability score from 0.00 to 1.00 that reflects how cleanly each miner handles pool switches over time &mdash; a
+    score of 1.00 indicates no issues, while lower scores mean the miner has experienced rejects or disconnects after
+    switches. A totals row at the bottom summarizes fleet-wide switch counts and confirms that contributions sum to
+    100%.</p>
+
+<h4>Worker Stats</h4>
+
+<p>The Worker Stats table focuses on individual miner performance. Each row shows a miner's estimated hashrate over
+    three rolling windows (5-minute, 60-minute, and 24-hour), its current share submission rate, working difficulty,
+    total accepted shares, best share found, reject count, and reject percentage. The <em>Seen</em> column shows how
+    recently each miner submitted a share, and workers that have not been seen for five minutes are automatically
+    removed from the table. At the far right of each row is an on/off toggle button that allows you to temporarily
+    disable a miner without disconnecting it. When toggled off, the miner remains connected to DPMP but is excluded from
+    scheduling and its shares are silently swallowed (the miner receives fake "accepted" responses so it continues
+    hashing without errors). Toggling a miner back on immediately restores it to normal operation. This is useful for
+    testing, maintenance, or temporarily removing a problematic miner from the fleet without physically accessing the
+    device. The toggle state resets to "on" when <b>DPMP</b> restarts.</p>
+
+<h4>Pool Stats</h4>
+
+<p>The Pool Stats table provides a per-pool summary of connection health and share accounting. Each row represents one
+    of the two configured pools and shows its slot (A or B), detected coin type, the extranonce2 size advertised by the
+    pool, the current ratio of hashrate allocated to that pool, the pool's estimated 5-minute hashrate, and the upstream
+    connection latency. The accepted and rejected share counts reflect cumulative totals since <b>DPMP</b> started, along with
+    the corresponding reject percentage. The <em>Jobs</em> column shows the total number of mining notifications
+    received from each pool, and <em>TotalDiff</em> shows the sum of all accepted share difficulties. Note that accepted
+    and rejected counts may include data from workers that have since disconnected.</p>
 <hr />
 <h4>Pool Failover Protection</h4>
 <p dir="auto"><strong>DPMP</strong> has pool failover protection implemented as follows: if you are splitting work
@@ -222,7 +278,8 @@
 <hr />
 <h4>How Many Miners can DPMP Support</h4>
 
-<p dir="auto">I run my copy of <b>DPMP</b> on a AMD Ryzen 5 3550H with 16GB RAM and a 1TB SSD under umbrelOS 1.5 and this setup
+<p dir="auto">I run my copy of <b>DPMP</b> on a AMD Ryzen 5 3550H with 16GB RAM and a 1TB SSD under umbrelOS 1.5 and
+    this setup
     should easily support up to 50 miners with a hashrate range from 1 to 200TH/s. Now, higher hashrate miners actually
     produce fewer shares per second (pool VarDiff scales up). A 1 PH/s miner at diff 65536 submits roughly 1 share every
     4 seconds. So a farm of 100 x 300 TH/s miners might only generate ~50 shares/sec total, which is very manageable.
@@ -272,7 +329,8 @@
     <li><b>Upstream pool connection limits</b> — Some pools cap connections per IP/wallet. Each miner in <b>DPMP</b>
         creates a separate upstream connection per pool, so 100 miners = 200 upstream connections (100 to Pool A, 100 to
         Pool B). Public pools may throttle this. Self-hosted pools don't have this issue.</li>
-    <li><b>The real scaling path</b> is multiple <b>DPMP</b> instances, each handling a subset of miners. Since <b>DPMP</b> is
+    <li><b>The real scaling path</b> is multiple <b>DPMP</b> instances, each handling a subset of miners. Since
+        <b>DPMP</b> is
         lightweight, you could run 3-4 instances on the same hardware, each on a different port, splitting the fleet.
         This also adds redundancy.</li>
     <li><b>Log volume</b> scales linearly with miners. At 200 miners, the JSON logging can become significant disk I/O,
@@ -294,7 +352,8 @@
     exhaustive list. The log data you provide will help us to expand the list of supported miners and pools.</p>
 
 <hr />
-<p dir="auto">If you would like to support the <b>DPMP</b> project, please consider a donation to either of the following
+<p dir="auto">If you would like to support the <b>DPMP</b> project, please consider a donation to either of the
+    following
     addresses:</p>
 <p dir="auto">Bitcoin (BTC): <strong>bc1q9qrn7lsdnpy8w33dsdnu6cr4jdpg53zexgxh59</strong></p>
 <p dir="auto">Bitcoin Cash (BCH): <strong>bitcoincash:qqlldmmc978u5u7uzas8cakxgfftraquxvjhcc8a3q</strong></p>
