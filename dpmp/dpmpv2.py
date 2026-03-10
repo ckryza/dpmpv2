@@ -309,7 +309,7 @@ class SchedulerCfg:
     min_slice_seconds: float = 10.0       # floor for any single pool stay
     assigner_interval_seconds: float = 3.0  # how often global assigner runs
     convergence_tolerance: float = 0.02   # 2% = "close enough" to target
-
+    force_reconnect_on_en2_mismatch: bool = False  # force reconnect when pools have different en2 sizes
 
 @dataclass
 class AppCfg:
@@ -445,6 +445,7 @@ def load_config(path: str) -> AppCfg:
     v3_assigner_interval = max(1.0, min(10.0, v3_assigner_interval))
     v3_convergence_tol = float(sched.get("convergence_tolerance", 0.02))
     v3_convergence_tol = max(0.005, min(0.10, v3_convergence_tol))
+    v3_force_reconnect_en2 = bool(sched.get("force_reconnect_on_en2_mismatch", False))
 
     return AppCfg(
         listen_host=str(listen_host),
@@ -459,7 +460,8 @@ def load_config(path: str) -> AppCfg:
                            oracle_url=oracle_url, oracle_poll_seconds=oracle_poll_seconds,
                            min_slice_seconds=v3_min_slice,
                            assigner_interval_seconds=v3_assigner_interval,
-                           convergence_tolerance=v3_convergence_tol),
+                           convergence_tolerance=v3_convergence_tol,
+                           force_reconnect_on_en2_mismatch=v3_force_reconnect_en2),
         downstream_diff=dict(cfg.get("downstream_diff", {})),
     )
 
@@ -862,7 +864,10 @@ async def _handle_switch_failure(session, peer_ip: str, pin_reason: str,
         reason_detail: Human-readable description for the log.
     """
     # Which pool were we trying to switch TO?
-    _target = "B" if session.active_pool == "A" else "A"
+    # active_pool is the pool currently failing (the one the miner just switched to).
+    # _target is that failing pool; _safe is the opposite (where the miner came from).
+    _target = session.active_pool
+    _safe = "A" if _target == "B" else "B"
 
     if dpmp_fleet.reconnect_switch_should_pin(peer_ip, _target):
         # Stage 2: already tried reconnect-switch, escalate to pin
@@ -876,8 +881,7 @@ async def _handle_switch_failure(session, peer_ip: str, pin_reason: str,
             en2b=session.extranonce2_size.get("B"),
             pin_reason=pin_reason,
             reason=reason_detail + " (reconnect already tried, pinning)")
-        # Reconnect to the safe pool (the one the miner was on before)
-        _safe = session.active_pool  # current pool is the "safe" one
+        # Reconnect to the safe pool (the pool opposite to the one that failed)
         dpmp_fleet.en2_set_hint(peer_ip, _safe)
         log("en2_force_reconnect", sid=session.sid,
             to_pool=_safe, miner_ip=peer_ip,
@@ -905,7 +909,7 @@ class ProxySession:
     def __init__(self, cfg: AppCfg, miner_r: asyncio.StreamReader, miner_w: asyncio.StreamWriter, sid: str):
         self.cfg = cfg
         self.sid = sid  # downstream session id (peer)
-        self.last_switch_mono: float | None = None
+        self.last_switch_mono: float | None = time.monotonic()
         self.switch_count: int = 0
         self.pool_w: Dict[str, asyncio.StreamWriter] = {}
         self.up_q: Dict[str, list[tuple[str, str]]] = {"A": [], "B": []}  # (raw, tag) queued until writer exists
@@ -1010,8 +1014,11 @@ class ProxySession:
         self.handshake_pool: str | None = None  # selected pool for subscribe/authorize handshake responses
         # de-dupe upstream responses (subscribe/authorize collisions)
         self.submit_diff: Dict[Any, float] = {}
+
         self.submit_mono: Dict[Any, float] = {}  # submit timestamp for VarDiff suppression
+        self.submit_switch_mono: Dict[Any, float] = {}  # last_switch_mono at submit time
         self.submit_true_diff: Dict[Any, float] = {}  # true share difficulty from header hash
+
         self.accepted_diff_sum: Dict[str, float] = {"A": 0.0, "B": 0.0}
         # Deduplicate submits to avoid upstream "Duplicate share" when miners retry submits.
         # key: pool -> {fingerprint: last_seen_monotonic}
@@ -1032,6 +1039,7 @@ class ProxySession:
         #             Set to False when pool_reader detects EOF or error.
         #             Set back to True when reconnect succeeds.
         self.pool_alive: Dict[str, bool] = {"A": True, "B": True}
+        self.pool_idle_disconnected: Dict[str, bool] = {"A": False, "B": False}
 
         # pool_fail_count: consecutive reconnect failures (drives exponential backoff).
         #                  Reset to 0 on successful reconnect.
@@ -1072,9 +1080,11 @@ class ProxySession:
         self._health_post_switch_storm_fired: bool = False
         self._health_clean_switch_pending: float | None = None
         self._health_last_continuous_credit: float = time.monotonic()
+
         self._post_switch_accepts: int = 0
         self._post_switch_rejects: int = 0
         self._post_switch_en1_mismatch: int = 0  # count of near-zero diff rejects (extranonce1 mismatch)
+        self._slice_timer_started: bool = False   # True once first accepted share received on current pool
 
         # Grace period after a pool switch: do not count rejects toward
         # the auto-pin threshold for this many seconds.  Miners need time
@@ -1239,15 +1249,13 @@ class ProxySession:
             pool_min = None
             pool_max = None
 
-        # If pool hasn't sent a difficulty yet, use the configured minimum
-        # as a starting floor.  This prevents low-diff reject storms when
-        # miners are switched to a pool before its VarDiff kicks in.
+        # If pool hasn't sent a difficulty yet, don't send anything.
+        # The pool will send its VarDiff shortly in the notify stream.
+        # Sending pool_min as a placeholder causes miners with slow
+        # firmware (e.g. Gekko) to build a pipeline of work at the
+        # wrong difficulty, producing a burst of rejects when the
+        # pool's actual VarDiff arrives.
         if d is None:
-            if pool_min is not None:
-                try:
-                    return int(float(pool_min))
-                except Exception:
-                    pass
             return None
 
         try:
@@ -1954,6 +1962,8 @@ class ProxySession:
                     # to check grace window against when the share was SENT,
                     # not when the pool's response arrives (could be 1-2s later).
                     self.submit_mono[mid] = time.monotonic()
+                    if self.last_switch_mono is not None:
+                        self.submit_switch_mono[mid] = self.last_switch_mono
 
                 # True-diff filter: if we successfully computed the share's
                 # actual difficulty and it falls below what the pool requires,
@@ -1974,10 +1984,13 @@ class ProxySession:
                                 true_diff=round(_true_diff, 2),
                                 pool_diff=_pool_required,
                                 suppressed_count=_td_suppressed + 1)
+
                         self.submit_owner.pop(mid, None)
                         self.submit_diff.pop(mid, None)
                         self.submit_mono.pop(mid, None)
+                        self.submit_switch_mono.pop(mid, None)
                         self.submit_true_diff.pop(mid, None)
+
                         await write_line(self.miner_w, dumps_json({
                             "id": msg.get("id"), "result": True, "error": None
                         }), "downstream")
@@ -1992,9 +2005,12 @@ class ProxySession:
                 if not self.pool_alive.get(pool, False):
                     log("submit_dropped_pool_dead", sid=self.sid, mid=msg.get("id"),
                         jid=jid, pool=pool)
+
                     self.submit_owner.pop(msg.get("id"), None)
                     self.submit_diff.pop(msg.get("id"), None)
                     self.submit_mono.pop(msg.get("id"), None)
+                    self.submit_switch_mono.pop(msg.get("id"), None)
+
                     self.submit_true_diff.pop(msg.get("id"), None)
                     await write_line(self.miner_w, dumps_json({
                         "id": msg.get("id"), "result": False,
@@ -2212,11 +2228,18 @@ class ProxySession:
                                 other_pool = "B" if pool_key == "A" else "A"
                                 other_en2 = self.extranonce2_size.get(other_pool)
                                 this_en2 = int(_sub_en2s)
-                                if other_en2 is not None:
+                                if other_en2 is not None and self.cfg.sched.force_reconnect_on_en2_mismatch:
+                                    # When force_reconnect is enabled, each session reconnects
+                                    # fresh to a specific pool -- lock to that pool's native
+                                    # en2 size so strict pools like PublicPool get correctly
+                                    # sized extranonce2 values.
+                                    self.locked_en2_size = this_en2
+                                elif other_en2 is not None:
                                     self.locked_en2_size = max(this_en2, int(other_en2))
                                 else:
                                     # Other pool hasn't subscribed yet; lock to this one
                                     self.locked_en2_size = this_en2
+
                                 log("en2_size_locked", sid=self.sid, pool=pool_key,
                                     locked_en2_size=self.locked_en2_size,
                                     this_pool_en2=this_en2,
@@ -2379,8 +2402,20 @@ class ProxySession:
 
                         # Post-switch accept tracking (for auto-pin detection)
                         # Only count accepts on the pool we switched TO, not the prior pool
+
                         if self.last_switch_mono is not None and p == self.active_pool:
                             self._post_switch_accepts += 1
+                            # Start the slice timer on the first accepted share.
+                            # This ensures the slice duration is measured from
+                            # productive hashing time, not from disconnect time.
+                            # Particularly important for Dynamic miners with
+                            # force reconnect enabled, where VarDiff ramp-up
+                            # can consume most of the slice window.
+                            if not self._slice_timer_started:
+                                self._slice_timer_started = True
+                                log("slice_timer_started", sid=self.sid,
+                                    pool=p, worker=self.worker or "unknown")
+
                             # Safety valve: if the miner got an accept after a switch,
                             # it handled the extranonce change correctly.  Clear any
                             # accumulated en1 mismatch count so it doesn't slowly
@@ -2433,28 +2468,37 @@ class ProxySession:
                         # 1-2 seconds to respond, so shares submitted within the
                         # grace window can get rejected responses after it ends.
                         _suppressed_vardiff = False
-                        if self.last_switch_mono is not None and _submit_ts > 0:
-                            _switch_age_at_submit = _submit_ts - self.last_switch_mono
-                            if 0 <= _switch_age_at_submit < dpmp_fleet.miner_grace_window_s(
-                                    dpmp_fleet.fleet_state.get("miners", {}).get(
-                                        str(self.sid), {}).get("hashrate_ths", 5.0)):
+
+                        _submit_switch_mono = self.submit_switch_mono.pop(mid, None)
+                        if _submit_switch_mono is not None and self._post_switch_accepts == 0:
+                            _switch_age_at_submit = _submit_ts - _submit_switch_mono
+                            if _switch_age_at_submit >= 0:
                                 _err = msg.get("error")
+
                                 # Detect null-error or low-difficulty rejects
+                                # Normalize plain string errors for uniform matching
+                                _err_str = (
+                                    _err[1].lower() if isinstance(_err, list) and len(_err) >= 2 and isinstance(_err[1], str)
+                                    else _err.get("message", "").lower() if isinstance(_err, dict)
+                                    else _err.lower() if isinstance(_err, str)
+                                    else ""
+                                )
                                 _is_suppressible = (
                                     _err is None
                                     or (isinstance(_err, list) and len(_err) >= 2
                                         and _err[1] is None)
                                     or (isinstance(_err, dict)
                                         and _err.get("message") is None)
-                                    or (isinstance(_err, list) and len(_err) >= 2
-                                        and isinstance(_err[1], str)
-                                        and ("null" in _err[1].lower()
-                                             or "low difficulty" in _err[1].lower()
-                                             or "stale" in _err[1].lower()))
-                                    or (isinstance(_err, dict)
-                                        and isinstance(_err.get("message"), str)
-                                        and ("low difficulty" in _err["message"].lower()
-                                             or "stale" in _err["message"].lower()))
+                                    or bool(_err_str and (
+                                        "null" in _err_str
+                                        or "difficulty" in _err_str
+                                        or "stale" in _err_str
+                                        or "job not found" in _err_str
+                                        or "unauthorized" in _err_str
+                                        or "duplicate" in _err_str
+                                        or "above target" in _err_str
+                                        or "high hash" in _err_str
+                                        or "low hash" in _err_str))
                                 )
                                 if _is_suppressible:
                                     _suppressed_vardiff = True
@@ -2500,31 +2544,46 @@ class ProxySession:
                                                 pass
                                         elif (self._post_switch_rejects >= 10
                                                 and self._post_switch_accepts == 0):
+
                                             _en2a = self.extranonce2_size.get("A")
                                             _en2b = self.extranonce2_size.get("B")
-                                            _en2_mismatch = (_en2a is not None and _en2b is not None
-                                                             and _en2a != _en2b)
                                             _en1_mismatch = self._post_switch_en1_mismatch >= 5
-                                            if _en2_mismatch or _en1_mismatch:
+                                            if _en1_mismatch:
                                                 try:
                                                     _peer2 = self.miner_w.get_extra_info("peername")
                                                     if _peer2 and not dpmp_fleet.en2_is_pinned(_peer2[0]):
-                                                        _pin_reason = ("en2_size_mismatch" if _en2_mismatch
-                                                                       else "extranonce1_mismatch")
                                                         await _handle_switch_failure(
                                                             self, _peer2[0],
-                                                            _pin_reason,
+                                                            "extranonce1_mismatch",
                                                             "10+ rejects with 0 accepts after switch (via vardiff suppress)")
                                                 except Exception:
                                                     pass
                                             else:
                                                 if self._post_switch_rejects == 10:
-                                                    log("auto_pin_skipped_same_en2", sid=self.sid,
+                                                    log("auto_pin_skipped", sid=self.sid,
                                                         worker=self.worker or "unknown",
                                                         rejects=self._post_switch_rejects,
                                                         en1_mismatch_count=self._post_switch_en1_mismatch,
                                                         en2a=_en2a, en2b=_en2b,
-                                                        reason="en2 sizes match and no extranonce1 mismatch detected")
+                                                        reason="no extranonce1 mismatch detected")
+
+
+                                                # Fallback: if miner has 30+ rejects with 0 accepts
+                                                # and has been on this pool for 30+ seconds, pin it.
+                                                # Catches miners that can't work on a pool for reasons
+                                                # other than extranonce mismatch (e.g. firmware limits).
+                                                elif (self._post_switch_rejects >= 30
+                                                        and _switch_age >= 30.0):
+                                                    try:
+                                                        _peer2 = self.miner_w.get_extra_info("peername")
+                                                        if _peer2 and not dpmp_fleet.en2_is_pinned(_peer2[0]):
+                                                            await _handle_switch_failure(
+                                                                self, _peer2[0],
+                                                                "no_accepts_after_switch",
+                                                                "30+ rejects with 0 accepts after 30s on new pool")
+                                                    except Exception:
+                                                        pass
+
                                     continue
 
                         # Reset vardiff suppression counter outside grace window
@@ -2916,16 +2975,48 @@ class ProxySession:
             self.pool_alive[pool_key] = False
             self.pool_last_fail_mono[pool_key] = time.monotonic()
             self.clear_pool_state(pool_key)
-            log("pool_down", sid=self.sid, pool=pool_key,
-                fail_count=self.pool_fail_count[pool_key],
-                other_alive=self.pool_alive["B" if pool_key == "A" else "A"])
 
-            # Phase 3: reconnect loop with backoff 
+            # Check if this is a pool-initiated idle disconnect on the
+            # inactive pool. If so, don't reconnect -- just wait silently
+            # until the scheduler needs this pool again (on-demand reconnect).
+            # This prevents zombie-worker timeout churn on pools like MiningCore
+            # that disconnect idle connections after ~10 minutes.
+            _is_idle_disconnect = (pool_key != self.active_pool)
+            if _is_idle_disconnect:
+                self.pool_idle_disconnected[pool_key] = True
+                log("pool_idle_disconnect", sid=self.sid, pool=pool_key,
+                    active_pool=self.active_pool,
+                    worker=self.worker or "unknown")
+                # Wait here until on-demand reconnect is requested.
+                # forward_jobs() will clear pool_idle_disconnected and
+                # call connect_pool() when a switch to this pool is needed.
+                while self.pool_idle_disconnected.get(pool_key, False):
+                    try:
+                        await asyncio.sleep(1.0)
+                    except asyncio.CancelledError:
+                        raise
+                # On-demand reconnect was requested -- fall through to
+                # Phase 3 to connect and bootstrap.
+                log("pool_idle_reconnect_requested", sid=self.sid, pool=pool_key,
+                    worker=self.worker or "unknown")
+            else:
+                log("pool_down", sid=self.sid, pool=pool_key,
+                    fail_count=self.pool_fail_count[pool_key],
+                    other_alive=self.pool_alive["B" if pool_key == "A" else "A"])
+
+            # Phase 3: reconnect loop with backoff
+            # For on-demand reconnects (idle disconnect path), skip the initial
+            # delay so the switch can proceed as quickly as possible.
+            _first_attempt = True
             while True:
-                # Exponential backoff: 5, 10, 20, 40, 60, 60, 60 
+                # Exponential backoff: 5, 10, 20, 40, 60, 60, 60
+                # Skip delay on first attempt for on-demand reconnects.
                 base_delay = 5.0
                 max_delay = 60.0
                 delay = min(base_delay * (2 ** self.pool_fail_count[pool_key]), max_delay)
+                if _first_attempt and _is_idle_disconnect:
+                    delay = 0.0  # no delay for on-demand reconnects
+                _first_attempt = False
                 log("pool_reconnect_wait", sid=self.sid, pool=pool_key,
                     delay_s=round(delay, 1),
                     fail_count=self.pool_fail_count[pool_key])
@@ -2996,6 +3087,14 @@ class ProxySession:
                         pool=pool_key, active_pool=self.active_pool,
                         miner_ip=_miner_ip_dc,
                         reason="pinned_miner_not_on_reconnecting_pool")
+                elif pool_key != self.active_pool:
+                    # On-demand reconnect for idle-disconnected pool --
+                    # miner is currently mining on the other pool and has
+                    # not been disturbed. Don't disconnect it here; the
+                    # extranonce will be sent when the switch executes.
+                    log("miner_disconnect_skipped_ondemand", sid=self.sid,
+                        pool=pool_key, active_pool=self.active_pool,
+                        reason="idle_reconnect_miner_unaffected")
                 else:
                     try:
                         log("miner_disconnect_for_reconnect", sid=self.sid,
@@ -3014,10 +3113,24 @@ class ProxySession:
     async def forward_jobs(self):
         await self.miner_ready.wait()
         last_seen = {"A": 0, "B": 0}
+
         current_pool = self.active_pool
+        # Safety: always start forwarding on the handshake pool.
+        # The miner's extranonce context from the subscribe response belongs to
+        # handshake_pool. If active_pool (from round-robin) differs, forwarding
+        # Pool B jobs immediately would send Pool B's extranonce mid-session,
+        # invalidating Pool A's subscribe extranonce and causing mass rejects.
+        # The assigner will move the miner to the correct pool after grace period.
+        if self.handshake_pool and current_pool != self.handshake_pool:
+            log("startup_pool_corrected_to_handshake", sid=self.sid,
+                was=current_pool, corrected=self.handshake_pool)
+            current_pool = self.handshake_pool
+            self.active_pool = self.handshake_pool
+
         ACTIVE_POOL.labels(pool="A").set(1 if current_pool == "A" else 0)
         ACTIVE_POOL.labels(pool="B").set(1 if current_pool == "B" else 0)
         last_switch_ts = time.monotonic()
+        _startup_grace_mono = time.monotonic()
 
         # Register this miner in the global fleet tracker
         # fleet_register returns the actual stored switch_count, which
@@ -3155,9 +3268,40 @@ class ProxySession:
                 # Static miner: only switch if the assigner reassigned us.
                 _target_pool = _my_assignment.get("pool", current_pool)
                 if _target_pool != current_pool:
-                    # Assigner wants us on a different pool
-                    pick = _target_pool
-                    _sched_reason = "assigner_static_reassign"
+                    # Guard: don't switch in the first 20 seconds after startup.
+                    # Pool B bootstrap may still be completing, and switching
+                    # before it finishes causes a low-diff reject storm
+                    # (especially on high-hashrate miners like AvalonQ).
+                    if (now - _startup_grace_mono) < 10.0:
+                        pick = current_pool
+                        _sched_reason = "startup_grace_hold"
+                    elif dpmp_fleet.is_manual_mode_active():
+                        # In Manual mode, always use full disconnect/reconnect
+                        # to reach the target pool. This bypasses mid-session
+                        # extranonce changes entirely -- the miner reconnects
+                        # fresh and handshakes directly with the target pool.
+                        # Safe for all miners including en2-sensitive ones like Gekko.
+                        _peer_manual = self.miner_w.get_extra_info("peername")
+                        if _peer_manual:
+                            _last_force = getattr(self, "_last_en2_force_reconnect_mono", 0.0)
+                            if now - _last_force >= 30.0:
+                                try:
+                                    dpmp_fleet.en2_clear_pin(_peer_manual[0])                                    
+                                    dpmp_fleet.en2_set_hint(_peer_manual[0], _target_pool)
+                                    log("manual_mode_force_reconnect", sid=self.sid,
+                                        from_pool=current_pool, to_pool=_target_pool,
+                                        miner_ip=_peer_manual[0],
+                                        worker=self.worker or "unknown")
+                                    self._last_en2_force_reconnect_mono = now
+                                    self.miner_w.close()
+                                except Exception as e:
+                                    log("manual_mode_force_reconnect_error",
+                                        sid=self.sid, err=str(e))
+                        pick = current_pool  # hold until reconnect completes
+                        _sched_reason = "manual_mode_reconnect_pending"
+                    else:
+                        pick = _target_pool
+                        _sched_reason = "assigner_static_reassign"
                 else:
                     _sched_reason = "static_hold"
 
@@ -3169,6 +3313,26 @@ class ProxySession:
                                             "B" if current_pool == "A" else "A")
                 _home_dur = _my_assignment.get("home_duration_s", 30.0)
                 _slice_dur = _my_assignment.get("slice_duration_s", 10.0)
+
+                # Hold the slice timer until the first accepted share arrives,
+                # but only when force_reconnect_on_en2_mismatch is enabled.
+                # With force reconnect, each switch involves a full reconnect
+                # and VarDiff ramp-up, so the timer should not start until
+                # the miner is actually producing accepted shares.
+                # Without force reconnect, VarDiff context is preserved across
+                # in-session switches so no ramp-up delay is needed.
+                # Safety timeout: if no accept arrives within 120s, start the
+                # timer anyway to prevent the miner from being stuck forever.
+                if not self._slice_timer_started and self.cfg.sched.force_reconnect_on_en2_mismatch:
+                    if now - last_switch_ts >= 120.0:
+                        self._slice_timer_started = True
+                        log("slice_timer_forced", sid=self.sid,
+                            pool=current_pool, worker=self.worker or "unknown",
+                            reason="no_accept_within_120s")
+                    else:
+                        last_switch_ts = now
+                elif not self._slice_timer_started:
+                    self._slice_timer_started = True
                 _time_on_current = now - last_switch_ts
 
                 if current_pool == _home:
@@ -3195,8 +3359,14 @@ class ProxySession:
             # handled it.  This just prevents the assigner from sending us
             # to a dead pool.
             if pick != current_pool and not self.pool_alive.get(pick, False):
-                pick = current_pool
-                _sched_reason = "target_pool_dead"
+                if self.pool_idle_disconnected.get(pick, False):
+                    # Target pool is idle-disconnected (not truly dead) --
+                    # allow the switch attempt to proceed so the on-demand
+                    # reconnect trigger in the switch block can fire.
+                    pass
+                else:
+                    pick = current_pool
+                    _sched_reason = "target_pool_dead"
 
             # --- Throttled scheduler_tick log ---
             # Only log on actual switch decisions or every 60s as heartbeat.
@@ -3219,6 +3389,7 @@ class ProxySession:
             # Don't switch into a pool until we have a cached job for it.
             # Also, don't switch miners that are flagged as unable to handle
             # en2_size changes -- they stay on whichever pool they handshaked on.
+
             if pick != current_pool:
                 _skip_en2 = False
                 try:
@@ -3230,6 +3401,22 @@ class ProxySession:
                         _skip_en2 = True
                 except Exception:
                     pass
+
+                # If force_reconnect_on_en2_mismatch is enabled and the two
+                # pools have different en2 sizes, treat every switch like a
+                # pinned miner -- force a clean disconnect so the miner
+                # reconnects and handshakes fresh with the correct en2 size.
+                # This is needed for strict pools like PublicPool that silently
+                # drop shares with an oversized extranonce2.
+                if not _skip_en2 and self.cfg.sched.force_reconnect_on_en2_mismatch:
+                    _en2a = self.extranonce2_size.get("A")
+                    _en2b = self.extranonce2_size.get("B")
+                    if _en2a is not None and _en2b is not None and _en2a != _en2b:
+                        _skip_en2 = True
+                        log("en2_mismatch_force_reconnect_armed", sid=self.sid,
+                            from_pool=current_pool, to_pool=pick,
+                            en2a=_en2a, en2b=_en2b,
+                            worker=self.worker or "unknown")
 
                 if _skip_en2:
                     # This miner can't handle extranonce changes in-session.
@@ -3247,22 +3434,56 @@ class ProxySession:
                                 from_pool=current_pool, to_pool=pick,
                                 cooldown_remaining=round(30.0 - (now - _last_force_reconn), 1))
                             self._last_en2_skip_log = now
+
                     else:
                         try:
                             dpmp_fleet.en2_set_hint(_peer[0], pick)
+                            self._last_en2_force_reconnect_mono = now
+                            # Count this as a switch so Fleet table stays accurate.
+
+                            _from_pool = current_pool
+                            self.active_pool = pick
+                            current_pool = pick
+                            last_switch_ts = now
+
+                            self.switch_count += 1
+                            self.last_switch_mono = time.monotonic()
+                            self._post_switch_accepts = 0
+                            self._post_switch_rejects = 0
+                            self._post_switch_en1_mismatch = 0
+                            self._slice_timer_started = False
+                            dpmp_fleet.fleet_register(str(self.sid), pick,
+                                            worker_name=self.worker or "unknown",
+                                            switch_count=self.switch_count,
+                                            last_switch_mono=self.last_switch_mono)
+                            log("pool_switched", sid=self.sid, to_pool=pick,
+                                via="en2_force_reconnect")
+
                             log("en2_force_reconnect", sid=self.sid,
-                                from_pool=current_pool, to_pool=pick,
+                                from_pool=_from_pool, to_pool=pick,
+
                                 miner_ip=_peer[0],
                                 reason="miner flagged for en2 incompatibility, forcing reconnect to target pool")
-                            self._last_en2_force_reconnect_mono = now
+
+                            self._en2_force_reconnect_disconnect = True
                             self.miner_w.close()
                         except Exception as e:
                             log("en2_force_reconnect_error", sid=self.sid, err=str(e))
                         last_switch_ts = now
 
-
                 elif self.latest_notify_raw.get(pick) is None:
-                    log("switch_skipped_no_cached_job", sid=self.sid, from_pool=current_pool, to_pool=pick)
+                    # If the target pool is idle-disconnected, trigger an
+                    # on-demand reconnect so we can switch to it once ready.
+                    if self.pool_idle_disconnected.get(pick, False):
+                        log("pool_ondemand_reconnect_triggered", sid=self.sid,
+                            pool=pick, worker=self.worker or "unknown")
+                        self.pool_idle_disconnected[pick] = False
+                        # pool_reader_with_reconnect is waiting on this flag --
+                        # clearing it lets it fall through to Phase 3 (reconnect).
+                    else:
+                        log("switch_skipped_no_cached_job", sid=self.sid,
+                            from_pool=current_pool, to_pool=pick)
+
                 elif not dpmp_fleet.fleet_try_switch():
                     # Another miner switched recently -- wait for cooldown.
                     # Don't reset last_switch_ts here -- let the assigner's
@@ -3287,9 +3508,11 @@ class ProxySession:
                     self._health_post_switch_rejects = 0
                     self._health_post_switch_storm_fired = False
                     self._health_clean_switch_pending = time.monotonic()
+
                     self._post_switch_accepts = 0
                     self._post_switch_rejects = 0
                     self._post_switch_en1_mismatch = 0
+                    self._slice_timer_started = False
 
                     # Immediately sync extranonce+diff and resend clean notify after switch.
                     # resend_active_notify_clean() handles extranonce+diff+notify internally,
@@ -3446,6 +3669,7 @@ class ProxySession:
                 if exc:
                     raise exc
 
+
     # Close all connections
     async def close(self):
         try:
@@ -3486,10 +3710,18 @@ async def handle_miner(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             _lsm = getattr(sess, "last_switch_mono", None)
             if _wn != "unknown" and _lsm is not None:
                 _since_switch = time.monotonic() - _lsm
+
                 if _since_switch < 10.0:
-                    dpmp_fleet.health_event(_wn, 0.0, "disconnect_after_switch")
-                    log("health_disconnect_near_switch", peer=str(peer),
-                        worker=_wn, seconds_since_switch=round(_since_switch, 1))
+                    if getattr(sess, "_en2_force_reconnect_disconnect", False):
+                        # Intentional force reconnect -- not a crash.
+                        # Skip the health penalty.
+                        log("health_disconnect_skipped_force_reconnect", peer=str(peer),
+                            worker=_wn, seconds_since_switch=round(_since_switch, 1))
+                    else:
+                        dpmp_fleet.health_event(_wn, 0.0, "disconnect_after_switch")
+                        log("health_disconnect_near_switch", peer=str(peer),
+                            worker=_wn, seconds_since_switch=round(_since_switch, 1))
+
                 else:
                     # General disconnect (not switch-related).  Mild penalty
                     # so miners that disconnect frequently (e.g. BM101) show
@@ -3553,6 +3785,8 @@ async def main():
     _fleet_health_path = os.path.join(_data_dir, "fleet_health.json")
     _fleet_metrics_path = os.path.join(_data_dir, "fleet_metrics.json")
     _scheduler_diag_path = os.path.join(_data_dir, "scheduler_diag.csv")
+    _manual_mode_path = os.path.join(_data_dir, "manual_mode.json")
+    _pinned_assignments_path = os.path.join(_data_dir, "pinned_assignments.json")
 
     # Wire up the fleet module with all its dependencies
     dpmp_fleet.init(
@@ -3566,6 +3800,8 @@ async def main():
         fleet_metrics_path=_fleet_metrics_path,
         scheduler_diag_path=None,  # disabled -- set to _scheduler_diag_path to re-enable
         get_paused_fn=get_paused_miners,
+        manual_mode_path=_manual_mode_path,
+        pinned_assignments_path=_pinned_assignments_path,
     )
     dpmp_fleet.load_best_shares()
     dpmp_fleet.load_fleet_health()

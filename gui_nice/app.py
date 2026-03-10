@@ -30,6 +30,9 @@ ORACLE_MODE_PATH = os.path.join(os.path.dirname(os.environ.get("DPMP_CONFIG_PATH
 WORKER_STATS_PATH = os.path.join(os.path.dirname(os.environ.get("DPMP_CONFIG_PATH", os.path.expanduser("~/dpmp/dpmp/config_v2.json"))), "worker_stats.json")
 FLEET_METRICS_PATH = os.path.join(os.path.dirname(os.environ.get("DPMP_CONFIG_PATH", os.path.expanduser("~/dpmp/dpmp/config_v2.json"))), "fleet_metrics.json")
 MINER_PAUSED_PATH = os.path.join(os.path.dirname(os.environ.get("DPMP_CONFIG_PATH", os.path.expanduser("~/dpmp/dpmp/config_v2.json"))), "miner_paused.json")
+MANUAL_MODE_PATH = os.path.join(os.path.dirname(os.environ.get("DPMP_CONFIG_PATH", os.path.expanduser("~/dpmp/dpmp/config_v2.json"))), "manual_mode.json")
+PINNED_ASSIGNMENTS_PATH = os.path.join(os.path.dirname(os.environ.get("DPMP_CONFIG_PATH", os.path.expanduser("~/dpmp/dpmp/config_v2.json"))), "pinned_assignments.json")
+POOLS_ADDRESS_BOOK_PATH = os.path.join(os.path.dirname(os.environ.get("DPMP_CONFIG_PATH", os.path.expanduser("~/dpmp/dpmp/config_v2.json"))), "pools.json")
 HOST = os.environ.get("NICEGUI_HOST", "0.0.0.0")
 PORT = int(os.environ.get("NICEGUI_PORT", "8845"))
 POLL_S = float(os.environ.get("NICEGUI_POLL_S", "2.0"))
@@ -174,11 +177,17 @@ def read_text_file(path: str, max_bytes: int = 200_000) -> str:
 import math as _math
 
 # build ratio gauge
-def _build_gauge_svg(pct_a: float, size: int = 160) -> str:
+def _build_gauge_svg(pct_a: float, size: int = 160, greyed: bool = False) -> str:
     """Build a half-circle gauge SVG. 0%A left, 50/50 top, 100%A right.
 
     Uses multiple small arc segments instead of complex large-arc flags
     to avoid browser rendering issues with semicircular arcs.
+
+    Args:
+        pct_a:  Fraction of Pool A (0.0 to 1.0).
+        size:   SVG width in pixels.
+        greyed: If True, render the gauge in muted grey (used in Manual mode
+                when the SR gauge is inactive).
     """
     pct_a = max(0.001, min(0.999, pct_a))
     cx, cy = 100, 92
@@ -209,18 +218,36 @@ def _build_gauge_svg(pct_a: float, size: int = 160) -> str:
     bg_path = _arc_path(180, 0, 48)
     bg = '<path d="%s" fill="none" stroke="#9ca3af" stroke-opacity="0.2" stroke-width="%d" stroke-linecap="round"/>' % (bg_path, sw)
 
-    # Pool A (blue): 180 -> needle
-    aa = ''
-    a_deg = 180.0 - nd  # degrees of arc for A
-    if a_deg > 0.5:
-        a_path = _arc_path(180, nd, max(4, int(a_deg / 4)))
-        aa = '<path d="%s" fill="none" stroke="#3b82f6" stroke-width="%d" stroke-linecap="round"/>' % (a_path, sw)
-
-    # Pool B (darker grey): needle -> 0
-    ba = ''
-    if nd > 0.5:
-        b_path = _arc_path(nd, 0, max(4, int(nd / 4)))
-        ba = '<path d="%s" fill="none" stroke="#9ca3af" stroke-opacity="0.35" stroke-width="%d" stroke-linecap="round"/>' % (b_path, sw)
+    if greyed:
+        # Greyed-out mode: both arcs use muted grey, needle is grey
+        aa = ''
+        a_deg = 180.0 - nd
+        if a_deg > 0.5:
+            a_path = _arc_path(180, nd, max(4, int(a_deg / 4)))
+            aa = '<path d="%s" fill="none" stroke="#6b7280" stroke-opacity="0.4" stroke-width="%d" stroke-linecap="round"/>' % (a_path, sw)
+        ba = ''
+        if nd > 0.5:
+            b_path = _arc_path(nd, 0, max(4, int(nd / 4)))
+            ba = '<path d="%s" fill="none" stroke="#6b7280" stroke-opacity="0.25" stroke-width="%d" stroke-linecap="round"/>' % (b_path, sw)
+        lb = '<text x="%d" y="%d" fill="#6b7280" font-size="11" font-weight="bold" text-anchor="middle">A</text>' % (cx - r - 14, cy + 4)
+        lb += '<text x="%d" y="%d" fill="#6b7280" font-size="11" font-weight="bold" text-anchor="middle">B</text>' % (cx + r + 14, cy + 4)
+        ne = '<line x1="%d" y1="%d" x2="%.1f" y2="%.1f" stroke="#6b7280" stroke-opacity="0.5" stroke-width="2.5" stroke-linecap="round"/>' % (cx, cy, npt[0], npt[1])
+        ne += '<circle cx="%d" cy="%d" r="4" fill="#6b7280" fill-opacity="0.5"/>' % (cx, cy)
+    else:
+        # Normal mode: Pool A blue, Pool B grey, needle red
+        aa = ''
+        a_deg = 180.0 - nd
+        if a_deg > 0.5:
+            a_path = _arc_path(180, nd, max(4, int(a_deg / 4)))
+            aa = '<path d="%s" fill="none" stroke="#3b82f6" stroke-width="%d" stroke-linecap="round"/>' % (a_path, sw)
+        ba = ''
+        if nd > 0.5:
+            b_path = _arc_path(nd, 0, max(4, int(nd / 4)))
+            ba = '<path d="%s" fill="none" stroke="#9ca3af" stroke-opacity="0.35" stroke-width="%d" stroke-linecap="round"/>' % (b_path, sw)
+        lb = '<text x="%d" y="%d" fill="#22d3ee" font-size="11" font-weight="bold" text-anchor="middle">A</text>' % (cx - r - 14, cy + 4)
+        lb += '<text x="%d" y="%d" fill="#f59e0b" font-size="11" font-weight="bold" text-anchor="middle">B</text>' % (cx + r + 14, cy + 4)
+        ne = '<line x1="%d" y1="%d" x2="%.1f" y2="%.1f" stroke="#ef4444" stroke-width="2.5" stroke-linecap="round"/>' % (cx, cy, npt[0], npt[1])
+        ne += '<circle cx="%d" cy="%d" r="4" fill="#ef4444"/>' % (cx, cy)
 
     # Tick marks at 0%, 25%, 50%, 75%, 100%
     tk = ''
@@ -229,14 +256,6 @@ def _build_gauge_svg(pct_a: float, size: int = 160) -> str:
         ti = _xy(ta, r - 9)
         to = _xy(ta, r + 9)
         tk += '<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="#9ca3af" stroke-opacity="0.4" stroke-width="1.5"/>' % (ti[0], ti[1], to[0], to[1])
-
-    # A/B labels
-    lb = '<text x="%d" y="%d" fill="#22d3ee" font-size="11" font-weight="bold" text-anchor="middle">A</text>' % (cx - r - 14, cy + 4)
-    lb += '<text x="%d" y="%d" fill="#f59e0b" font-size="11" font-weight="bold" text-anchor="middle">B</text>' % (cx + r + 14, cy + 4)
-
-    # Needle + center dot
-    ne = '<line x1="%d" y1="%d" x2="%.1f" y2="%.1f" stroke="#ef4444" stroke-width="2.5" stroke-linecap="round"/>' % (cx, cy, npt[0], npt[1])
-    ne += '<circle cx="%d" cy="%d" r="4" fill="#ef4444"/>' % (cx, cy)
 
     w = size
     h = int(size * 0.62)
@@ -408,6 +427,41 @@ def write_paused_miners(paused_list: list) -> None:
     """Write miner_paused.json with the current list of paused worker names."""
     write_json_atomic(MINER_PAUSED_PATH, {"paused": paused_list})
 
+# manual_mode.json helpers (hot-switch to Manual mode from GUI)
+def read_manual_mode() -> bool | None:
+    """Read manual_mode.json. Returns True/False, or None if file missing."""
+    try:
+        obj = read_json(MANUAL_MODE_PATH)
+        return bool(obj.get("manual_active", False))
+    except Exception:
+        return None
+
+def write_manual_mode(active: bool) -> None:
+    """Write manual_mode.json so dpmp_fleet picks up the mode change instantly."""
+    write_json_atomic(MANUAL_MODE_PATH, {"manual_active": active})
+
+def delete_manual_mode() -> None:
+    """Remove manual_mode.json so Manual mode is inactive on next startup."""
+    try:
+        os.remove(MANUAL_MODE_PATH)
+    except Exception:
+        pass
+
+# pinned_assignments.json helpers (read by Fleet table dropdown in Manual mode)
+def read_pinned_assignments_gui() -> dict:
+    """Read pinned_assignments.json. Returns {worker_name: 'A'/'B'}, or {} on error."""
+    try:
+        obj = read_json(PINNED_ASSIGNMENTS_PATH)
+        return {k: v for k, v in obj.items() if v in ("A", "B")}
+    except Exception:
+        return {}
+
+def write_pinned_assignments_gui(assignments: dict) -> None:
+    """Write pinned_assignments.json atomically. Only B assignments are stored."""
+    b_only = {k: v for k, v in assignments.items() if v == "B"}
+    write_json_atomic(PINNED_ASSIGNMENTS_PATH, b_only)
+
+
 # write JSON file atomically
 def write_json_atomic(path: str, obj: Dict[str, Any]) -> None:
     tmp = f"{path}.tmp"
@@ -415,6 +469,48 @@ def write_json_atomic(path: str, obj: Dict[str, Any]) -> None:
         json.dump(obj, f, indent=2, sort_keys=False)
         f.write("\n")
     os.replace(tmp, path)
+
+# ---------------------------------------------------------------------------
+# Pool Address Book helpers
+# ---------------------------------------------------------------------------
+def load_address_book() -> dict:
+    """Load pools.json address book. Returns dict keyed by 'host:port'."""
+    try:
+        obj = read_json(POOLS_ADDRESS_BOOK_PATH)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    return {}
+
+def save_address_book(book: dict) -> None:
+    """Write pools.json address book atomically."""
+    try:
+        write_json_atomic(POOLS_ADDRESS_BOOK_PATH, book)
+    except Exception:
+        pass
+
+def address_book_key(host: str, port: int) -> str:
+    """Generate a stable key for an address book entry."""
+    return f"{host.strip().lower()}:{int(port)}"
+
+def address_book_autosave(host: str, port: int, name: str, wallet: str, chain: str) -> None:
+    """Add a pool to the address book if not already present.
+    Called automatically on Apply. Never overwrites an existing entry."""
+    host = host.strip()
+    if not host:
+        return
+    key = address_book_key(host, port)
+    book = load_address_book()
+    if key not in book:
+        book[key] = {
+            "host":   host,
+            "port":   int(port),
+            "name":   name.strip(),
+            "wallet": wallet.strip(),
+            "chain":  chain.strip().upper(),
+        }
+        save_address_book(book)
 
 # Save oracle chart history to disk (survives browser refresh)
 def save_oracle_chart_history(history: list, poll_seconds: int) -> None:
@@ -689,19 +785,29 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
 
             # Determine initial mode:
             #   - If chain config is invalid -> always slider, no switch button
+            #   - If manual_mode.json exists and is active -> Manual mode
             #   - If oracle_mode.json exists -> use its value
             #   - Otherwise -> use config auto_balance
             _oracle_mode_file = read_oracle_mode()  # True/False/None
+            _manual_mode_file = read_manual_mode()  # True/False/None
+
             if not _chain_valid:
                 _show_oracle = False
+                _show_manual = False
+            elif _manual_mode_file is True:
+                _show_oracle = False
+                _show_manual = True
             elif _oracle_mode_file is not None:
                 _show_oracle = _oracle_mode_file
+                _show_manual = False
             else:
                 _show_oracle = _auto_balance_enabled
+                _show_manual = False
 
             # Shared mutable state for mode switching
-            _mode = {"oracle_active": _show_oracle}
-
+            # "oracle_active" and "manual_active" are mutually exclusive.
+            # Both False = Slider mode.
+            _mode = {"oracle_active": _show_oracle, "manual_active": _show_manual}
             # ---- SLIDER PANEL (always built) ----
             weight_slider_ref = None
 
@@ -716,9 +822,11 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                         ui.icon("balance", size="sm").style("color: #6E93D6")
                         ui.label("Hashrate Allocation").classes("text-base font-semibold").style("color: #6E93D6")
 
-                    # Switch button: only shown when chain config is valid AND both pools active
+                    # Forward arrow: goes to Oracle if available, otherwise directly to Manual
                     if _chain_valid and _slider_usable:
-                        btn_switch_to_oracle = ui.button("Oracle", icon="swap_horiz").props("dense outline size=sm").classes("text-xs")
+                        btn_switch_to_oracle = ui.button(icon="arrow_forward").props("dense outline size=sm round")
+                    else:
+                        btn_switch_to_manual_from_slider = ui.button(icon="arrow_forward").props("dense outline size=sm round")
 
                 if _slider_usable:
                     # If an override file exists (slider was moved), start there instead of config defaults
@@ -751,7 +859,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                     ui.label("Slider disabled (one pool has 0 weight)").classes("text-sm").style("color: #888")
 
             # Set initial visibility
-            slider_card.visible = not _show_oracle
+            slider_card.visible = not _show_oracle and not _show_manual
 
             # ---- ORACLE PANEL (only built when chain config is valid AND both pools active) ----
             _oracle_ui = {}  # holds references to oracle UI elements
@@ -774,8 +882,11 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                             with ui.row().classes("items-center gap-1"):
                                 oracle_health_dot = ui.icon("circle", size="xs")
                                 oracle_health_lbl = ui.label("starting...").classes("text-xs")
-                            # Switch button
-                            btn_switch_to_slider = ui.button("Slider", icon="swap_horiz").props("dense outline size=sm").classes("text-xs")
+                            # Navigation buttons: [<-] back to Slider, [->] forward to Manual
+                            with ui.row().classes("items-center gap-1"):
+                                btn_switch_to_slider = ui.button(icon="arrow_back").props("dense outline size=sm round")
+                                btn_switch_to_manual = ui.button(icon="arrow_forward").props("dense outline size=sm round")
+
                     _oracle_ui["health_dot"] = oracle_health_dot
                     _oracle_ui["health_lbl"] = oracle_health_lbl
 
@@ -856,19 +967,68 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                     _oracle_ui["ratio_lbl"] = oracle_ratio_lbl
                     _oracle_ui["countdown_lbl"] = oracle_countdown_lbl
 
-                # Set initial visibility
-                oracle_card.visible = _show_oracle
+                # Set initial visibility        
+                oracle_card.visible = _show_oracle and not _show_manual
 
                 _oracle_charts = [_oracle_ui.get("chart_left"), _oracle_ui.get("chart_right")]
             else:
                 oracle_card = None  # no oracle panel when chain config is invalid
 
+            # ---- MANUAL PANEL (built whenever both pools are active, regardless of chain config) ----
+            if _slider_usable:
+                with ui.card().classes("flex-1 min-w-[280px] max-w-[480px] slider-card-height") as manual_card:
+
+                    with ui.row().classes("w-full items-center justify-between"):
+                        with ui.row().classes("items-center gap-1"):
+                            ui.icon("tune", size="sm").style("color: #6E93D6")
+                            ui.label("Manual Assignment").classes("text-base font-semibold").style("color: #6E93D6")
+                        # Navigation button: [<-] back to Oracle (if available) or Slider
+                        btn_switch_from_manual = ui.button(icon="arrow_back").props("dense outline size=sm round")
+
+                    ui.separator().classes("my-2")
+
+                    ui.label("Each miner is manually assigned to a pool.").classes("text-sm")
+                    ui.html(
+                        '<span style="opacity:0.7; font-size:0.82rem;">'
+                        'Go to the <b>Stats</b> tab and use the <b>Pool</b> column dropdowns '
+                        'in the Fleet table to assign each miner to Pool A or Pool B. '
+                        'Changes take effect immediately without restarting miners.'
+                        '</span>',
+                        sanitize=False
+                    ).classes("w-full")
+
+                    ui.separator().classes("my-2")
+
+                    ui.html(
+                        '<span style="opacity:0.55; font-size:0.78rem;">'
+                        'The Scheduler Ratio gauge is inactive in Manual mode. '
+                        'Assignments persist across restarts. '
+                        'Active workers may take up to 30 seconds to stabilize on their assigned pools.'
+                        '</span>',
+                        sanitize=False
+                    ).classes("w-full")
+
+                # Set initial visibility
+                manual_card.visible = _show_manual
+            else:
+                manual_card = None  # no manual panel when chain config is invalid
+
             # ---- SWITCH BUTTON HANDLERS ----
-            def _do_switch_to_oracle():
-                """User clicked 'Switch to Oracle' on the slider panel."""
-                _mode["oracle_active"] = True
-                write_oracle_mode(True)
+            def _all_panels_hide():
+                """Hide all three mode panels."""
                 slider_card.visible = False
+                if oracle_card is not None:
+                    oracle_card.visible = False
+                if manual_card is not None:
+                    manual_card.visible = False
+
+            def _do_switch_to_oracle():
+                """Switch to Oracle mode (from Slider or Manual)."""
+                _mode["oracle_active"] = True
+                _mode["manual_active"] = False
+                write_oracle_mode(True)
+                delete_manual_mode()
+                _all_panels_hide()
                 if oracle_card is not None:
                     oracle_card.visible = True
 
@@ -885,13 +1045,15 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                     pass  # oracle data may not be available yet; next poll will handle it
 
                 ui.notify("Switched to Oracle mode", type="info")
+                update_stats()  # immediately update stats to reflect oracle weights and mode change
 
             def _do_switch_to_slider():
-                """User clicked 'Switch to Slider' on the oracle panel."""
+                """Switch to Slider mode (from Oracle or Manual)."""
                 _mode["oracle_active"] = False
+                _mode["manual_active"] = False
                 write_oracle_mode(False)
-                if oracle_card is not None:
-                    oracle_card.visible = False
+                delete_manual_mode()
+                _all_panels_hide()
                 slider_card.visible = True
                 # Write the current slider position to weights_override.json
                 # so DPMP immediately picks up the slider's weights
@@ -899,10 +1061,49 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                     val = int(weight_slider_ref.value)
                     write_weight_override(val, 100 - val)
                 ui.notify("Switched to Slider mode", type="info")
+                update_stats()  # immediately update stats to reflect slider weights and mode change
+
+            def _do_switch_to_manual():
+                """Switch to Manual mode (from Slider or Oracle)."""
+                _mode["oracle_active"] = False
+                _mode["manual_active"] = True
+                write_oracle_mode(False)
+                write_manual_mode(True)
+                _all_panels_hide()
+                if manual_card is not None:
+                    manual_card.visible = True
+                # Snapshot miners that need to move to their assigned pool.
+                # Any miner whose current pool doesn't match assignment gets
+                # highlighted orange until the reconnect completes.
+                _manual_pending.clear()
+                _cur_assignments = read_pinned_assignments_gui()
+                _fm = read_fleet_metrics()
+
+                for _wname, _mdata in _fm.get("miners", {}).items():
+                    _cur_pool = _mdata.get("pool", "A")
+                    _assigned = _cur_assignments.get(_wname, "A")
+                    if _cur_pool != _assigned:
+                        _manual_pending[_wname] = _mdata.get("time_on_pool_s", 0.0)
+
+                ui.notify("Switched to Manual mode", type="info")
+                update_stats()
+
+            def _do_switch_from_manual():
+                """Back button on Manual panel: go to Oracle if available, else Slider."""
+                if _chain_valid and oracle_card is not None:
+                    _do_switch_to_oracle()
+                else:
+                    _do_switch_to_slider()
 
             if _chain_valid:
                 btn_switch_to_oracle.on_click(_do_switch_to_oracle)
                 btn_switch_to_slider.on_click(_do_switch_to_slider)
+                btn_switch_to_manual.on_click(_do_switch_to_manual)
+                btn_switch_from_manual.on_click(_do_switch_from_manual)
+            else:
+                btn_switch_to_manual_from_slider.on_click(_do_switch_to_manual)
+                btn_switch_from_manual.on_click(_do_switch_from_manual)
+
 
             # ---- ORACLE CHART STATE + UPDATE TIMER (always runs when chain valid) ----
             _CHART_MAX_POINTS = 8
@@ -1273,6 +1474,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
 
             # Delete oracle_mode.json so DPMP falls back to config auto_balance
             delete_oracle_mode()
+            delete_manual_mode()
 
             # Clear chart history so charts start fresh after DPMP restart
             # (also cleared on GUI startup, but clear here too for immediate effect)
@@ -1300,9 +1502,13 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             _new_chain_valid = sorted([_new_ab["poolA_chain"], _new_ab["poolB_chain"]]) == ["BCH", "BTC"]
             _new_show_oracle = _new_ab["auto_balance"] and _new_chain_valid
             _mode["oracle_active"] = _new_show_oracle
+            _mode["manual_active"] = False
+            delete_manual_mode()
             slider_card.visible = not _new_show_oracle
             if oracle_card is not None:
                 oracle_card.visible = _new_show_oracle
+            if manual_card is not None:
+                manual_card.visible = False
 
 
             ok, msg = restart_dpmpv2()
@@ -1519,20 +1725,27 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                     lbl_sched_rat.content = '<span style="color:#22d3ee">A %.1f%%</span> <span style="opacity:0.3">/</span> <span style="color:#f59e0b">B %.1f%%</span>' % (_ppA, _ppB)
                     lbl_gauge_rd.content = _build_gauge_svg(_pin)
                     lbl_recent_rat.content = '<span style="color:#22d3ee">A %.1f%%</span> <span style="opacity:0.3">/</span> <span style="color:#f59e0b">B %.1f%%</span>' % (_ppA, _ppB)
+
                 else:
-                    # Scheduler Ratio -- reads the averaged per-miner time-ratio
-                    # directly from the Prometheus gauge.  This is instantaneous,
-                    # stable, and reflects what the scheduler is actually doing.
-                    _schedA = _prom_gauge_value(raw, "dpmp_scheduler_share", pool="A")
-                    _schedB = _prom_gauge_value(raw, "dpmp_scheduler_share", pool="B")
-                    if _schedA is not None and _schedB is not None:
-                        _spctA = 100.0 * _schedA
-                        _spctB = 100.0 * _schedB
-                        lbl_gauge_sr.content = _build_gauge_svg(_schedA)
-                        lbl_sched_rat.content = '<span style="color:#22d3ee">A %.1f%%</span> <span style="opacity:0.3">/</span> <span style="color:#f59e0b">B %.1f%%</span>' % (_spctA, _spctB)
+                    # In Manual mode the scheduler does no dynamic switching,
+                    # so the SR gauge is meaningless -- show it greyed out at 50/50.
+                    if _mode.get("manual_active", False):
+                        lbl_gauge_sr.content = _build_gauge_svg(0.5, greyed=True)
+                        lbl_sched_rat.content = '<span style="opacity:0.35">Manual mode</span>'
                     else:
-                        lbl_gauge_sr.content = _build_gauge_svg(0.5)
-                        lbl_sched_rat.content = "waiting for data..."
+                        # Scheduler Ratio -- reads the averaged per-miner time-ratio
+                        # directly from the Prometheus gauge.  This is instantaneous,
+                        # stable, and reflects what the scheduler is actually doing.
+                        _schedA = _prom_gauge_value(raw, "dpmp_scheduler_share", pool="A")
+                        _schedB = _prom_gauge_value(raw, "dpmp_scheduler_share", pool="B")
+                        if _schedA is not None and _schedB is not None:
+                            _spctA = 100.0 * _schedA
+                            _spctB = 100.0 * _schedB
+                            lbl_gauge_sr.content = _build_gauge_svg(_schedA)
+                            lbl_sched_rat.content = '<span style="color:#22d3ee">A %.1f%%</span> <span style="opacity:0.3">/</span> <span style="color:#f59e0b">B %.1f%%</span>' % (_spctA, _spctB)
+                        else:
+                            lbl_gauge_sr.content = _build_gauge_svg(0.5)
+                            lbl_sched_rat.content = "waiting for data..."
 
                     # Rolling recent diff -- exponentially weighted difficulty.
                     # Recent data is weighted much more heavily than old data,
@@ -1616,12 +1829,14 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
         }
         """)
 
-        # ---- Fleet Stats Card ----        
-        with ui.expansion("Fleet Stats", icon="groups", value=True).props("dense dense-toggle").classes("stats-expansion text-lg font-semibold w-full"):
+        # ---- Fleet Stats Card ----    
+        fleet_expansion = ui.expansion("Fleet Stats", icon="groups", value=True).props("dense dense-toggle").classes("stats-expansion text-lg font-semibold w-full")
+        with fleet_expansion:
+        #with ui.expansion("Fleet Stats", icon="groups", value=True).props("dense dense-toggle").classes("stats-expansion text-lg font-semibold w-full"):
             with ui.card().classes("w-full").style("padding: 4px 8px 8px 8px"):
                 ui.label("Real-time scheduler view. Click column headers to sort.").classes("text-xs opacity-60").style("padding-left: 6px")
                 stats_fleet_html = ui.html("", sanitize=False).classes("w-full overflow-x-auto")
-                ui.label("* A pinned miner will only operate on the assigned pool, which may impact convergence at extreme ratios.").classes("text-xs opacity-60").style("padding-left: 6px")
+                lbl_fleet_footnote = ui.label("* A pinned worker will only operate on the assigned pool, which may impact convergence at extreme ratios.").classes("text-xs opacity-60").style("padding-left: 6px")
 
         # ---- Miner Stats Card ----
         with ui.expansion("Worker Stats", icon="memory", value=True).props("dense dense-toggle").classes("stats-expansion text-lg font-semibold w-full"):
@@ -1664,6 +1879,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
         _miner_sort = {"key": "name", "reverse": False}
         _pool_sort = {"key": "pool_name", "reverse": False}
         _fleet_sort = {"key": "worker_name", "reverse": False}
+        _manual_pending = {}  # { worker_name: last_known_time_on_pool_s } -- orange highlight while reconnect pending
 
         # ---- Miner table column definitions ----
         # Each tuple: (key, header_label, css_class, format_fn)
@@ -1689,7 +1905,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             ("slot",      "Slot",      "",    None),
             ("chain",     "Coin",      "",    None),
             ("en2_size",  "En2",       "num", lambda v: str(int(v)) if v else "--"),
-            ("ratio",     "Ratio",     "num", lambda v: f"{v:.0f}%"),
+            ("ratio",     "Ratio",     "num", lambda v: v if isinstance(v, str) else f"{v:.0f}%"),
             ("pool_hr",   "5m HR",     "num", lambda v: fmt_hashrate(v)),
             ("latency",   "Latency",   "num", None),
             ("accepted",  "Accepted*",  "num", lambda v: f"{int(v):,}"),
@@ -1741,6 +1957,10 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
         _toggle_bridge = ui.input("").style("display:none").props("dense")
         _bridge_toggle_id = _toggle_bridge.id
 
+        # Hidden bridge for Manual mode pool assignment dropdown changes
+        _assign_bridge = ui.input("").style("display:none").props("dense")
+        _bridge_assign_id = _assign_bridge.id
+
         # In-memory set of paused worker names; seeded from miner_paused.json
         _paused_miners = set(read_paused_miners())
 
@@ -1757,6 +1977,32 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             update_stats()
 
         _toggle_bridge.on("toggle_miner", _on_toggle_click)
+
+        def _on_assign_change(e):
+            """Update a miner's pool assignment when the Manual mode dropdown changes."""
+            data = e.args if isinstance(e.args, dict) else {}
+            worker = data.get("worker", "")
+            pool = data.get("pool", "A")
+            if not worker or pool not in ("A", "B"):
+                return
+            # Read current assignments, update this miner, write back
+            current = read_pinned_assignments_gui()
+            if pool == "B":
+                current[worker] = "B"
+            else:
+                current.pop(worker, None)
+            write_pinned_assignments_gui(current)
+            # Mark miner as pending -- highlight orange until reconnect completes.
+            # Snapshot current time_on_pool_s so we can detect when it resets.
+            _fm = read_fleet_metrics()
+            _miners = _fm.get("miners", {})
+            if worker in _miners:
+                _manual_pending[worker] = _miners[worker].get("time_on_pool_s", 0.0)
+
+            #ui.notify(f"DEBUG: {worker} pending={_manual_pending.get(worker, 'NOT SET')}", type="warning")
+            update_stats()
+
+        _assign_bridge.on("assign_pool", _on_assign_change)
 
         def _on_miner_header_click(e):
             val = e.args if isinstance(e.args, str) else (e.args or {}).get("key", "")
@@ -1812,6 +2058,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                 ws = read_worker_stats()
                 workers = ws.get("workers", {})
                 pool_lat = ws.get("pool_latency", {})
+                _is_manual = _mode.get("manual_active", False)
 
                 # --- Miner Table ---
                 now = time.time()
@@ -1941,7 +2188,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                         <tbody>{rows_html}</tbody>
                     </table>"""
                 else:
-                    stats_miner_html.content = '<span style="opacity:0.5">No active miners detected yet.</span>'
+                    stats_miner_html.content = '<span style="opacity:0.5">No active workers detected yet.</span>'
 
                 # --- Pool Table ---
                 pool_info = get_pool_info()
@@ -1995,7 +2242,8 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                     acc = _prom_gauge_value(raw, "dpmp_shares_accepted_total", pool=pk) or 0.0
                     rej = _prom_gauge_value(raw, "dpmp_shares_rejected_total", pool=pk) or 0.0
                     total = acc + rej
-                    _goal_pct = _target_pctA if pk == "A" else (100.0 - _target_pctA)
+                    # In Manual mode there is no target ratio, so show "--"
+                    _goal_pct = "--" if _is_manual else (_target_pctA if pk == "A" else (100.0 - _target_pctA))
                     _en2 = _prom_gauge_value(raw, "dpmp_extranonce2_size", pool=pk)
                     pool_data.append({
                         "pool_name": pi.get("name", f"Pool {pk}"),
@@ -2051,7 +2299,20 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                 fm = read_fleet_metrics()
                 fleet_miners = fm.get("miners", {})
 
+                # Adjust the fleet table title depending on mode
+                fleet_expansion.text = "Fleet Stats (Manual Mode Active)" if _is_manual else "Fleet Stats"
+                
+                # Adjust the fleet table footnote depending on mode
+                if _is_manual:
+                    lbl_fleet_footnote.text = "* Active workers may take up to 30 seconds to stabilize on their assigned pools when switching to Manual mode."
+                else:
+                    lbl_fleet_footnote.text = "* A pinned worker will only operate on the assigned pool, which may impact convergence at extreme ratios."
+                lbl_fleet_footnote.visible = True
+
                 if fleet_miners:
+                    # In Manual mode, read current pinned assignments for dropdown state
+                    _pinned_assign = read_pinned_assignments_gui() if _is_manual else {}
+
                     fleet_data = []
                     for mname, mdata in fleet_miners.items():
                         _can_sw = mdata.get("can_switch", True)
@@ -2072,9 +2333,16 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                         key=lambda r: (r.get(fsk, "") if fsk in ("worker_name", "current_pool", "pinned", "mode") else r.get(fsk, 0)),
                         reverse=_fleet_sort["reverse"])
 
+                    # Determine which columns to show.
+                    # In Manual mode: hide "Pinned*" column; Pool column becomes dropdown.
+                    # In normal mode: show all columns as usual.
+                    _skip_cols = {"pinned"} if _is_manual else set()
+
                     # Build header
                     fhdr = ""
                     for key, label, css, _ in _fleet_cols:
+                        if key in _skip_cols:
+                            continue
                         sc = " sorted" if _fleet_sort["key"] == key else ""
                         cls = f'class="{css}{sc}"' if (css or sc) else ""
                         arrow = _sort_arrow(_fleet_sort, key)
@@ -2082,17 +2350,57 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
 
                     # Build rows
                     fleet_rows = ""
+
                     for r in fleet_data:
                         cells = ""
+                        wname = r["worker_name"]
+                        # Check if this miner has completed its pending reconnect.
+                        # Reconnect is complete when time_on_pool_s resets (new < stored).
+                        if wname in _manual_pending:
+                            _prev_top = _manual_pending[wname]
+                            _cur_top = r.get("time_on_pool_s", 0.0)
+                            if _cur_top < _prev_top:
+                                del _manual_pending[wname]
+                            else:
+                                _manual_pending[wname] = _cur_top
+                        _name_pending = _is_manual and wname in _manual_pending
                         for key, _, css, fmt_fn in _fleet_cols:
+                            if key in _skip_cols:
+                                continue
                             val = r[key]
                             cls = f' class="{css}"' if css else ""
-                            if key == "health":
-                                # Color-code health: green >= 90%, yellow >= 70%, red < 70%
+                            if key == "current_pool" and _is_manual:
+                                # Replace static pool text with A/B dropdown
+                                _cur_assign = _pinned_assign.get(wname, "A")
+                                _opt_a = 'selected' if _cur_assign == "A" else ''
+                                _opt_b = 'selected' if _cur_assign == "B" else ''
+
+                                _sel = (
+                                    f'<select data-assign="{wname}" '
+                                    f'style="background:#1e2330;color:#e5e7eb;border:1px solid rgba(110,147,214,0.4);'
+                                    f'border-radius:4px;padding:1px 4px;font-size:0.8rem;cursor:pointer;">'
+                                    f'<option value="A" {_opt_a} style="background:#1e2330;color:#e5e7eb;">A</option>'
+                                    f'<option value="B" {_opt_b} style="background:#1e2330;color:#e5e7eb;">B</option>'
+                                    f'</select>'
+                                )
+
+                                cells += f'<td{cls}>{_sel}</td>'
+
+                            elif key == "worker_name":
+                                _nc = ' style="color:#f97316;font-weight:600"' if _name_pending else ""
+                                cells += f'<td{cls}{_nc}>{wname}</td>'
+
+                            elif key == "health":
                                 hc = "#22c55e" if val >= 0.9 else "#f59e0b" if val >= 0.7 else "#ef4444"
                                 cells += f'<td{cls} style="color:{hc}">{fmt_fn(val)}</td>'
                             elif key == "time_on_pool_s":
                                 cells += f'<td{cls}>{_fmt_ago(val)}</td>'
+                            elif key == "switch_count" and _is_manual:
+                                cells += f'<td{cls}>--</td>'
+                            elif key == "mode":
+                                _display_mode = "static" if _is_manual else val
+                                mc = "#22d3ee" if _display_mode == "time_slice" else "#9ca3af"
+                                cells += f'<td{cls} style="color:{mc}">{fmt_fn(_display_mode)}</td>'
                             elif key == "mode":
                                 mc = "#22d3ee" if val == "time_slice" else "#9ca3af"
                                 cells += f'<td{cls} style="color:{mc}">{fmt_fn(val)}</td>'
@@ -2107,12 +2415,17 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                         tot_style = ' style="border-top:2px solid rgba(110,147,214,0.4);font-weight:600;opacity:0.85"'
                         tot_cells = ""
                         for key, _, css, fmt_fn in _fleet_cols:
+                            if key in _skip_cols:
+                                continue
                             cls = f' class="{css}"' if css else ""
                             if key == "worker_name":
                                 tot_cells += f"<td{tot_style}>Total ({len(fleet_data)})</td>"
                             elif key == "switch_count":
-                                val = sum(r[key] for r in fleet_data)
-                                tot_cells += f'<td{cls}{tot_style}>{int(val):,}</td>'
+                                if _is_manual:
+                                    tot_cells += f'<td{cls}{tot_style}>--</td>'
+                                else:
+                                    val = sum(r[key] for r in fleet_data)
+                                    tot_cells += f'<td{cls}{tot_style}>{int(val):,}</td>'
                             elif key == "contribution":
                                 val = sum(r[key] for r in fleet_data)
                                 tot_cells += f'<td{cls}{tot_style}>{val:.1%}</td>'
@@ -2158,6 +2471,17 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                 var worker = tog.getAttribute('data-toggle');
                 if (worker) {{
                     getElement({_bridge_toggle_id}).$emit('toggle_miner', worker);
+                }}
+            }}
+        }});
+
+        document.addEventListener('change', function(e) {{
+            var sel = e.target.closest('select[data-assign]');
+            if (sel) {{
+                var worker = sel.getAttribute('data-assign');
+                var pool = sel.value;
+                if (worker && pool) {{
+                    getElement({_bridge_assign_id}).$emit('assign_pool', {{worker: worker, pool: pool}});
                 }}
             }}
         }});
@@ -2232,10 +2556,89 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             dd_poolB_min.set_value(a_dmin)
             ui.notify("Pool A and Pool B settings swapped. Review and click Apply + Restart when ready.", type="info")
 
-        ui.button("Swap Pool A / Pool B", icon="swap_horiz", on_click=_swap_pools).props(
-            "flat dense no-caps"
-        ).classes("text-sm").style("color: #6E93D6").tooltip(
-            "Swap all Pool A and Pool B settings. Does not apply changes -- you must click Apply + Restart.")
+        with ui.row().classes("items-center gap-4"):
+            ui.button("Swap Pool A / Pool B", icon="swap_horiz", on_click=_swap_pools).props(
+                "flat dense no-caps"
+            ).classes("text-sm").style("color: #6E93D6").tooltip(
+                "Swap all Pool A and Pool B settings. Does not apply changes -- you must click Apply + Restart.")
+
+            def _open_edit_address_book():
+                """Open modal to rename or delete address book entries."""
+                book = load_address_book()
+                if not book:
+                    ui.notify("Address book is empty.", type="info")
+                    return
+
+                with ui.dialog() as dlg, ui.card().classes("w-full max-w-lg"):
+                    ui.label("Edit Address Book").classes("text-base font-semibold").style("color: #6E93D6")
+                    ui.separator().classes("my-2")
+
+                    rows_container = ui.column().classes("w-full gap-2")
+
+                    def _build_rows():
+                        rows_container.clear()
+                        current_book = load_address_book()
+                        if not current_book:
+                            with rows_container:
+                                ui.label("Address book is empty.").classes("text-sm").style("color: #888")
+                            return
+                        for key, entry in sorted(current_book.items(),
+                                                  key=lambda x: x[1].get("name", x[0]).lower()):
+                            name   = entry.get("name", "") or key
+                            host   = entry.get("host", "")
+                            port   = entry.get("port", 3333)
+                            chain  = entry.get("chain", "BTC")
+
+                            def _make_delete(k=key):
+                                def _delete():
+                                    b = load_address_book()
+                                    if k in b:
+                                        del b[k]
+                                        save_address_book(b)
+                                        ui.notify("Entry deleted.", type="positive")
+                                        _build_rows()
+                                return _delete
+
+                            def _make_rename(k=key, current_name=name):
+                                def _rename():
+                                    with ui.dialog() as rename_dlg, ui.card().classes("min-w-[300px]"):
+                                        ui.label("Rename Pool").classes("text-sm font-semibold").style("color: #6E93D6")
+                                        new_name_input = ui.input("Name", value=current_name).classes("w-full")
+                                        with ui.row().classes("gap-2 justify-end"):
+                                            def _save_rename(nd=rename_dlg, ni=new_name_input, ky=k):
+                                                b = load_address_book()
+                                                if ky in b:
+                                                    b[ky]["name"] = ni.value.strip()
+                                                    save_address_book(b)
+                                                    ui.notify("Name updated.", type="positive")
+                                                    nd.close()
+                                                    _build_rows()
+                                            ui.button("Save", on_click=_save_rename).props("dense outline size=sm")
+                                            ui.button("Cancel", on_click=rename_dlg.close).props("flat dense size=sm")
+                                    rename_dlg.open()
+                                return _rename
+
+                            _delete_handler = _make_delete(k=key)
+                            _rename_handler = _make_rename(k=key, current_name=name)
+                            with rows_container:
+                                with ui.row().classes("w-full items-center justify-between gap-2"):
+                                    with ui.column().classes("flex-1 gap-0"):
+                                        ui.label(f"{name}").classes("text-sm font-semibold")
+                                        ui.label(f"{host}:{port}  |  {chain}").classes("text-xs").style("color: #888")
+                                    with ui.row().classes("gap-1"):
+                                        ui.button("Rename", on_click=_rename_handler).props("dense outline size=sm")
+                                        ui.button("Delete", on_click=_delete_handler).props("dense outline size=sm color=negative")
+                                ui.separator().classes("my-1")
+
+                    _build_rows()
+                    ui.button("Close", on_click=dlg.close).props("flat dense no-caps").classes("text-sm")
+
+                dlg.open()
+
+            ui.button("Edit Address Book", icon="edit", on_click=_open_edit_address_book).props(
+                "flat dense no-caps"
+            ).classes("text-sm").style("color: #6E93D6").tooltip(
+                "Rename or delete saved pools in the address book.")
 
         # Pool A
         with ui.expansion("Pool A Settings:", icon="settings").classes("w-full").tooltip("Settings for Pool A"):
@@ -2246,6 +2649,10 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             poolA_chain  = ui.select(["BTC", "BCH", "BSV", "DGB", "XEC", "PPC", "None"], value="BTC", label="Chain").classes("w-64").tooltip(
                 "Which SHA-256 blockchain this pool mines. Set to 'None' if not applicable. "
                 "Oracle auto-balance requires one BTC and one BCH pool.")
+            ui.separator().classes("my-2")
+            btn_poolA_select = ui.button("Select from Address Book", icon="menu_book").props(
+                "flat dense no-caps").classes("text-sm").style("color: #6E93D6").tooltip(
+                "Fill Pool A fields from a previously saved pool.")
 
         # Pool B
         with ui.expansion("Pool B Settings:", icon="settings").classes("w-full").tooltip("Settings for Pool B"):
@@ -2256,6 +2663,10 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             poolB_chain  = ui.select(["BTC", "BCH", "BSV", "DGB", "XEC", "PPC", "None"], value="BCH", label="Chain").classes("w-64").tooltip(
                 "Which SHA-256 blockchain this pool mines. Set to 'None' if not applicable. "
                 "Oracle auto-balance requires one BTC and one BCH pool.")
+            ui.separator().classes("my-2")
+            btn_poolB_select = ui.button("Select from Address Book", icon="menu_book").props(
+                "flat dense no-caps").classes("text-sm").style("color: #6E93D6").tooltip(
+                "Fill Pool B fields from a previously saved pool.")
 
         # Scheduler
         with ui.expansion("Scheduler Settings:", icon="settings").classes("w-full").tooltip("Settings for the dual-pool scheduler"):
@@ -2271,10 +2682,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
 
             # Oracle Auto-Balance settings
             ui.label("Oracle Auto-Balance").classes("text-sm font-semibold").style("color: #6E93D6")
-            sch_auto_balance = ui.checkbox("Enable Auto-Balance").tooltip(
-                "When enabled, the oracle automatically adjusts Pool A/B weights based on real-time "
-                "BTC and BCH network hashrate. Manual weights and the slider are ignored. "
-                "Requires Pool A and Pool B to be assigned BTC and BCH (one each, in either order).")
+
             sch_max_deviation = ui.number("Max Deviation (%)", value=20, precision=0).props("step=1 min=5 max=45").classes("w-64").tooltip(
                 "Maximum percentage points the oracle can deviate from 50/50. "
                 "Example: 20 means weights can range from 30/70 to 70/30. "
@@ -2283,10 +2691,22 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             sch_oracle_url = ui.input("Oracle URL").classes("w-full").tooltip(
                 "URL of the oracle data endpoint (oracle.php). "
                 "Default: https://www.sr-analyst.com/dpmp/oracle.php")
+
             sch_oracle_poll = ui.number("Oracle Poll Seconds", value=600, precision=0).props("step=60 min=600 max=3600").classes("w-64").tooltip(
                 "How often the oracle fetches fresh hashrate data, in seconds. "
                 "Default: 600 (10 minutes). Minimum: 600. "
                 "The data collector updates every 10 minutes, so polling faster has no benefit.")
+
+            ui.separator().classes("my-2")
+
+            # Pool Compatibility
+            ui.label("Pool Compatibility").classes("text-sm font-semibold").style("color: #6E93D6")
+            sch_force_reconnect_en2 = ui.checkbox("Force reconnect on en2 size mismatch").tooltip(
+                "When enabled, miners will fully disconnect and reconnect when switching between pools "
+                "that have different extranonce2 sizes (e.g. Bassin en2=8 paired with PublicPool en2=4). "
+                "This ensures each pool receives correctly-sized shares. "
+                "Not needed for MiningCore/Bassin which handles oversized en2 gracefully. "
+                "Enable only if one pool shows 0 accepted shares.")
 
         ui.separator()
 
@@ -2391,17 +2811,72 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             sch_weightA.value    = _to_int(_safe_get(cfg, ["scheduler", "poolA_weight"], 50), 50)
             sch_weightB.value    = _to_int(_safe_get(cfg, ["scheduler", "poolB_weight"], 50), 50)
 
-            # oracle auto-balance
-            sch_auto_balance.value  = bool(_safe_get(cfg, ["scheduler", "auto_balance"], False))
+            # oracle auto-balance            
             sch_max_deviation.value = _to_int(_safe_get(cfg, ["scheduler", "auto_balance_max_deviation"], 20), 20)
             sch_oracle_url.value    = str(_safe_get(cfg, ["scheduler", "oracle_url"], "https://www.sr-analyst.com/dpmp/oracle.php") or "")
             sch_oracle_poll.value   = _to_int(_safe_get(cfg, ["scheduler", "oracle_poll_seconds"], 600), 600)
+            sch_force_reconnect_en2.value = bool(_safe_get(cfg, ["scheduler", "force_reconnect_on_en2_mismatch"], False))
 
             lbl_cfg.text = f"[{now_utc()}] reloaded"
             ui.notify("config reloaded", type="positive")
 
+        def _open_address_book_dialog(target_pool: str):
+            """Open address book selection dialog for the given pool (A or B)."""
+            book = load_address_book()
+            if not book:
+                ui.notify("Address book is empty. Pools are saved automatically when you click Apply.", type="info")
+                return
+
+            with ui.dialog() as dlg, ui.card().classes("w-full max-w-lg"):
+                ui.label("Select a Pool").classes("text-base font-semibold").style("color: #6E93D6")
+                ui.separator().classes("my-2")
+
+                for key, entry in sorted(book.items(), key=lambda x: x[1].get("name", x[0]).lower()):
+                    name    = entry.get("name", "") or key
+                    host    = entry.get("host", "")
+                    port    = entry.get("port", 3333)
+                    wallet  = entry.get("wallet", "")
+                    chain   = entry.get("chain", "BTC")
+
+                    def _make_handler(e=entry, d=dlg, tp=target_pool):
+                        def _handler():
+                            if tp == "A":
+                                poolA_host.set_value(e.get("host", ""))
+                                poolA_name.set_value(e.get("name", ""))
+                                poolA_port.set_value(e.get("port", 3333))
+                                poolA_wallet.set_value(e.get("wallet", ""))
+                                _chain_val = e.get("chain", "BTC")
+                                if _chain_val in ["BTC", "BCH", "BSV", "DGB", "XEC", "PPC", "None"]:
+                                    poolA_chain.set_value(_chain_val)
+                            else:
+                                poolB_host.set_value(e.get("host", ""))
+                                poolB_name.set_value(e.get("name", ""))
+                                poolB_port.set_value(e.get("port", 3333))
+                                poolB_wallet.set_value(e.get("wallet", ""))
+                                _chain_val = e.get("chain", "BTC")
+                                if _chain_val in ["BTC", "BCH", "BSV", "DGB", "XEC", "PPC", "None"]:
+                                    poolB_chain.set_value(_chain_val)
+                            d.close()
+                            ui.notify(f"Pool fields filled from address book.", type="positive")
+                        return _handler
+
+                    with ui.row().classes("w-full items-center justify-between gap-2"):
+                        with ui.column().classes("flex-1 gap-0"):
+                            ui.label(f"{name}").classes("text-sm font-semibold")
+                            ui.label(f"{host}:{port}  |  {chain}").classes("text-xs").style("color: #888")
+                        ui.button("Select", on_click=_make_handler()).props("dense outline size=sm")
+                    ui.separator().classes("my-1")
+
+                ui.button("Cancel", on_click=dlg.close).props("flat dense no-caps").classes("text-sm")
+
+            dlg.open()
+
+        btn_poolA_select.on_click(lambda: _open_address_book_dialog("A"))
+        btn_poolB_select.on_click(lambda: _open_address_book_dialog("B"))
+
         def apply_cfg():
             # start from current on-disk config so we preserve unknown fields
+
             try:
                 raw = read_text_file(CONFIG_PATH, max_bytes=500_000)
                 cfg = json.loads(raw or "{}")
@@ -2444,6 +2919,16 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             cfg["pools"]["B"]["wallet"] = str(poolB_wallet.value or "").strip()
             cfg["pools"]["B"]["chain"]  = str(poolB_chain.value or "BCH").strip().upper()
 
+            # Auto-save both pools to address book (only if not already present)
+            address_book_autosave(
+                cfg["pools"]["A"]["host"], cfg["pools"]["A"]["port"],
+                cfg["pools"]["A"]["name"], cfg["pools"]["A"]["wallet"],
+                cfg["pools"]["A"]["chain"])
+            address_book_autosave(
+                cfg["pools"]["B"]["host"], cfg["pools"]["B"]["port"],
+                cfg["pools"]["B"]["name"], cfg["pools"]["B"]["wallet"],
+                cfg["pools"]["B"]["chain"])
+
             # scheduler
             cfg.setdefault("scheduler", {})
             #cfg["scheduler"]["min_switch_seconds"] = _to_int(sch_min_switch.value, 30)
@@ -2451,11 +2936,11 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             cfg["scheduler"]["poolA_weight"]       = _to_int(sch_weightA.value, 50)
             cfg["scheduler"]["poolB_weight"]       = _to_int(sch_weightB.value, 50)
 
-            # oracle auto-balance
-            cfg["scheduler"]["auto_balance"]               = bool(sch_auto_balance.value)
+            # oracle auto-balance            
             cfg["scheduler"]["auto_balance_max_deviation"]  = max(5, min(45, _to_int(sch_max_deviation.value, 20)))
             cfg["scheduler"]["oracle_url"]                 = str(sch_oracle_url.value or "").strip()
             cfg["scheduler"]["oracle_poll_seconds"]        = max(600, min(3600, _to_int(sch_oracle_poll.value, 600)))
+            cfg["scheduler"]["force_reconnect_on_en2_mismatch"] = bool(sch_force_reconnect_en2.value)
 
             cfg.setdefault("scheduler", {}).setdefault("mode", "ratio")  # preserve/ensure
 
@@ -2469,6 +2954,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             delete_weight_override()
             # Delete oracle_mode.json so DPMP falls back to config auto_balance
             delete_oracle_mode()
+            delete_manual_mode()
             # Reset slider back to NEW config defaults (recompute from saved config)
             if weight_slider_ref is not None:
                 new_wA = _to_int(sch_weightA.value, 50)

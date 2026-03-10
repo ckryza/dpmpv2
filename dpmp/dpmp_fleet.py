@@ -40,24 +40,28 @@ _get_paused_fn = None       # get_paused_miners() -> set from dpmpv2
 
 def init(*, log_fn, read_weights_fn, read_oracle_fn, health_gauge,
          worker_stats_path, best_shares_path, fleet_health_path,
-         fleet_metrics_path, scheduler_diag_path, get_paused_fn=None):
+         fleet_metrics_path, scheduler_diag_path, get_paused_fn=None,
+         manual_mode_path=None, pinned_assignments_path=None):
     """Wire up external dependencies. Called once from dpmpv2.main().
 
     Args:
-        log_fn:            log(event, **kwargs) function
-        read_weights_fn:   read_weight_override() -> tuple | None
-        read_oracle_fn:    read_oracle_mode(config_auto_balance) -> bool
-        health_gauge:      Prometheus Gauge for MINER_HEALTH
-        worker_stats_path: path to worker_stats.json
-        best_shares_path:  path to best_shares.json
-        fleet_health_path: path to fleet_health.json
-        fleet_metrics_path: path to fleet_metrics.json
-        scheduler_diag_path: path to scheduler_diag.csv
-        get_paused_fn:     get_paused_miners() -> set of paused worker names
+        log_fn:                  log(event, **kwargs) function
+        read_weights_fn:         read_weight_override() -> tuple | None
+        read_oracle_fn:          read_oracle_mode(config_auto_balance) -> bool
+        health_gauge:            Prometheus Gauge for MINER_HEALTH
+        worker_stats_path:       path to worker_stats.json
+        best_shares_path:        path to best_shares.json
+        fleet_health_path:       path to fleet_health.json
+        fleet_metrics_path:      path to fleet_metrics.json
+        scheduler_diag_path:     path to scheduler_diag.csv
+        get_paused_fn:           get_paused_miners() -> set of paused worker names
+        manual_mode_path:        path to manual_mode.json
+        pinned_assignments_path: path to pinned_assignments.json
     """
     global _log_fn, _read_weights_fn, _read_oracle_fn, _health_gauge
     global WORKER_STATS_PATH, BEST_SHARES_PATH, FLEET_HEALTH_PATH
     global FLEET_METRICS_PATH, SCHEDULER_DIAG_PATH, _get_paused_fn
+    global MANUAL_MODE_PATH, PINNED_ASSIGNMENTS_PATH
     _log_fn = log_fn
     _read_weights_fn = read_weights_fn
     _read_oracle_fn = read_oracle_fn
@@ -68,7 +72,8 @@ def init(*, log_fn, read_weights_fn, read_oracle_fn, health_gauge,
     FLEET_HEALTH_PATH = fleet_health_path
     FLEET_METRICS_PATH = fleet_metrics_path
     SCHEDULER_DIAG_PATH = scheduler_diag_path
-
+    MANUAL_MODE_PATH = manual_mode_path
+    PINNED_ASSIGNMENTS_PATH = pinned_assignments_path
 
 def log(event, **kw):
     """Internal log wrapper -- delegates to injected log function."""
@@ -90,7 +95,88 @@ def read_oracle_mode(config_auto_balance=False):
     return config_auto_balance
 
 
-SWITCH_SUBMIT_GRACE_S = 6.0   # BASE grace window for VarDiff suppression (seconds).
+# ---------------------------------------------------------------------------
+# Manual Mode helpers
+# ---------------------------------------------------------------------------
+# Manual mode is a third scheduler mode alongside Slider and Oracle.
+# When active, every miner is statically assigned to Pool A or B based on
+# the user's choices stored in pinned_assignments.json.  The bin-packing
+# algorithm in _compute_assignments() is bypassed entirely.
+#
+# manual_mode.json  -- {"manual_active": true/false}
+# pinned_assignments.json -- {"WorkerName": "A", "WorkerName2": "B", ...}
+#   Only miners assigned to Pool B are stored; Pool A is the default.
+# ---------------------------------------------------------------------------
+
+def is_manual_mode_active() -> bool:
+    """Return True if Manual mode is currently active.
+
+    Reads manual_mode.json from disk on every call so the scheduler
+    picks up mode changes without a restart.  Returns False if the
+    file is missing or unreadable (safe default: normal scheduling).
+    """
+    if not MANUAL_MODE_PATH:
+        return False
+    try:
+        with open(MANUAL_MODE_PATH, "r") as f:
+            obj = json.load(f)
+        return bool(obj.get("manual_active", False))
+    except Exception:
+        return False
+
+
+def read_pinned_assignments() -> dict:
+    """Read pinned_assignments.json and return {worker_name: pool_key}.
+
+    Pool A is the default -- only B assignments are stored in the file,
+    so any worker not listed defaults to 'A'.
+
+    Returns an empty dict if the file is missing (all miners default to A).
+
+    Example return value:
+        {"BM101": "B", "BitAxe2": "B"}
+    """
+    if not PINNED_ASSIGNMENTS_PATH:
+        return {}
+    try:
+        with open(PINNED_ASSIGNMENTS_PATH, "r") as f:
+            obj = json.load(f)
+        # Validate: only keep entries with pool "A" or "B"
+        return {k: v for k, v in obj.items() if v in ("A", "B")}
+    except Exception:
+        return {}
+
+
+def write_pinned_assignment(worker_name: str, pool: str) -> None:
+    """Update one miner's assignment in pinned_assignments.json.
+
+    Reads the current file, updates the single entry, and writes back
+    atomically (tmp + os.replace).  Pool A assignments are removed from
+    the file (A is the default), keeping the file minimal.
+
+    Args:
+        worker_name: The miner's worker name (e.g. "AvalonQ")
+        pool:        "A" or "B"
+    """
+    if not PINNED_ASSIGNMENTS_PATH:
+        return
+    try:
+        assignments = read_pinned_assignments()
+        if pool == "B":
+            assignments[worker_name] = "B"
+        else:
+            # A is default -- remove from file so it stays minimal
+            assignments.pop(worker_name, None)
+        tmp = PINNED_ASSIGNMENTS_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(assignments, f, indent=2)
+        os.replace(tmp, PINNED_ASSIGNMENTS_PATH)
+        log("pinned_assignment_written", worker=worker_name, pool=pool)
+    except Exception as e:
+        log("pinned_assignment_write_error", worker=worker_name, err=str(e))
+
+
+SWITCH_SUBMIT_GRACE_S = 15.0   # BASE grace window for VarDiff suppression (seconds).
                               # The actual per-miner grace window is computed dynamically
                               # by miner_grace_window_s() which adds time proportional
                               # to the miner's hashrate.  This base covers network latency
@@ -181,6 +267,8 @@ _fleet_health: dict[str, float] = {}   # worker_name -> score (0.1 to 1.0)
 FLEET_HEALTH_PATH: str | None = None   # set in main(), e.g. /data/fleet_health.json
 FLEET_METRICS_PATH: str | None = None  # set in main(), e.g. /data/fleet_metrics.json
 SCHEDULER_DIAG_PATH: str | None = None  # set in main(), e.g. /data/scheduler_diag.csv
+MANUAL_MODE_PATH: str | None = None      # set in init(), e.g. /data/manual_mode.json
+PINNED_ASSIGNMENTS_PATH: str | None = None  # set in init(), e.g. /data/pinned_assignments.json
 _HEALTH_ALPHA = 0.1  # EWMA smoothing: each event shifts score by 10% of delta
 
 # ---------------------------------------------------------------------------
@@ -1686,6 +1774,35 @@ def _compute_assignments(fleet: dict, min_slice_s: float) -> dict:
     if not miners_data:
         return assignments
 
+    # ------------------------------------------------------------------
+    # Manual Mode: bypass bin-packing entirely.
+    # Each miner is assigned statically to their user-chosen pool.
+    # Paused miners still get their current pool (same as normal mode).
+    # ------------------------------------------------------------------
+    if is_manual_mode_active():
+        pinned = read_pinned_assignments()  # {worker_name: "A" or "B"}
+        _paused = _get_paused_fn() if _get_paused_fn else set()
+        for sid_str, m in miners_data.items():
+            wname = m.get("worker_name", "")
+            if wname and wname in _paused:
+                # Paused miners stay on their current pool, same as normal mode
+                assignments[sid_str] = {
+                    "mode": "static",
+                    "pool": m.get("current_pool", "A"),
+                }
+            else:
+                # Use the user's pinned assignment; default to A if not listed
+                pool = pinned.get(wname, "A")
+                assignments[sid_str] = {
+                    "mode": "static",
+                    "pool": pool,
+                }
+        log("assigner_manual_mode",
+            miner_count=len(miners_data),
+            assignments={m.get("worker_name", s): assignments[s].get("pool")
+                         for s, m in miners_data.items()})
+        return assignments
+
     # Identify paused miners -- they get a static assignment on their
     # current pool but are excluded from all ratio/hashrate calculations.
     _paused = _get_paused_fn() if _get_paused_fn else set()
@@ -2313,6 +2430,12 @@ def en2_force_pin(miner_ip: str) -> None:
     if miner_ip not in _en2_force_disconnect:
         _en2_force_disconnect.add(miner_ip)
 
+def en2_clear_pin(miner_ip: str) -> None:
+    """Clear a miner IP's pin, allowing it to switch pools again.
+    Used by Manual mode force-reconnect to give the miner a clean slate."""
+    _en2_force_disconnect.discard(miner_ip)
+    en2_strikes[miner_ip] = 0
+    _reconnect_switch_attempts[miner_ip] = 0
 
 def en2_is_pinned(miner_ip: str) -> bool:
     """Check if a miner IP is pinned (cannot switch pools).
@@ -2344,7 +2467,7 @@ def en2_is_pinned(miner_ip: str) -> bool:
 
 _reconnect_switch_attempts: dict[str, int] = {}
 _reconnect_switch_last_pool: dict[str, str] = {}
-_RECONNECT_SWITCH_MAX_ATTEMPTS = 3  # try reconnect once, pin on second failure (was 1)
+_RECONNECT_SWITCH_MAX_ATTEMPTS = 1  # try reconnect once, pin on second failure (was 1)
 
 
 def reconnect_switch_should_pin(miner_ip: str, target_pool: str) -> bool:

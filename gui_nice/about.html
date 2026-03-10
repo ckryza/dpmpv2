@@ -1,366 +1,803 @@
-<h3>Dual-Pool Mining Proxy (DPMP)</h3>
-<p dir="auto"> <img src="/static/icond.png" style="float:left; width:170px; height:170px; margin:0 16px 8px 0;" />
-    <strong>DPMP</strong> is a
-    lightweight, high-reliability&nbsp;<strong>Stratum v1 mining
-        proxy</strong>&nbsp;designed to sit between one or more miners and&nbsp;two upstream mining pools. It was
-    designed primarily for Bitcoin solo-miners who run one or more ASIC miners (SHA-256) and want to split hash power
-    across compatible coins/pools (i.e., BTC/BCH/DGB). Some miners, like the NerdQAxe++, have a built-in "dual pool
-    mining" feature but the majority of miners out there do not.
-</p>
-<p dir="auto">So if you have one or more miners that do NOT have a built-in dual-pool mining feature (such as the Canaan
-    Avalon Q
-    or the Nano3S) and you would like, for example, to mine to a BTC pool and a Bitcoin Cash pool simultaneously, then
-    <strong>DPMP</strong> is for you.&nbsp;
-</p>
-<p dir="auto"><strong>DPMP</strong> enables&nbsp;<strong>deterministic dual-pool scheduling</strong>, advanced
-    difficulty/extranonce handling, and observability via Prometheus metrics &mdash; while remaining simple to deploy
-    and operate.</p>
-<p dir="auto">At a high level, <strong>DPMP</strong>:</p>
-<ul dir="auto">
-    <li>Accepts Stratum connections from miners (acts like a pool)</li>
-    <li>Maintains concurrent Stratum connections to&nbsp;<strong>two upstream pools</strong>&nbsp;(acts like a miner)
-    </li>
-    <li>Routes jobs and share submissions according to a&nbsp;<strong>scheduler</strong> with manual or auto-balancing
-    </li>
-    <li>Ensures correct propagation of:
-        <ul dir="auto">
-            <li>difficulty</li>
-            <li>extranonce</li>
-            <li>job IDs</li>
-        </ul>
-    </li>
-    <li>Exposes runtime metrics for monitoring and analysis</li>
-    <li>Logs structured, machine-readable events for debugging and auditing</li>
-</ul>
-<p dir="auto">The proxy is intentionally&nbsp;<strong>transparent</strong>: miners and pools do not need to be modified
-    or aware that <strong>DPMP</strong> is in the middle.</p>
-<p dir="auto">Please visit the <strong>DPMP</strong> landing page at: <a href="https://ckryza.github.io/dpmpv2/"
-        target="_blank" rel="noopener noreferrer"><b>https://ckryza.github.io/dpmpv2/</b></a>.</p>
-<hr />
-<h4>Fleet-Aware Scheduling</h4>
-<p dir="auto"><strong>DPMP</strong>'s scheduler uses a fleet-aware assignment strategy that evaluates each miner's
-    hashrate, health
-    score, and firmware capabilities to determine the optimal role for every miner in the fleet. Rather than switching
-    all miners simultaneously between pools — which causes dramatic ratio oscillations, reject storms, and unnecessary
-    wear on sensitive devices — the scheduler divides the fleet into Static and Dynamic categories.</p>
-<p dir="auto">Small miners are assigned statically to whichever pool needs their hashrate to meet the target weight
-    ratio, where
-    they mine continuously without ever switching. Only the minimum number of miners necessary are designated as Dynamic
-    time-slicers, and these are chosen based on hashrate fit and health score to ensure the most capable and reliable
-    miners handle the switching workload.</p>
-<p dir="auto">This approach eliminates the "herding behavior" of the original implementation, where the entire fleet
-    would stampede
-    from one pool to the other and back again, producing wild swings in the actual ratio and floods of rejected shares.
-    Instead, the target ratio is maintained smoothly by one or two Dynamic miners alternating between pools on
-    calculated time intervals, while the rest of the fleet mines undisturbed.</p>
-<p dir="auto">The result is faster convergence to the target weights, dramatically lower fleet-wide reject rates, and
-    graceful
-    handling of mixed fleets containing miners with varying capabilities and firmware quirks.</p>
-<hr />
+<!-- DPMP About / User Guide -->
+<style>
+    /* -- Base (dark background) -- */
+    .about-body {
+        font-family: 'Outfit', 'Segoe UI', sans-serif;
+        line-height: 1.72;
+        color: #d4dce8;
+    }
 
-<h4>Pool Compatibility and Miner Protection</h4>
-<p dir="auto"><strong>DPMP</strong> presents itself as a ckpool-compatible Stratum v1 proxy to all connected miners,
-    regardless of
-    what upstream pool types are configured. This means your miners see a single, consistent mining endpoint — they
-    never need to know that Pool A might be running MiningCore while Pool B runs Bassin (ckpool). Behind the scenes,
-    <strong>DPMP</strong> handles the translation between different pool behaviors, including differences in difficulty
-    management (VarDiff), extranonce formatting, job delivery timing, and share validation. Each miner maintains its own
-    independent connection to both upstream pools through <strong>DPMP</strong>, and the scheduler seamlessly routes
-    work and shares to the correct pool based on the current allocation weights.
-</p>
-<p dir="auto">From the miner's perspective, it is simply connected to one stable pool that occasionally sends new work —
-    exactly as
-    a direct ckpool-type connection would behave.</p>
+    .about-body h3 {
+        font-size: 1.35rem;
+        font-weight: 700;
+        color: #e6edf8;
+        margin: 0 0 12px 0;
+    }
 
-<hr />
-<h4>Automatic Miner Compatibility Detection</h4>
+    .about-body h4 {
+        font-size: 1.0rem;
+        font-weight: 700;
+        color: #6E93D6;
+        margin: 28px 0 8px 0;
+        padding-bottom: 5px;
+        border-bottom: 1px solid rgba(110, 147, 214, 0.4);
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
 
-<p dir="auto">Some miners cannot handle mid-session changes to
-    their extranonce parameters, which is required when switching between pools that use different extranonce sizes (for
-    example, a 4-byte pool and an 8-byte pool).</p>
-<p dir="auto">When <strong>DPMP</strong> detects this incompatibility, it adapts automatically. On the first pool switch
-    attempt,
-    if a miner accumulates 10 or more consecutive rejected shares with zero accepts, <strong>DPMP</strong> flags that
-    miner's IP as extranonce-sensitive and immediately reconnects it back to its original pool.</p>
-<p dir="auto">On all subsequent switch attempts, rather than trying to change the extranonce mid-session (which the
-    miner would
-    ignore, producing invalid shares), <strong>DPMP</strong> gracefully closes the miner's connection and sets a
-    handshake hint pointing to the target pool. The miner reconnects within about one second, performs a fresh handshake
-    directly with the new pool, and begins mining immediately with the correct parameters — no rejected shares, no
-    manual intervention. A 30-second cooldown between forced reconnects provides an additional safety net against
-    excessive disconnects. This entire process is transparent to the miner and requires no configuration;
-    <strong>DPMP</strong> learns each miner's capabilities and adjusts its switching strategy accordingly.
-</p>
+    .about-body p {
+        margin: 0 0 12px 0;
+        font-size: 0.9rem;
+    }
 
-<hr />
-<h4>Dynamic Miner Reject Rates and Pool Switching</h4>
-<p dir="auto">Miners assigned to the "Dynamic" (time_slice) category will typically show a higher reject rate in their
-    individual
-    dashboards compared to statically-assigned miners. This is a normal and expected side effect of how
-    <strong>DPMP</strong> operates. When a Dynamic miner receives a pool switch command, it must flush its internal work
-    pipeline — any shares it has already computed but not yet submitted were built using the previous pool's job data,
-    difficulty, and extranonce parameters. These in-flight shares are essentially orphaned the moment the switch occurs,
-    because the new pool has no knowledge of the old pool's work templates. The new pool will reject these stale shares
-    as invalid, even though the miner performed legitimate work.
-</p>
-<p dir="auto">From the miner's perspective, it did everything correctly; the rejects are simply a consequence of the
-    pool context
-    changing underneath it. <strong>DPMP</strong> mitigates this by suppressing many of these transient rejects
-    internally — intercepting them before they reach the miner and returning fake "accepted" responses — but a small
-    number may still pass through during the brief transition window.</p>
-<p dir="auto">Importantly, these rejects do not represent lost hashrate or wasted electricity in any meaningful sense;
-    the miner
-    immediately begins productive work on the new pool within one to two seconds of the switch.</p>
+    .about-body ul,
+    .about-body ol {
+        margin: 0 0 12px 0;
+        padding-left: 22px;
+        font-size: 0.9rem;
+    }
 
-<hr />
-<h4>The Relationship Between Slice Duration and Reject Rate</h4>
-<p dir="auto">There is a direct inverse relationship between the "Slice Seconds" configuration value and the reject rate
-    seen on
-    Dynamic miners. Each pool switch carries a roughly fixed cost of a few rejected shares during the transition,
-    regardless of how long the miner stays on a given pool. If "Slice Seconds"" is set low (for example, 10 seconds),
-    the miner switches more frequently, and those fixed-cost rejects accumulate as a larger percentage of total shares
-    submitted.</p>
-<p dir="auto">Conversely, a higher "Slice Seconds" (for example, 30 seconds) means fewer switches per hour and a
-    proportionally
-    lower reject rate, since the miner spends more time doing productive work between each transition. For most
-    configurations, a "Slice Seconds" value between 20 and 30 seconds strikes a good balance between responsive weight
-    tracking and acceptable reject rates, typically keeping the Dynamic miner's dashboard reject rate below 2-3%.</p>
-<p dir="auto">It is important to keep in mind when configuring <strong>DPMP</strong> that the higher the "Slice Seconds"
-    value, the
-    more stable the miner's performance will be (e.g., lower reject percentage), but it will take longer for the system
-    to respond to pool ratio changes. We recommend that you start with a value of 10 for the "Slice Seconds" setting. If
-    you see a spike in reject rate on any Dynamic miner, consider increasing the "Slice Seconds" value to 20 or 25 to
-    reduce the
-    frequency of pool switches. The valid range for "Slice Seconds" is between 10 and 30 seconds.
-</p>
+    .about-body li {
+        margin-bottom: 5px;
+    }
 
-<hr />
-<h4>Hashrate Allocation - Dynamic</h4>
-<p dir="auto"><strong>Dynamic Hashrate Allocation</strong>: with the slider on the Home tab, you can adjust the hashrate
-    allocation (weighting) in realtime with no restart required. Just drag the slider to the desired position and
-    <strong>DPMP</strong> will adjust accordingly. Some limitations do apply. The slider ranges from 5% to 95% so you
-    cannot allocate 100% of the hashrate to one pool or the other. If you DO want either 0/100 or 100/0 weightings, you
-    must set that in the <strong>scheduler</strong> section on the Configuration tab and restart <strong>DPMP</strong>.
-    And if your weighting is set to either 0/100 or 100/0, the <strong>Hashrate Allocation</strong> slider will no
-    longer appear on the Home tab. Bottom line, though, if you need to temporarily move some hashrate from one pool to
-    the other, the <strong>Hashrate Allocation</strong> slider is the best way to do that.
-</p>
-<hr />
-<h4>Hashrate Allocation - Auto-Balance</h4>
-<p dir="auto"><strong>Auto-Balancing</strong>: if you enable the "Auto Balance" feature in the
-    <strong>scheduler</strong> section on the Configuration tab, <strong>DPMP</strong> will automatically adjust the
-    pool weighting ratio periodically based on the observed realtime network hashrate of the coin associated with each
-    pool. The default pool ratio when in "Auto-Balancet" mode is 50/50 and it adjusts from there. The goal of this
-    feature is to send more hashrate to the pool where our hashrate has more "value". So, for example, if BTC short-term
-    network hashrate increases relative to its long-term hashrate while BCH hashrate decreases then
-    <strong>DPMP</strong> will automatically adjust the weighting to send more hashrate to BCH and less to BTC.
-</p>
-<p dir="auto">The hashrate information is obtained by polling an oracle API endpoint at regular intervals (default is
-    every 10 minutes) and the oracle data is used to calculate the optimal pool weighting ratio based on the relative
-    hashrate changes. The oracle URL, poll interval, and max deviation threshold can all be configured in the
-    <strong>scheduler</strong> section on the Configuration tab. When the Auto-Balancer feature is enabled, the
-    <strong>Hashrate Allocation</strong> slider on the Home tab will no longer be visible since the pool weighting will
-    be automatically managed by <strong>DPMP</strong>. In its place a new panel will appear showing the current
-    oracle-based pool weighting ratio as well as the realtime network hashrate for each pool. You can also see the
-    oracle data in the Prometheus metrics (ORACLE_HASHRATE, ORACLE_RATIO, ORACLE_WEIGHT, ORACLE_STATUS, and ORACLE_AGE).
-</p>
-<p dir="auto">Now, our "baseline" network hashrate calculation tracks closely with what you'd see on hashrate reporting
-    sites (e.g., CoinWarz), while the short-term window deliberately captures block-to-block variance to detect
-    transient hashrate shifts — the Auto-Balancer acts on the ratio between the two, not the raw numbers. </p>
-<p dir="auto">Some limitations do apply when using the Auto-Balance feature. Currently, we only support BTC and BCH
-    pools. In the Pool A and B sections of your configuration file you must specify a chain name for each pool (e.g.,
-    "BTC" or "BCH").
-    So, if you are using a combination of pools that are not BTC/BCH (or BCH/BTC) then you won't be able to use the
-    Auto-Balance feature, but you can always use the Hashrate Allocation slider to adjust the weighting in realtime.
-    We also limit the <em>max deviation threshold</em> to between 5 and 45. So with a setting of 5 the Auto-Balancer
-    will never move beyond a
-    45/55 - 55/45 ratio. With a max deviation threshold of 45, the Auto-Balancer will never move beyond a 5/95 - 95/5
-    ratio. The
-    default max deviation value is 20, so the Auto-Balancer will never move beyond 30/70 - 70/30.</p>
-<p dir="auto"><strong>Note</strong>: You can toggle between the Slider panel and the Auto-Balancer panel at any time by
-    clicking on the <strong>Slider/Oracle</strong> button, and the hashrate allocation will adjust accordingly. Also,
-    the network hashrate charts only update if the data points (e.g. short-term and long-term) change. So even though
-    the default polling interval is every 10 minutes, the charts may not update on every polling cycle if the network
-    hashrate values do not change. If one of the values change, the charts will definitely update.</p>
+    .about-body hr {
+        border: none;
+        border-top: 1px solid rgba(110, 147, 214, 0.2);
+        margin: 24px 0;
+    }
 
-<hr />
-<h4>Stats Tab</h4>
+    .about-body a {
+        color: #38bdf8;
+        text-decoration: none;
+    }
 
-<p>The Stats tab provides real-time visibility into every aspect of your mining fleet. It is organized into three
-    collapsible sections, each containing a sortable table that updates every five seconds. Click any column header to
-    sort the table by that column, and click again to reverse the sort order.</p>
+    .about-body a:hover {
+        text-decoration: underline;
+    }
 
-<h4>Fleet Stats</h4>
+    .about-body strong {
+        color: #e6edf8;
+    }
 
-<p>The Fleet Stats table gives you a scheduler-level view of your entire fleet. Each connected miner appears as a row
-    showing its current pool assignment (A or B), how long it has been mining on that pool, and whether the scheduler
-    has assigned it as <em>Static</em> (locked to one pool) or <em>Dynamic</em> (actively time-slicing between both
-    pools to achieve the target ratio). The <em>Pinned</em> column indicates whether a miner has been automatically
-    pinned to a single pool due to hardware incompatibility with mid-session pool switching. The <em>Switches</em>
-    column tracks how many times each miner has changed pools since it connected, while <em>Contribution</em> shows each
-    miner's share of total accepted difficulty across the fleet as a percentage. The <em>Health</em> column displays a
-    reliability score from 0.00 to 1.00 that reflects how cleanly each miner handles pool switches over time &mdash; a
-    score of 1.00 indicates no issues, while lower scores mean the miner has experienced rejects or disconnects after
-    switches. A totals row at the bottom summarizes fleet-wide switch counts and confirms that contributions sum to
-    100%.</p>
+    .about-body code {
+        font-family: 'JetBrains Mono', 'Courier New', monospace;
+        font-size: 0.82rem;
+        background: rgba(110, 147, 214, 0.12);
+        color: #38bdf8;
+        padding: 1px 6px;
+        border-radius: 4px;
+    }
 
-<h4>Worker Stats</h4>
+    /* Tab pill - used for Home, Stats, Config, Logs */
+    .tab-pill {
+        display: inline-block;
+        font-size: 0.78rem;
+        font-weight: 600;
+        background: rgba(110, 147, 214, 0.13);
+        color: #6E93D6;
+        padding: 1px 8px;
+        border-radius: 5px;
+        border: 1px solid rgba(110, 147, 214, 0.3);
+        font-family: 'Outfit', 'Segoe UI', sans-serif;
+        white-space: nowrap;
+    }
 
-<p>The Worker Stats table focuses on individual miner performance. Each row shows a miner's estimated hashrate over
-    three rolling windows (5-minute, 60-minute, and 24-hour), its current share submission rate, working difficulty,
-    total accepted shares, best share found, reject count, and reject percentage. The <em>Seen</em> column shows how
-    recently each miner submitted a share, and workers that have not been seen for five minutes are automatically
-    removed from the table. At the far right of each row is an on/off toggle button that allows you to temporarily
-    disable a miner without disconnecting it. When toggled off, the miner remains connected to DPMP but is excluded from
-    scheduling and its shares are silently swallowed (the miner receives fake "accepted" responses so it continues
-    hashing without errors). Toggling a miner back on immediately restores it to normal operation. This is useful for
-    testing, maintenance, or temporarily removing a problematic miner from the fleet without physically accessing the
-    device. The toggle state resets to "on" when <b>DPMP</b> restarts.</p>
+    /* Mode badge - used for Slider, Oracle Auto-Balance, Manual Assignment */
+    .mode-badge {
+        display: inline-block;
+        font-size: 0.8rem;
+        font-weight: 600;
+        color: #f0b449;
+        white-space: nowrap;
+    }
 
-<h4>Pool Stats</h4>
+    /* Config section name - used for Pool A Settings, Scheduler Settings, etc. */
+    .cfg {
+        font-weight: 700;
+        color: #a5b8d4;
+    }
 
-<p>The Pool Stats table provides a per-pool summary of connection health and share accounting. Each row represents one
-    of the two configured pools and shows its slot (A or B), detected coin type, the extranonce2 size advertised by the
-    pool, the current ratio of hashrate allocated to that pool, the pool's estimated 5-minute hashrate, and the upstream
-    connection latency. The accepted and rejected share counts reflect cumulative totals since <b>DPMP</b> started, along with
-    the corresponding reject percentage. The <em>Jobs</em> column shows the total number of mining notifications
-    received from each pool, and <em>TotalDiff</em> shows the sum of all accepted share difficulties. Note that accepted
-    and rejected counts may include data from workers that have since disconnected.</p>
-<hr />
-<h4>Pool Failover Protection</h4>
-<p dir="auto"><strong>DPMP</strong> has pool failover protection implemented as follows: if you are splitting work
-    between pools A and B (i.e., pool weighting ratio is NOT 0/100 or 100/0) then if either pool fails, all work (100%)
-    will be routed to the pool that is still active. When the inactive pool becomes available again, the original
-    weighting logic will resume. If BOTH pools become unavailable, <strong>DPMP</strong> will simply wait until one or
-    both pools become available again and, during this time, it will maintain a connection with any miners attached. If
-    you are currently routing to only one pool (i.e., pool weighting is 0/100 or 100/0) then if the active pool becomes
-    unavailable, <strong>DPMP</strong> will simply wait until the pool becomes available again...in this situation it
-    will NOT route any work to the pool with the 0 weighting.</p>
-<hr />
-<h4 dir="auto">Configuration and Setup</h4>
-<p dir="auto">When <strong>DPMP</strong> first starts, you will need to go to the <em>Config</em>&nbsp;tab to edit the
-    <strong>pools</strong> section and, for both pools, put in the URL/IP Address, Port, and the wallet address to be
-    used when mining to that pool (make sure the wallet address is correct!) You can also give&nbsp;the pool a
-    name.&nbsp;
-</p>
-<p dir="auto">By detault, the work will be split 50/50 between the two pools. You can adjust the weighting in the
-    <strong>scheduler</strong> section (e.g., perhaps 70/30, or 90/10...whatever you like), or you can leave it at 50/50
-    and use the <strong>Hashrate Allocation</strong> slider on the <em>Home</em> tab to adjust the weighting in
-    realtime. If you want to use the Auto-Balancer feature, be sure to enable it in the <strong>scheduler</strong>
-    section, and make sure you have set up a BTC and BCH pool as described in the Auto-Balance section above.
-</p>
-<p dir="auto">Lastly, check the value of "Slice Seconds" in Scheduler Settings. Start with a value of 10 seconds and
-    give that a try. If you see too many rejects on your Dynamic miner dashboards, then raise the value in 5-second
-    increments until the reject percentage stabilizes.</p>
-<p dir="auto">Once you make the configuration changes, click the <strong>APPLY + RESTART</strong> button and
-    <strong>DPMP</strong> will restart. When it does, check the <em>Home</em> tab and make sure you see:
-    <strong>DPMP</strong>: running, and the tables on the <em>Stats</em> tab should begin to populate.
-</p>
-<p dir="auto">Now, for each miner you want to use with the proxy, set up the miner's Pool URL to point to the IP address
-    of the box on which you are running the <strong>DPMP</strong> proxy, set the Port to 3351, and put in one of your
-    wallet addresses, a period, and finally the workername (i.e., &lt;wallet address&gt;.&lt;workername&gt;)</p>
-<p dir="auto">Please note that the wallet address you input in the miner is <strong>NOT</strong> used by the
-    proxy...only the workername is used. The proxy gets the correct wallet address to use for each pool from the
-    <strong>DPMP</strong> Configuration file, and when it communicates with either pool it uses the correct wallet
-    address for that pool. So, for example, if you are setting up <strong>DPMP</strong> to mine to a regular Bitcoin
-    pool and to a Bitcoin Cash pool, in your miner config use either your Bitcoin wallet address or your Bitcoin Cash
-    wallet address (does not matter which) and then append the workername to the end as shown above.
-</p>
-<p dir="auto">Once your miners are configured and restarted, check the <em>Home</em> tab and you should see the correct
-    number of miners connected, and the Accepted, Rejected, and Jobs stats should be updating. You should also see your
-    miner(s) show up on your pool dashboards as well as in the <strong>DPMP</strong> Worker Table on the <em>Stats</em>
-    tab.</p>
-<p dir="auto"><strong>Note</strong>: When using <strong>DPMP</strong>, it&nbsp;is normal for the Rejection Rate reported
-    in your miner dashboard to be a bit higher than usual, and this is because switching between pools introduces some
-    <em>job not found</em> as well as some&nbsp;<em>stale job</em> conditions. Again, this is normal and nothing to be
-    worried about.
-</p>
-<hr />
-<h4>How Many Miners can DPMP Support</h4>
+    /* Callout boxes */
+    .callout {
+        border-left: 3px solid;
+        padding: 10px 14px;
+        border-radius: 0 8px 8px 0;
+        margin: 14px 0;
+        font-size: 0.875rem;
+    }
 
-<p dir="auto">I run my copy of <b>DPMP</b> on a AMD Ryzen 5 3550H with 16GB RAM and a 1TB SSD under umbrelOS 1.5 and
-    this setup
-    should easily support up to 50 miners with a hashrate range from 1 to 200TH/s. Now, higher hashrate miners actually
-    produce fewer shares per second (pool VarDiff scales up). A 1 PH/s miner at diff 65536 submits roughly 1 share every
-    4 seconds. So a farm of 100 x 300 TH/s miners might only generate ~50 shares/sec total, which is very manageable.
-    The ceiling isn't raw CPU — it's the single-threaded event loop getting saturated by JSON processing and share
-    routing.</p>
+    .callout-note {
+        border-color: #6E93D6;
+        background: rgba(110, 147, 214, 0.15);
+    }
 
-<p dir="auto"><b>Recommendations:</b></p>
+    .callout-tip {
+        border-color: #34d399;
+        background: rgba(52, 211, 153, 0.15);
+    }
 
-<table style="border-collapse:collapse; font-size:0.85rem; width:100%; max-width:720px;">
-    <thead>
-        <tr style="border-bottom:2px solid rgba(110,147,214,0.4);">
-            <th style="text-align:left; padding:6px 10px; color:#6E93D6; font-weight:600;">Farm Size</th>
-            <th style="text-align:right; padding:6px 10px; color:#6E93D6; font-weight:600;">Miners</th>
-            <th style="text-align:right; padding:6px 10px; color:#6E93D6; font-weight:600;">Total Hashrate</th>
-            <th style="text-align:left; padding:6px 10px; color:#6E93D6; font-weight:600;">Hardware</th>
-        </tr>
-    </thead>
-    <tbody>
-        <tr style="border-bottom:1px solid rgba(255,255,255,0.07);">
-            <td style="padding:5px 10px;">Small</td>
-            <td style="padding:5px 10px; text-align:right;">2 - 30</td>
-            <td style="padding:5px 10px; text-align:right;">Up to 5 PH/s</td>
-            <td style="padding:5px 10px;">Raspberry Pi 5 (8 GB) or any mini-PC</td>
-        </tr>
-        <tr style="border-bottom:1px solid rgba(255,255,255,0.07);">
-            <td style="padding:5px 10px;">Medium</td>
-            <td style="padding:5px 10px; text-align:right;">30 - 75</td>
-            <td style="padding:5px 10px; text-align:right;">5 - 50 PH/s</td>
-            <td style="padding:5px 10px;">4-core (Ryzen 5 / Intel i5), 16 GB RAM</td>
-        </tr>
-        <tr style="border-bottom:1px solid rgba(255,255,255,0.07);">
-            <td style="padding:5px 10px;">Large</td>
-            <td style="padding:5px 10px; text-align:right;">75 - 200</td>
-            <td style="padding:5px 10px; text-align:right;">50 - 200 PH/s</td>
-            <td style="padding:5px 10px;">8-core (Ryzen 7 / Intel i7), 32 GB RAM</td>
-        </tr>
-        <tr style="border-bottom:1px solid rgba(255,255,255,0.07);">
-            <td style="padding:5px 10px;">XL</td>
-            <td style="padding:5px 10px; text-align:right;">200 - 500</td>
-            <td style="padding:5px 10px; text-align:right;">200+ PH/s</td>
-            <td style="padding:5px 10px;">12+ core, 64 GB RAM, or split across 2 DPMP instances</td>
-        </tr>
-    </tbody>
-</table>
-<p dir="auto"><b>Things to keep in mind:</b></p>
-<ul>
-    <li><b>Upstream pool connection limits</b> — Some pools cap connections per IP/wallet. Each miner in <b>DPMP</b>
-        creates a separate upstream connection per pool, so 100 miners = 200 upstream connections (100 to Pool A, 100 to
-        Pool B). Public pools may throttle this. Self-hosted pools don't have this issue.</li>
-    <li><b>The real scaling path</b> is multiple <b>DPMP</b> instances, each handling a subset of miners. Since
-        <b>DPMP</b> is
-        lightweight, you could run 3-4 instances on the same hardware, each on a different port, splitting the fleet.
-        This also adds redundancy.</li>
-    <li><b>Log volume</b> scales linearly with miners. At 200 miners, the JSON logging can become significant disk I/O,
-        so suppress all high-frequency events in production.</li>
-</ul>
-<hr />
-<h4>Error Reporting</h4>
-<p dir="auto">If you encounter errors associated either with a particular miner or a particular pool:</p>
+    .callout-warn {
+        border-color: #f0b449;
+        background: rgba(240, 180, 73, 0.15);
+    }
 
-<ul>
-    <li>Please make sure that ALL events are being logged on the Config tab</li>
-    <li>Click <strong>APPLY + RESTART</strong> to restart <strong>DPMP</strong> and recreate the error</li>
-    <li>Click on the <strong>Download Log</strong> button on the Logs tab</li>
-    <li>Send a description of the problem (i.e., miner-related or pool-related and identify the miner or pool) to <a
-            href="mailto:dpmp.project@gmail.com">dpmp.project@gmail.com</a> and attach the log file.</li>
-</ul>
+    .callout p {
+        margin: 0;
+    }
 
-<p dir="auto">We have tested <strong>DPMP</strong> with a number of different miners and pools but it is by no means an
-    exhaustive list. The log data you provide will help us to expand the list of supported miners and pools.</p>
+    .callout-label {
+        font-weight: 700;
+        margin-bottom: 4px;
+        font-size: 0.78rem;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
 
-<hr />
-<p dir="auto">If you would like to support the <b>DPMP</b> project, please consider a donation to either of the
-    following
-    addresses:</p>
-<p dir="auto">Bitcoin (BTC): <strong>bc1q9qrn7lsdnpy8w33dsdnu6cr4jdpg53zexgxh59</strong></p>
-<p dir="auto">Bitcoin Cash (BCH): <strong>bitcoincash:qqlldmmc978u5u7uzas8cakxgfftraquxvjhcc8a3q</strong></p>
-<hr />
-<p dir="auto">Questions or Comments? Contact us at: <a
-        href="mailto:dpmp.project@gmail.com"><strong>dpmp.project@gmail.com</strong></a>
+    .callout-note .callout-label {
+        color: #6E93D6;
+    }
+
+    .callout-tip .callout-label {
+        color: #34d399;
+    }
+
+    .callout-warn .callout-label {
+        color: #c97d0a;
+    }
+
+    /* Wallet address display */
+    .wallet-block {
+        background: rgba(110, 147, 214, 0.15);
+        border: 1px solid rgba(110, 147, 214, 0.18);
+        border-radius: 8px;
+        padding: 12px 16px;
+        margin: 10px 0;
+        font-family: 'JetBrains Mono', 'Courier New', monospace;
+        font-size: 0.78rem;
+        color: #d78b18;
+        line-height: 1.9;
+    }
+
+    .wallet-block .wl {
+        color: #8b9ab5;
+        font-family: 'Outfit', sans-serif;
+        font-size: 0.8rem;
+        font-weight: 600;
+    }
+
+    /* -- Light background overrides --
+     NiceGUI adds .body--light to <body> when light mode is active.
+     We also cover prefers-color-scheme:light for good measure.        */
+    body.body--light .about-body {
+        color: #1e2a3a;
+    }
+
+    body.body--light .about-body h3 {
+        color: #0f1923;
+    }
+
+    body.body--light .about-body h4 {
+        color: #1a5fa8;
+        border-bottom-color: rgba(26, 95, 168, 0.2);
+    }
+
+    body.body--light .about-body strong {
+        color: #0f1923;
+    }
+
+    body.body--light .about-body a {
+        color: #1a6abf;
+    }
+
+    body.body--light .about-body code {
+        background: rgba(26, 95, 168, 0.08);
+        color: #1a6abf;
+    }
+
+    body.body--light .about-body hr {
+        border-top-color: rgba(26, 95, 168, 0.18);
+    }
+
+    body.body--light .tab-pill {
+        background: rgba(26, 95, 168, 0.08);
+        color: #1a5fa8;
+        border-color: rgba(26, 95, 168, 0.3);
+    }
+
+    body.body--light .mode-badge {
+        color: #b36a00;
+    }
+
+    body.body--light .cfg {
+        color: #2c5282;
+    }
+
+    body.body--light .callout-note {
+        background: rgba(26, 95, 168, 0.06);
+    }
+
+    body.body--light .callout-tip {
+        background: rgba(21, 128, 61, 0.06);
+    }
+
+    body.body--light .callout-warn {
+        background: rgba(180, 100, 0, 0.06);
+    }
+
+    body.body--light .callout-note .callout-label {
+        color: #1a5fa8;
+    }
+
+    body.body--light .callout-tip .callout-label {
+        color: #15803d;
+    }
+
+    body.body--light .callout-warn .callout-label {
+        color: #b36a00;
+    }
+
+    body.body--light .callout-warn {
+        border-color: #b36a00;
+    }
+
+    body.body--light .callout-tip {
+        border-color: #15803d;
+    }
+
+    body.body--light .callout-note {
+        border-color: #1a5fa8;
+    }
+
+    body.body--light .wallet-block {
+        color: #b36a00;
+        border-color: rgba(26, 95, 168, 0.2);
+    }
+
+    body.body--light .wallet-block .wl {
+        color: #4a5568;
+    }
+</style>
+
+<div class="about-body">
+
+    <h3>Dual-Pool Mining Proxy (DPMP)</h3>
+
+    <p dir="auto">
+        <img src="/static/icond.png" style="float:left; width:170px; height:170px; margin:0 16px 8px 0;" />
+        <strong>DPMP</strong> is a lightweight, high-reliability <strong>Stratum v1 mining proxy</strong> designed to
+        sit
+        between one or more miners and two upstream mining pools. It was designed primarily for Bitcoin solo-miners who
+        run
+        one or more ASIC miners (SHA-256) and want to split hash power across compatible coins/pools (i.e.,
+        BTC/BCH/DGB).
+        Some miners, like the NerdQAxe++, have a built-in "dual pool mining" feature but the majority of miners out
+        there
+        do not.
+    </p>
+    <p dir="auto">So if you have one or more miners that do NOT have a built-in dual-pool mining feature (such as the
+        Canaan Avalon Q or the Nano3S) and you would like, for example, to mine to a BTC pool and a Bitcoin Cash pool
+        simultaneously, then <strong>DPMP</strong> is for you.
+    </p>
+    <p dir="auto"><strong>DPMP</strong> enables <strong>deterministic dual-pool scheduling</strong>, advanced
+        difficulty/extranonce handling, and observability via Prometheus metrics &mdash; while remaining simple to
+        deploy
+        and operate.</p>
+
+    <p dir="auto">At a high level, <strong>DPMP</strong>:</p>
+    <ul dir="auto">
+        <li>Accepts Stratum connections from miners (acts like a pool)</li>
+        <li>Maintains concurrent Stratum connections to <strong>two upstream pools</strong> (acts like a miner)</li>
+        <li>Routes jobs and share submissions according to a <strong>scheduler</strong> with manual or auto-balancing
+        </li>
+        <li>Ensures correct propagation of difficulty, extranonce, and job IDs</li>
+        <li>Exposes runtime metrics for monitoring and analysis</li>
+        <li>Logs structured, machine-readable events for debugging and auditing</li>
+    </ul>
+
+    <p dir="auto">The proxy is intentionally <strong>transparent</strong>: miners and pools do not need to be modified
+        or aware that <strong>DPMP</strong> is in the middle.</p>
+
+    <p dir="auto">Please visit the <strong>DPMP</strong> landing page at:
+        <a href="https://ckryza.github.io/dpmpv2/" target="_blank" rel="noopener noreferrer">
+            https://ckryza.github.io/dpmpv2/</a>.
+    </p>
     <hr />
-<p dir="auto"><b>Note</b>: This dashboard was built using <a href="https://nicegui.io/" target="_blank"
-        rel="noopener noreferrer"><b>NiceGUI</b></a>.</p>
-<p dir="auto">&nbsp;</p>
+    <div class="callout callout-note">
+        <div class="callout-label">Choosing Your Pools</div>
+        <p>
+            <strong>Before configuring DPMP</strong>: Connect each miner directly to each pool you plan to use and
+            confirm you are
+            receiving accepted shares within a reasonable time. If a miner cannot produce accepted shares when connected
+            directly, <strong>DPMP</strong> cannot fix that — it's a miner/pool compatibility issue.
+        </p>
+    </div>
+
+    <hr />
+    <h4>Fleet-Aware Scheduling</h4>
+
+    <p dir="auto"><strong>DPMP</strong>'s scheduler uses a fleet-aware assignment strategy that evaluates each miner's
+        hashrate, health score, and firmware capabilities to determine the optimal role for every miner in the fleet.
+        Rather than switching all miners simultaneously between pools &mdash; which causes dramatic ratio oscillations,
+        reject storms, and unnecessary wear on sensitive devices &mdash; the scheduler divides the fleet into
+        <em>Static</em> and <em>Dynamic</em> categories.
+    </p>
+
+    <p dir="auto">Small miners are assigned statically to whichever pool needs their hashrate to meet the target weight
+        ratio, where they mine continuously without ever switching. Only the minimum number of miners necessary are
+        designated as Dynamic time-slicers, and these are chosen based on hashrate fit and health score to ensure the
+        most
+        capable and reliable miners handle the switching workload.</p>
+
+    <p dir="auto">This approach eliminates the "herding behavior" of the original implementation, where the entire fleet
+        would stampede from one pool to the other and back again, producing wild swings in the actual ratio and floods
+        of
+        rejected shares. Instead, the target ratio is maintained smoothly by one or two Dynamic miners alternating
+        between
+        pools on calculated time intervals, while the rest of the fleet mines undisturbed.</p>
+
+    <p dir="auto">The result is faster convergence to the target weights, dramatically lower fleet-wide reject rates,
+        and
+        graceful handling of mixed fleets containing miners with varying capabilities and firmware quirks.</p>
+
+    <hr />
+    <h4>Pool Compatibility and Miner Protection</h4>
+
+    <p dir="auto"><strong>DPMP</strong> presents itself as a ckpool-compatible Stratum v1 proxy to all connected
+        miners, regardless of what upstream pool types are configured. This means your miners see a single, consistent
+        mining endpoint &mdash; they never need to know that Pool A might be running MiningCore while Pool B runs Bassin
+        (ckpool). Behind the scenes, <strong>DPMP</strong> handles the translation between different pool behaviors,
+        including differences in difficulty management (VarDiff), extranonce formatting, job delivery timing, and share
+        validation. Each miner maintains its own independent connection to both upstream pools through
+        <strong>DPMP</strong>, and the scheduler seamlessly routes work and shares to the correct pool based on the
+        current allocation weights.
+    </p>
+
+    <p dir="auto">From the miner's perspective, it is simply connected to one stable pool that occasionally sends new
+        work &mdash; exactly as a direct ckpool-type connection would behave.</p>
+
+    <hr />
+    <h4>Automatic Miner Compatibility Detection</h4>
+
+    <p dir="auto">Some miners cannot handle mid-session changes to their extranonce parameters, which is required when
+        switching between pools that use different extranonce sizes (for example, a 4-byte pool and an 8-byte pool).</p>
+
+    <p dir="auto">When <strong>DPMP</strong> detects this incompatibility, it adapts automatically. On the first pool
+        switch attempt, if a miner accumulates 10 or more consecutive rejected shares with zero accepts,
+        <strong>DPMP</strong> flags that miner's IP as extranonce-sensitive and immediately reconnects it back to its
+        original pool.
+    </p>
+
+    <p dir="auto">On all subsequent switch attempts, rather than trying to change the extranonce mid-session (which the
+        miner would ignore, producing invalid shares), <strong>DPMP</strong> gracefully closes the miner's connection
+        and
+        sets a handshake hint pointing to the target pool. The miner reconnects within about one second, performs a
+        fresh
+        handshake directly with the new pool, and begins mining immediately with the correct parameters &mdash; no
+        rejected shares, no manual intervention. A 30-second cooldown between forced reconnects provides an additional
+        safety net against excessive disconnects. This entire process is transparent to the miner and requires no
+        configuration; <strong>DPMP</strong> learns each miner's capabilities and adjusts its switching strategy
+        accordingly.</p>
+
+    <hr />
+    <h4>Dynamic Miner Reject Rates and Pool Switching</h4>
+
+    <p dir="auto">Miners assigned to the <em>Dynamic</em> (time-slice) category will typically show a higher reject rate
+        in their individual dashboards compared to statically-assigned miners. This is a normal and expected side effect
+        of how <strong>DPMP</strong> operates. When a Dynamic miner receives a pool switch command, it must flush its
+        internal work pipeline &mdash; any shares it has already computed but not yet submitted were built using the
+        previous pool's job data, difficulty, and extranonce parameters. These in-flight shares are essentially orphaned
+        the moment the switch occurs, because the new pool has no knowledge of the old pool's work templates. The new
+        pool
+        will reject these stale shares as invalid, even though the miner performed legitimate work.</p>
+
+    <p dir="auto">From the miner's perspective, it did everything correctly; the rejects are simply a consequence of the
+        pool context changing underneath it. <strong>DPMP</strong> mitigates this by suppressing many of these transient
+        rejects internally &mdash; intercepting them before they reach the miner and returning fake "accepted" responses
+        &mdash; but a small number may still pass through during the brief transition window.</p>
+
+    <p dir="auto">Importantly, these rejects do not represent lost hashrate or wasted electricity in any meaningful
+        sense; the miner immediately begins productive work on the new pool within one to two seconds of the switch.</p>
+
+    <hr />
+    <h4>The Relationship Between Slice Duration and Reject Rate</h4>
+
+    <p dir="auto">There is a direct inverse relationship between the <code>Slice Seconds</code> configuration value and
+        the reject rate seen on Dynamic miners. Each pool switch carries a roughly fixed cost of a few rejected shares
+        during the transition, regardless of how long the miner stays on a given pool. If <code>Slice Seconds</code> is
+        set low (for example, 10 seconds), the miner switches more frequently, and those fixed-cost rejects accumulate
+        as
+        a larger percentage of total shares submitted.</p>
+
+    <p dir="auto">Conversely, a higher <code>Slice Seconds</code> value (for example, 30 seconds) means fewer switches
+        per hour and a proportionally lower reject rate, since the miner spends more time doing productive work between
+        each transition. For most configurations, a <code>Slice Seconds</code> value between 20 and 30 seconds strikes a
+        good balance between responsive weight tracking and acceptable reject rates, typically keeping the Dynamic
+        miner's
+        dashboard reject rate below 2&ndash;3%.</p>
+
+    <p dir="auto">It is important to keep in mind that the higher the <code>Slice Seconds</code> value, the more stable
+        the miner's performance will be (e.g., lower reject percentage), but it will take longer for the system to
+        respond
+        to pool ratio changes. We recommend starting with a value of 10 for <code>Slice Seconds</code>. If you see a
+        spike in reject rate on any Dynamic miner, consider increasing the value to 20 or 25 to reduce the frequency of
+        pool switches. The valid range for <code>Slice Seconds</code> is between 10 and 30 seconds.</p>
+
+    <hr />
+    <h4>Hashrate Allocation</h4>
+
+    <p><strong>DPMP</strong> supports three modes for allocating hashrate between the two pools:
+        <strong class="mode-badge">Slider</strong>,
+        <strong class="mode-badge">Oracle Auto-Balance</strong>, and
+        <strong class="mode-badge">Manual Assignment</strong>.
+        You can switch between modes at any time from the <span class="tab-pill">Home</span> tab using the arrow buttons
+        at the top of each panel &mdash; no restart required.
+    </p>
+
+    <h4>Slider</h4>
+
+    <p dir="auto">When you select the <strong class="mode-badge">Slider</strong> panel on the
+        <span class="tab-pill">Home</span> tab, you can adjust the hashrate allocation (weighting) in real time with no
+        restart required. Just drag the slider to the desired position and <strong>DPMP</strong> will adjust
+        accordingly.
+        Some limitations do apply. The slider ranges from 5% to 95%, so you cannot allocate 100% of the hashrate to one
+        pool or the other. If you DO want either 0/100 or 100/0 weightings, you must set that in the
+        <span class="cfg">Scheduler Settings</span> section on the <span class="tab-pill">Config</span> tab and restart
+        <strong>DPMP</strong>. And if your weighting is set to either 0/100 or 100/0, the
+        <strong class="mode-badge">Slider</strong> panel will no longer be available on the
+        <span class="tab-pill">Home</span> tab. Bottom line: if you need to temporarily move some hashrate from one pool
+        to the other, the <strong class="mode-badge">Slider</strong> panel is the best way to do that.
+    </p>
+
+    <h4>Oracle Auto-Balance</h4>
+
+    <p dir="auto">If you are mining to a BTC pool and a BCH pool you will be able to switch to the
+        <strong class="mode-badge">Oracle Auto-Balance</strong> panel on the <span class="tab-pill">Home</span> tab.
+        When
+        in <strong class="mode-badge">Oracle Auto-Balance</strong> mode, <strong>DPMP</strong> will automatically adjust
+        the pool weighting ratio periodically based on the observed real-time network hashrate of the coin associated
+        with
+        each pool. The default pool ratio in <strong class="mode-badge">Oracle Auto-Balance</strong> mode is 50/50 and
+        it
+        adjusts from there. The goal of this feature is to send more hashrate to the pool where our hashrate has more
+        "value". So, for example, if BTC short-term network hashrate increases relative to its long-term hashrate while
+        BCH hashrate decreases, then <strong>DPMP</strong> will automatically adjust the weighting to send more hashrate
+        to BCH and less to BTC.
+    </p>
+
+    <p dir="auto">The hashrate information is obtained by polling an oracle API endpoint at regular intervals (default
+        is every 10 minutes) and the oracle data is used to calculate the optimal pool weighting ratio based on the
+        relative hashrate changes. The oracle URL, poll interval, and max deviation threshold can all be configured in
+        the
+        <span class="cfg">Scheduler Settings</span> section on the <span class="tab-pill">Config</span> tab. The
+        <strong class="mode-badge">Oracle Auto-Balance</strong> panel will show the current oracle-based pool weighting
+        ratio as well as the real-time network hashrate for each pool.
+    </p>
+
+    <p dir="auto">Our "baseline" network hashrate calculation tracks closely with what you'd see on hashrate reporting
+        sites (e.g., CoinWarz), while the short-term window deliberately captures block-to-block variance to detect
+        transient hashrate shifts &mdash; the Oracle Auto-Balancer acts on the ratio between the two, not the raw
+        numbers.</p>
+
+    <div class="callout callout-note">
+        <div class="callout-label">Limitations</div>
+        <p>Currently, <strong class="mode-badge">Oracle Auto-Balance</strong> only supports BTC and BCH pools. In the
+            <span class="cfg">Pool A Settings</span> and <span class="cfg">Pool B Settings</span> sections of your
+            configuration you must specify a chain name for each pool (e.g., <code>BTC</code> or <code>BCH</code>). If
+            you
+            are using a combination of pools that is not BTC/BCH then you won't be able to use
+            <strong class="mode-badge">Oracle Auto-Balance</strong>, but you can always use the
+            <strong class="mode-badge">Slider</strong> panel or the
+            <strong class="mode-badge">Manual Assignment</strong> panel instead. We also limit the
+            <em>max deviation threshold</em> to between 5 and 45. With a setting of 5, the Oracle Auto-Balancer will
+            never
+            move beyond a 45/55&ndash;55/45 ratio. With a setting of 45, it will never move beyond a 5/95&ndash;95/5
+            ratio.
+            The default max deviation value is 20, so the Oracle Auto-Balancer will never move beyond 30/70&ndash;70/30.
+        </p>
+    </div>
+
+    <div class="callout callout-tip">
+        <div class="callout-label">Chart Updates</div>
+        <p>The network hashrate charts only update when the data points (short-term and long-term) actually change. So
+            even though the default polling interval is every 10 minutes, the charts may not update on every polling
+            cycle if
+            the network hashrate values have not changed.</p>
+    </div>
+
+    <h4>Manual Assignment</h4>
+
+    <p dir="auto">When you switch to the <strong class="mode-badge">Manual Assignment</strong> panel on the
+        <span class="tab-pill">Home</span> tab, you can then go to the <span class="tab-pill">Stats</span> tab and
+        manually assign each miner to either Pool A or Pool B by using the dropdown in the <strong>Pool</strong> column
+        of the Fleet Stats table. Once you make an assignment for a miner, that miner will be pinned to the assigned
+        pool
+        and will not be scheduled to switch pools until you change the assignment. This is useful if you want to
+        manually
+        balance the hashrate across pools by miner instead of by hashrate percentage.
+    </p>
+
+    <p>If you switch back to either the <strong class="mode-badge">Slider</strong> panel or the
+        <strong class="mode-badge">Oracle Auto-Balance</strong> panel, then normal operation for those panels will
+        resume.
+    </p>
+
+    <div class="callout callout-note">
+        <div class="callout-label">Note on Switching</div>
+        <p>When you switch a miner from pool A to B, or Pool B to A, the miner will be disconnected and reconnected to
+            the new pool, which can take a few seconds. During this transition period, the worker name in the Fleet
+            table will turn orange. Once the pool switch is complete the worker name color will return to normal.
+        </p>
+    </div>
+
+    <hr />
+    <h4>Stats Tab</h4>
+
+    <p>The <span class="tab-pill">Stats</span> tab provides real-time visibility into every aspect of your mining
+        fleet. It is organized into three collapsible sections, each containing a sortable table that updates every five
+        seconds. Click any column header to sort the table by that column, and click again to reverse the sort order.
+    </p>
+
+    <h4>Fleet Stats</h4>
+
+    <p>The Fleet Stats table gives you a scheduler-level view of your entire fleet. Each connected miner appears as a
+        row showing its current pool assignment (A or B), how long it has been mining on that pool, and whether the
+        scheduler has assigned it as <em>Static</em> (locked to one pool) or <em>Dynamic</em> (actively time-slicing
+        between both pools to achieve the target ratio). The <em>Pinned</em> column indicates whether a miner has been
+        automatically pinned to a single pool due to hardware incompatibility with mid-session pool switching. The
+        <em>Switches</em> column tracks how many times each miner has changed pools since it connected, while
+        <em>Contribution</em> shows each miner's share of total accepted difficulty across the fleet as a percentage.
+        The
+        <em>Health</em> column displays a reliability score from 0.00 to 1.00 that reflects how cleanly each miner
+        handles pool switches over time &mdash; a score of 1.00 indicates no issues, while lower scores mean the miner
+        has experienced rejects or disconnects after switches. A totals row at the bottom summarizes fleet-wide switch
+        counts and confirms that contributions sum to 100%.
+    </p>
+
+    <div class="callout callout-note">
+        <div class="callout-label">Manual Assignment Mode</div>
+        <p>When you are in <strong class="mode-badge">Manual Assignment</strong> mode the <em>Pinned</em> column is not
+            displayed. Instead, use the dropdown in the <strong>Pool</strong> column to assign each miner to Pool A or
+            Pool B.</p>
+    </div>
+
+    <h4>Worker Stats</h4>
+
+    <p>The Worker Stats table focuses on individual miner performance. Each row shows a miner's estimated hashrate over
+        three rolling windows (5-minute, 60-minute, and 24-hour), its current share submission rate, working difficulty,
+        total accepted shares, best share found, reject count, and reject percentage. The <em>Seen</em> column shows how
+        recently each miner submitted a share, and workers that have not been seen for five minutes are automatically
+        removed from the table. At the far right of each row is an on/off toggle button that allows you to temporarily
+        disable a miner without disconnecting it. When toggled off, the miner remains connected to
+        <strong>DPMP</strong> but is excluded from scheduling and its shares are silently swallowed (the miner receives
+        fake "accepted" responses so it continues hashing without errors). Toggling a miner back on immediately restores
+        it to normal operation. This is useful for testing, maintenance, or temporarily removing a problematic miner
+        from
+        the fleet without physically accessing the device. The toggle state resets to "on" when
+        <strong>DPMP</strong> restarts.
+    </p>
+
+    <h4>Pool Stats</h4>
+
+    <p>The Pool Stats table provides a per-pool summary of connection health and share accounting. Each row represents
+        one of the two configured pools and shows its slot (A or B), detected coin type, the extranonce2 size advertised
+        by the pool, the current ratio of hashrate allocated to that pool, the pool's estimated 5-minute hashrate, and
+        the upstream connection latency. The accepted and rejected share counts reflect cumulative totals since
+        <strong>DPMP</strong> started, along with the corresponding reject percentage. The <em>Jobs</em> column shows
+        the
+        total number of mining notifications received from each pool, and <em>TotalDiff</em> shows the sum of all
+        accepted share difficulties. Note that accepted and rejected counts may include data from workers that have
+        since
+        disconnected.
+    </p>
+
+    <hr />
+    <h4>Pool Failover Protection</h4>
+
+    <p dir="auto"><strong>DPMP</strong> has pool failover protection implemented as follows: if you are splitting work
+        between pools A and B (i.e., pool weighting ratio is NOT 0/100 or 100/0) then if either pool fails, all work
+        (100%) will be routed to the pool that is still active. When the inactive pool becomes available again, the
+        original weighting logic will resume. If BOTH pools become unavailable, <strong>DPMP</strong> will simply wait
+        until one or both pools become available again and, during this time, it will maintain a connection with any
+        miners attached. If you are currently routing to only one pool (i.e., pool weighting is 0/100 or 100/0) then if
+        the active pool becomes unavailable, <strong>DPMP</strong> will wait until the pool becomes available again
+        &mdash; in this situation it will NOT route any work to the pool with the 0 weighting.</p>
+
+    <h4>Pool Idle Timeout Handling</h4>
+
+    <p dir="auto">Some upstream pool software (such as MiningCore) implements an <strong>idle timeout</strong> that
+        automatically disconnects any worker session that has not submitted a share within a set period (typically
+        around
+        10 minutes). This is not a failure &mdash; it is the pool quietly closing a connection it considers inactive.
+        For <strong>DPMP</strong>, this can affect the upstream connection to whichever pool a miner is <em>not</em>
+        currently mining to, since that pool never receives any share submissions from that miner.</p>
+
+    <p dir="auto"><strong>DPMP</strong> handles pool idle timeouts gracefully. When an upstream pool closes an idle
+        connection, <strong>DPMP</strong> silently absorbs the disconnect and does <em>not</em> reconnect immediately
+        &mdash; there is no reason to maintain a live connection to a pool that a miner is not currently using. The
+        miner continues mining on its active pool completely undisturbed, with no health score penalty and no
+        time-on-pool reset. If the scheduler later assigns that miner to the pool that had gone idle,
+        <strong>DPMP</strong>
+        reconnects on demand, bootstraps the session, and completes the switch &mdash; typically within 15&ndash;30
+        seconds. During this transition the miner remains connected and mining on its current pool until the new
+        connection is fully ready. Note that after an on-demand reconnect, the new pool connection starts fresh with
+        its minimum configured difficulty and ramps up over the first minute or two &mdash; this is normal pool
+        VarDiff behavior and not an error.
+    </p>
+
+    <hr />
+    <h4>Configuration and Setup</h4>
+
+    <p dir="auto">When <strong>DPMP</strong> first starts, go to the <span class="tab-pill">Config</span> tab and edit
+        the <span class="cfg">Pool A Settings</span> and <span class="cfg">Pool B Settings</span> sections. For both
+        pools, enter the URL/IP Address, Port, and the wallet address to be used when mining to that pool (make sure the
+        wallet address is correct!). You can also give each pool a display name and assign it to a particular
+        blockchain.</p>
+
+    <p dir="auto">By default, work will be split 50/50 between the two pools. You can adjust the weighting in the
+        <span class="cfg">Scheduler Settings</span> section (e.g., 70/30, or 90/10 &mdash; whatever you like), or you
+        can leave it at 50/50 and use the <strong class="mode-badge">Slider</strong> panel on the
+        <span class="tab-pill">Home</span> tab to adjust the weighting in real time. If you want to use the
+        <strong class="mode-badge">Oracle Auto-Balance</strong> feature, make sure you have set up a BTC and BCH pool as
+        described in the Oracle Auto-Balance section above.
+    </p>
+
+    <p dir="auto">Lastly, check the value of <code>Slice Seconds</code> in the
+        <span class="cfg">Scheduler Settings</span> section. Start with a value of 10 seconds and give that a try. If
+        you see too many rejects on your Dynamic miner dashboards, raise the value in 5-second increments until the
+        reject percentage stabilizes.
+    </p>
+
+    <p dir="auto">Once you make the configuration changes, click the <strong>APPLY + RESTART</strong> button and
+        <strong>DPMP</strong> will restart. When it does, check the <span class="tab-pill">Home</span> tab and make sure
+        you see <strong>DPMP</strong>: running, and the tables on the <span class="tab-pill">Stats</span> tab should
+        begin to populate.
+    </p>
+
+    <p dir="auto">Now, for each miner you want to use with the proxy, set up the miner's Pool URL to point to the IP
+        address of the box on which you are running the <strong>DPMP</strong> proxy, set the Port to
+        <code>3351</code>, and put in one of your wallet addresses, a period, and finally the worker name
+        (i.e., <code>&lt;wallet address&gt;.&lt;workername&gt;</code>).
+    </p>
+
+    <div class="callout callout-note">
+        <div class="callout-label">Pool Address Book</div>
+        <p>
+            <strong>DPMP</strong> includes a built-in Pool Address Book that makes it easy to manage and switch between multiple mining
+            pools without re-entering connection details every time. Pool entries are saved automatically — whenever you
+            click <strong>APPLY</strong> on the Config tab, both Pool A and Pool B are added to the address book if they aren't already
+            stored there. Each entry records the pool's host, port, name, wallet address, and blockchain.
+            To use a saved pool, open either the <span class="cfg">Pool A Settings</span> or <span class="cfg">Pool B Settings</span> expansion on the Config tab and
+            click <code>Select from Address Book</code>. A dialog will appear listing all saved pools — click <code>Select</code> next to any
+            entry to instantly fill in all fields for that pool slot. You can manage your saved pools at any time using
+            the <strong>Edit Address Book</strong> button, which allows you to rename entries for easier identification or delete pools
+            you no longer use. Note that the address book only prevents duplicate entries from being created
+            automatically — if you update a pool's wallet or port, you can use the Edit dialog to keep your entries
+            current.
+        </p>
+    </div>
+
+    <div class="callout callout-warn">
+        <div class="callout-label">Important &mdash; Wallet Address</div>
+        <p>The wallet address you input in the miner is <strong>NOT</strong> used by the proxy &mdash; only the worker
+            name is used. The proxy gets the correct wallet address for each pool from the <strong>DPMP</strong>
+            configuration
+            file. So if you are setting up <strong>DPMP</strong> to mine to a Bitcoin pool and a Bitcoin Cash pool, in
+            your
+            miner config use either your BTC or BCH wallet address (does not matter which) and then append the worker
+            name as
+            shown above.</p>
+    </div>
+
+    <p dir="auto">Once your miners are configured and restarted, check the <span class="tab-pill">Home</span> tab and
+        you should see the correct number of miners connected, and the Accepted, Rejected, and Jobs stats should be
+        updating. You should also see your miner(s) show up on your pool dashboards as well as in the Worker Stats table
+        on the <span class="tab-pill">Stats</span> tab.</p>
+
+    <div class="callout callout-note">
+        <div class="callout-label">Note on Reject Rates</div>
+        <p>When using <strong>DPMP</strong>, it is normal for the rejection rate reported in your miner dashboard to be
+            slightly higher than usual. Switching between pools introduces some <em>job not found</em> and
+            <em>stale job</em> conditions. This is expected behavior and nothing to be concerned about.
+        </p>
+    </div>
+
+    <hr />
+    <h4>How Many Miners Can DPMP Support</h4>
+
+    <p dir="auto">Running <strong>DPMP</strong> on an AMD Ryzen 5 3550H with 16 GB RAM under umbrelOS 1.5, this setup
+        should easily support up to 50 miners with a hashrate range from 1 to 200 TH/s. Note that higher hashrate miners
+        actually produce fewer shares per second (pool VarDiff scales up). A 1 PH/s miner at diff 65536 submits roughly
+        1 share every 4 seconds. So a farm of 100 x 300 TH/s miners might only generate ~50 shares/sec total, which is
+        very manageable. The ceiling isn't raw CPU &mdash; it's the single-threaded event loop getting saturated by JSON
+        processing and share routing.</p>
+
+    <table style="border-collapse:collapse; font-size:0.85rem; width:100%; max-width:720px; margin:12px 0 18px 0;">
+        <thead>
+            <tr style="border-bottom:2px solid rgba(110,147,214,0.4);">
+                <th style="text-align:left;  padding:6px 10px; color:#6E93D6; font-weight:600;">Farm Size</th>
+                <th style="text-align:right; padding:6px 10px; color:#6E93D6; font-weight:600;">Miners</th>
+                <th style="text-align:right; padding:6px 10px; color:#6E93D6; font-weight:600;">Total Hashrate</th>
+                <th style="text-align:left;  padding:6px 10px; color:#6E93D6; font-weight:600;">Hardware</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr style="border-bottom:1px solid rgba(255,255,255,0.07);">
+                <td style="padding:5px 10px;">Small</td>
+                <td style="padding:5px 10px; text-align:right;">2 &ndash; 30</td>
+                <td style="padding:5px 10px; text-align:right;">Up to 5 PH/s</td>
+                <td style="padding:5px 10px;">Raspberry Pi 5 (8 GB) or any mini-PC</td>
+            </tr>
+            <tr style="border-bottom:1px solid rgba(255,255,255,0.07);">
+                <td style="padding:5px 10px;">Medium</td>
+                <td style="padding:5px 10px; text-align:right;">30 &ndash; 75</td>
+                <td style="padding:5px 10px; text-align:right;">5 &ndash; 50 PH/s</td>
+                <td style="padding:5px 10px;">4-core (Ryzen 5 / Intel i5), 16 GB RAM</td>
+            </tr>
+            <tr style="border-bottom:1px solid rgba(255,255,255,0.07);">
+                <td style="padding:5px 10px;">Large</td>
+                <td style="padding:5px 10px; text-align:right;">75 &ndash; 200</td>
+                <td style="padding:5px 10px; text-align:right;">50 &ndash; 200 PH/s</td>
+                <td style="padding:5px 10px;">8-core (Ryzen 7 / Intel i7), 32 GB RAM</td>
+            </tr>
+            <tr style="border-bottom:1px solid rgba(255,255,255,0.07);">
+                <td style="padding:5px 10px;">XL</td>
+                <td style="padding:5px 10px; text-align:right;">200 &ndash; 500</td>
+                <td style="padding:5px 10px; text-align:right;">200+ PH/s</td>
+                <td style="padding:5px 10px;">12+ core, 64 GB RAM, or split across 2 DPMP instances</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <p><strong>Things to keep in mind:</strong></p>
+    <ul>
+        <li><strong>Upstream pool connection limits</strong> &mdash; Some pools cap connections per IP/wallet. Each
+            miner
+            in <strong>DPMP</strong> creates a separate upstream connection per pool, so 100 miners = 200 upstream
+            connections (100 to Pool A, 100 to Pool B). Public pools may throttle this; self-hosted pools typically do
+            not.</li>
+        <li><strong>The real scaling path</strong> is multiple <strong>DPMP</strong> instances, each handling a subset
+            of
+            miners. Since <strong>DPMP</strong> is lightweight, you could run 3&ndash;4 instances on the same hardware,
+            each on a different port, splitting the fleet. This also adds redundancy.</li>
+        <li><strong>Log volume</strong> scales linearly with miners. At 200 miners, the JSON logging can become
+            significant disk I/O, so suppress all high-frequency events in production via the
+            <span class="cfg">Logging Settings</span> section on the <span class="tab-pill">Config</span> tab.
+        </li>
+    </ul>
+
+    <hr />
+    <h4>Error Reporting</h4>
+
+    <p dir="auto">If you encounter errors associated with a particular miner or pool:</p>
+    <ul>
+        <li>Make sure that ALL events are being logged &mdash; check the <span class="cfg">Logging Settings</span>
+            section on the <span class="tab-pill">Config</span> tab</li>
+        <li>Click <strong>APPLY + RESTART</strong> to restart <strong>DPMP</strong> and recreate the error</li>
+        <li>Click the <strong>Download Log</strong> button on the <span class="tab-pill">Logs</span> tab</li>
+        <li>Send a description of the problem (i.e., miner-related or pool-related and identify the miner or pool) to
+            <a href="mailto:dpmp.project@gmail.com">dpmp.project@gmail.com</a> and attach the log file.
+        </li>
+    </ul>
+    <p dir="auto">We have tested <strong>DPMP</strong> with a number of different miners and pools but it is by no
+        means an exhaustive list. The log data you provide will help us to expand the list of supported miners and
+        pools.</p>
+
+    <hr />
+    <p dir="auto">If you would like to support the <strong>DPMP</strong> project, please consider a donation:</p>
+    <div class="wallet-block">
+        <span class="wl">BTC:</span> bc1q9qrn7lsdnpy8w33dsdnu6cr4jdpg53zexgxh59<br>
+        <span class="wl">BCH:</span> bitcoincash:qqlldmmc978u5u7uzas8cakxgfftraquxvjhcc8a3q
+    </div>
+
+    <hr />
+    <p dir="auto">Questions or Comments? Contact us at:
+        <a href="mailto:dpmp.project@gmail.com"><strong>dpmp.project@gmail.com</strong></a>
+    </p>
+
+    <p dir="auto"><b>Note</b>: This dashboard was built using
+        <a href="https://nicegui.io/" target="_blank" rel="noopener noreferrer"><b>NiceGUI</b></a>.
+    </p>
+    <p>&nbsp;</p>
+
+</div><!-- /.about-body -->

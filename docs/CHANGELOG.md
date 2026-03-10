@@ -1,5 +1,17 @@
 # Changelog
 
+## 3.0.6 - 2026-03-11
+- startup pool correction
+- implement per-submit switch timestamp
+- accept-gated reject suppression
+- switch failure safe pool fix
+- duplicate share suppression
+- grace window increase to 15 seconds
+- added: manual assignment panel
+- added: force_reconnect_on_en2_mismatch config option
+- added: post-switch slice timer gate
+- added: pool address book
+
 ## 3.0.5 - 2026-03-04
 - add on/off toggle in worker table
 - adjust pool switching logic
