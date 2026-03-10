@@ -1,19 +1,20 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <title>DPMP - Dual Pool Mining Proxy</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap"
+        rel="stylesheet">
     <style>
         :root {
             --bg-deep: #06080d;
             --bg-card: #141c27;
-            --bg-card-cap: #063a6e;
-            --bg-card-hover: #131a24;
             --border: rgba(110, 147, 214, 0.12);
             --border-glow: rgba(110, 147, 214, 0.3);
-            --text-primary: #e6edf8;
+            --text-primary:#f0f4fc; 
             --text-secondary: #8b9ab5;
             --text-muted: #5a6a82;
             --accent-blue: #6E93D6;
@@ -23,14 +24,18 @@
             --accent-orange: #fb923c;
             --gradient-hero: linear-gradient(160deg, #06080d 0%, #0c1220 30%, #111d33 60%, #0a1628 100%);
             --glow-blue: 0 0 60px rgba(110, 147, 214, 0.15);
-            --glow-gold: 0 0 40px rgba(240, 180, 73, 0.1);
             --radius: 16px;
-            --radius-sm: 10px;
         }
 
-        * { margin: 0; padding: 0; box-sizing: border-box; }
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
 
-        html { scroll-behavior: smooth; }
+        html {
+            scroll-behavior: smooth;
+        }
 
         body {
             font-family: 'Outfit', sans-serif;
@@ -40,32 +45,36 @@
             overflow-x: hidden;
         }
 
-        /* ---- Grain overlay ---- */
         body::before {
             content: '';
             position: fixed;
-            top: 0; left: 0; right: 0; bottom: 0;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
             background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.03'/%3E%3C/svg%3E");
             pointer-events: none;
             z-index: 9999;
         }
 
-        /* ---- Animated grid background ---- */
         .grid-bg {
             position: fixed;
-            top: 0; left: 0; right: 0; bottom: 0;
-            background-image:
-                linear-gradient(rgba(110, 147, 214, 0.03) 1px, transparent 1px),
-                linear-gradient(90deg, rgba(110, 147, 214, 0.03) 1px, transparent 1px);
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-image: linear-gradient(rgba(110, 147, 214, 0.03) 1px, transparent 1px), linear-gradient(90deg, rgba(110, 147, 214, 0.03) 1px, transparent 1px);
             background-size: 60px 60px;
             pointer-events: none;
             z-index: 0;
         }
 
-        /* ---- Navigation ---- */
+        /* NAV */
         nav {
             position: fixed;
-            top: 0; left: 0; right: 0;
+            top: 0;
+            left: 0;
+            right: 0;
             z-index: 100;
             padding: 16px 40px;
             display: flex;
@@ -76,27 +85,38 @@
             border-bottom: 1px solid var(--border);
             transition: all 0.3s ease;
         }
+
         nav.scrolled {
             padding: 10px 40px;
-            box-shadow: 0 4px 30px rgba(0,0,0,0.4);
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.4);
         }
+
         .nav-brand {
             display: flex;
             align-items: center;
             gap: 12px;
             text-decoration: none;
         }
+
         .nav-brand img {
-            width: 36px; height: 36px;
+            width: 36px;
+            height: 36px;
             border-radius: 8px;
         }
+
         .nav-brand span {
             font-weight: 700;
             font-size: 1.1rem;
             color: var(--text-primary);
             letter-spacing: 1px;
         }
-        .nav-links { display: flex; gap: 32px; align-items: center; }
+
+        .nav-links {
+            display: flex;
+            gap: 32px;
+            align-items: center;
+        }
+
         .nav-links a {
             text-decoration: none;
             color: var(--text-secondary);
@@ -106,7 +126,11 @@
             transition: color 0.2s;
             text-transform: uppercase;
         }
-        .nav-links a:hover { color: var(--accent-cyan); }
+
+        .nav-links a:hover {
+            color: var(--accent-cyan);
+        }
+
         .nav-cta {
             background: linear-gradient(135deg, var(--accent-blue), var(--accent-cyan));
             color: #fff !important;
@@ -115,12 +139,13 @@
             font-weight: 600;
             transition: transform 0.2s, box-shadow 0.2s;
         }
+
         .nav-cta:hover {
             transform: translateY(-1px);
             box-shadow: 0 4px 20px rgba(56, 189, 248, 0.3);
         }
 
-        /* ---- Hero ---- */
+        /* HERO */
         .hero {
             position: relative;
             min-height: 100vh;
@@ -131,6 +156,7 @@
             overflow: hidden;
             padding: 120px 40px 80px;
         }
+
         .hero-orb {
             position: absolute;
             border-radius: 50%;
@@ -138,35 +164,56 @@
             opacity: 0.4;
             animation: float 8s ease-in-out infinite;
         }
+
         .hero-orb-1 {
-            width: 500px; height: 500px;
-            background: radial-gradient(circle, rgba(110,147,214,0.25), transparent 70%);
-            top: -10%; right: -5%;
-            animation-delay: 0s;
+            width: 500px;
+            height: 500px;
+            background: radial-gradient(circle, rgba(110, 147, 214, 0.25), transparent 70%);
+            top: -10%;
+            right: -5%;
         }
+
         .hero-orb-2 {
-            width: 400px; height: 400px;
-            background: radial-gradient(circle, rgba(240,180,73,0.15), transparent 70%);
-            bottom: 5%; left: -5%;
+            width: 400px;
+            height: 400px;
+            background: radial-gradient(circle, rgba(240, 180, 73, 0.15), transparent 70%);
+            bottom: 5%;
+            left: -5%;
             animation-delay: -3s;
         }
+
         .hero-orb-3 {
-            width: 300px; height: 300px;
-            background: radial-gradient(circle, rgba(56,189,248,0.12), transparent 70%);
-            top: 40%; left: 30%;
+            width: 300px;
+            height: 300px;
+            background: radial-gradient(circle, rgba(56, 189, 248, 0.12), transparent 70%);
+            top: 40%;
+            left: 30%;
             animation-delay: -5s;
         }
+
         @keyframes float {
-            0%, 100% { transform: translate(0, 0) scale(1); }
-            33% { transform: translate(20px, -20px) scale(1.05); }
-            66% { transform: translate(-15px, 15px) scale(0.95); }
+
+            0%,
+            100% {
+                transform: translate(0, 0) scale(1);
+            }
+
+            33% {
+                transform: translate(20px, -20px) scale(1.05);
+            }
+
+            66% {
+                transform: translate(-15px, 15px) scale(0.95);
+            }
         }
+
         .hero-content {
             position: relative;
             z-index: 2;
             max-width: 900px;
             text-align: center;
         }
+
         .hero-badge {
             display: inline-flex;
             align-items: center;
@@ -183,24 +230,39 @@
             animation: fadeInUp 0.8s ease forwards;
             opacity: 0;
         }
+
         .hero-badge .dot {
-            width: 6px; height: 6px;
+            width: 6px;
+            height: 6px;
             background: var(--accent-green);
             border-radius: 50%;
             animation: pulse-dot 2s ease-in-out infinite;
         }
+
         @keyframes pulse-dot {
-            0%, 100% { opacity: 1; transform: scale(1); }
-            50% { opacity: 0.5; transform: scale(1.3); }
+
+            0%,
+            100% {
+                opacity: 1;
+                transform: scale(1);
+            }
+
+            50% {
+                opacity: 0.5;
+                transform: scale(1.3);
+            }
         }
+
         .hero-icon {
-            width: 120px; height: 120px;
+            width: 120px;
+            height: 120px;
             border-radius: 28px;
             margin-bottom: 32px;
-            box-shadow: var(--glow-blue), 0 20px 60px rgba(0,0,0,0.5);
+            box-shadow: var(--glow-blue), 0 20px 60px rgba(0, 0, 0, 0.5);
             animation: fadeInUp 0.8s 0.1s ease forwards;
             opacity: 0;
         }
+
         .hero h1 {
             font-size: clamp(2.4rem, 5vw, 3.8rem);
             font-weight: 800;
@@ -210,12 +272,14 @@
             animation: fadeInUp 0.8s 0.2s ease forwards;
             opacity: 0;
         }
+
         .hero h1 .gradient-text {
             background: linear-gradient(135deg, var(--accent-blue), var(--accent-cyan), var(--accent-gold));
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             background-clip: text;
         }
+
         .hero-sub {
             font-size: 1.15rem;
             color: var(--text-secondary);
@@ -225,6 +289,7 @@
             animation: fadeInUp 0.8s 0.3s ease forwards;
             opacity: 0;
         }
+
         .hero-actions {
             display: flex;
             gap: 16px;
@@ -233,6 +298,20 @@
             animation: fadeInUp 0.8s 0.4s ease forwards;
             opacity: 0;
         }
+
+        @keyframes fadeInUp {
+            from {
+                opacity: 0;
+                transform: translateY(24px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        /* BUTTONS */
         .btn {
             display: inline-flex;
             align-items: center;
@@ -247,37 +326,40 @@
             cursor: pointer;
             border: none;
         }
+
         .btn-primary {
             background: linear-gradient(135deg, var(--accent-blue), var(--accent-cyan));
             color: #fff;
             box-shadow: 0 4px 20px rgba(56, 189, 248, 0.25);
         }
+
         .btn-primary:hover {
             transform: translateY(-2px);
             box-shadow: 0 8px 30px rgba(56, 189, 248, 0.35);
         }
+
         .btn-outline {
             background: transparent;
             color: var(--text-primary);
             border: 1px solid var(--border-glow);
         }
+
         .btn-outline:hover {
             background: rgba(110, 147, 214, 0.08);
             border-color: var(--accent-blue);
         }
 
-        @keyframes fadeInUp {
-            from { opacity: 0; transform: translateY(24px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-
-        /* ---- Sections ---- */
+        /* SECTIONS */
         section {
             position: relative;
             z-index: 1;
             padding: 100px 40px;
         }
-        .container { max-width: 1140px; margin: 0 auto; }
+
+        .container {
+            max-width: 1140px;
+            margin: 0 auto;
+        }
 
         .section-label {
             display: inline-flex;
@@ -291,34 +373,42 @@
             text-transform: uppercase;
             margin-bottom: 12px;
         }
+
         .section-label::before {
             content: '';
-            width: 20px; height: 1px;
+            width: 20px;
+            height: 1px;
             background: var(--accent-cyan);
         }
+
         .section-title {
             font-size: clamp(1.8rem, 3.5vw, 2.6rem);
             font-weight: 700;
             letter-spacing: -0.5px;
             margin-bottom: 16px;
         }
+
         .section-desc {
             color: var(--text-secondary);
             font-size: 1.05rem;
-            max-width: 600px;
+            max-width: 640px;
             font-weight: 300;
             margin-bottom: 48px;
         }
 
-        /* ---- Feature Cards ---- */
+        /* FEATURE CARDS */
         .features-grid {
             display: grid;
             grid-template-columns: repeat(3, 1fr);
             gap: 20px;
         }
+
         @media (max-width: 900px) {
-            .features-grid { grid-template-columns: 1fr; }
+            .features-grid {
+                grid-template-columns: 1fr;
+            }
         }
+
         .feature-card {
             background: var(--bg-card);
             border: 1px solid var(--border);
@@ -328,23 +418,32 @@
             position: relative;
             overflow: hidden;
         }
+
         .feature-card::before {
             content: '';
             position: absolute;
-            top: 0; left: 0; right: 0;
+            top: 0;
+            left: 0;
+            right: 0;
             height: 2px;
             background: linear-gradient(90deg, transparent, var(--accent-blue), transparent);
             opacity: 0;
             transition: opacity 0.4s;
         }
+
         .feature-card:hover {
             border-color: var(--border-glow);
             transform: translateY(-4px);
             box-shadow: var(--glow-blue);
         }
-        .feature-card:hover::before { opacity: 1; }
+
+        .feature-card:hover::before {
+            opacity: 1;
+        }
+
         .feature-icon {
-            width: 48px; height: 48px;
+            width: 48px;
+            height: 48px;
             border-radius: 12px;
             display: flex;
             align-items: center;
@@ -352,17 +451,37 @@
             font-size: 1.4rem;
             margin-bottom: 20px;
         }
-        .fi-blue { background: rgba(110, 147, 214, 0.12); }
-        .fi-gold { background: rgba(240, 180, 73, 0.12); }
-        .fi-green { background: rgba(52, 211, 153, 0.12); }
-        .fi-cyan { background: rgba(56, 189, 248, 0.12); }
-        .fi-orange { background: rgba(251, 146, 60, 0.12); }
-        .fi-purple { background: rgba(168, 130, 255, 0.12); }
+
+        .fi-blue {
+            background: rgba(110, 147, 214, 0.12);
+        }
+
+        .fi-gold {
+            background: rgba(240, 180, 73, 0.12);
+        }
+
+        .fi-green {
+            background: rgba(52, 211, 153, 0.12);
+        }
+
+        .fi-cyan {
+            background: rgba(56, 189, 248, 0.12);
+        }
+
+        .fi-orange {
+            background: rgba(251, 146, 60, 0.12);
+        }
+
+        .fi-purple {
+            background: rgba(168, 130, 255, 0.12);
+        }
+
         .feature-card h3 {
             font-size: 1.1rem;
             font-weight: 600;
             margin-bottom: 10px;
         }
+
         .feature-card p {
             color: var(--text-secondary);
             font-size: 0.9rem;
@@ -370,15 +489,219 @@
             font-weight: 300;
         }
 
-        /* ---- Screenshot gallery ---- */
+        /* STATS BANNER */
+        .stats-banner {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 1px;
+            background: var(--border);
+            border-radius: var(--radius);
+            overflow: hidden;
+            margin: 80px 0 0;
+        }
+
+        @media (max-width: 700px) {
+            .stats-banner {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+
+        .stat-item {
+            background: var(--bg-card);
+            padding: 32px 24px;
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 2rem;
+            font-weight: 700;
+            font-family: 'JetBrains Mono', monospace;
+            background: linear-gradient(135deg, var(--accent-blue), var(--accent-cyan));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .stat-label {
+            font-size: 0.82rem;
+            color: var(--text-muted);
+            margin-top: 4px;
+            font-weight: 400;
+        }
+
+        /* MODES SECTION */
+        .modes-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 24px;
+        }
+
+        @media (max-width: 900px) {
+            .modes-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .mode-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 32px 28px;
+            transition: all 0.4s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .mode-card::after {
+            content: '';
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 3px;
+            border-radius: 0 0 var(--radius) var(--radius);
+            opacity: 0.8;
+        }
+
+        .mode-card.mode-oracle::after {
+            background: linear-gradient(90deg, var(--accent-gold), var(--accent-cyan));
+        }
+
+        .mode-card.mode-slider::after {
+            background: linear-gradient(90deg, var(--accent-blue), var(--accent-cyan));
+        }
+
+        .mode-card.mode-manual::after {
+            background: linear-gradient(90deg, var(--accent-green), var(--accent-blue));
+        }
+
+        .mode-card:hover {
+            border-color: var(--border-glow);
+            transform: translateY(-4px);
+            box-shadow: var(--glow-blue);
+        }
+
+        .mode-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.72rem;
+            font-weight: 600;
+            letter-spacing: 1.5px;
+            text-transform: uppercase;
+            padding: 4px 10px;
+            border-radius: 6px;
+            margin-bottom: 18px;
+        }
+
+        .badge-oracle {
+            background: rgba(240, 180, 73, 0.12);
+            color: var(--accent-gold);
+        }
+
+        .badge-slider {
+            background: rgba(110, 147, 214, 0.12);
+            color: var(--accent-blue);
+        }
+
+        .badge-manual {
+            background: rgba(52, 211, 153, 0.12);
+            color: var(--accent-green);
+        }
+
+        .mode-card h3 {
+            font-size: 1.15rem;
+            font-weight: 700;
+            margin-bottom: 12px;
+        }
+
+        .mode-card p {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            line-height: 1.7;
+            font-weight: 300;
+        }
+
+        .mode-card ul {
+            list-style: none;
+            margin-top: 16px;
+        }
+
+        .mode-card ul li {
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+            font-weight: 300;
+            line-height: 1.6;
+            padding: 5px 0 5px 18px;
+            position: relative;
+        }
+
+        .mode-card ul li::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 13px;
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+        }
+
+        .mode-oracle ul li::before {
+            background: var(--accent-gold);
+        }
+
+        .mode-slider ul li::before {
+            background: var(--accent-blue);
+        }
+
+        .mode-manual ul li::before {
+            background: var(--accent-green);
+        }
+
+        .metrics-banner {
+            margin-top: 48px;
+            background: var(--bg-card);
+            border: 1px solid var(--border-glow);
+            border-radius: var(--radius);
+            padding: 28px 36px;
+            display: flex;
+            align-items: center;
+            gap: 20px;
+        }
+
+        .metrics-banner-icon {
+            font-size: 2.2rem;
+            flex-shrink: 0;
+        }
+
+        .metrics-banner-text h4 {
+            font-size: 1rem;
+            font-weight: 600;
+            margin-bottom: 6px;
+            color: var(--accent-cyan);
+        }
+
+        .metrics-banner-text p {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            font-weight: 300;
+            line-height: 1.65;
+        }
+
+        /* GALLERY */
         .gallery-grid {
             display: grid;
             grid-template-columns: repeat(2, 1fr);
             gap: 24px;
         }
+
         @media (max-width: 800px) {
-            .gallery-grid { grid-template-columns: 1fr; }
+            .gallery-grid {
+                grid-template-columns: 1fr;
+            }
         }
+
         .gallery-item {
             position: relative;
             border-radius: var(--radius);
@@ -388,19 +711,23 @@
             transition: all 0.4s ease;
             background: var(--bg-card);
         }
+
         .gallery-item:hover {
             border-color: var(--border-glow);
             transform: translateY(-4px);
             box-shadow: var(--glow-blue);
         }
+
         .gallery-item img {
             width: 100%;
             display: block;
             transition: transform 0.5s ease;
         }
+
         .gallery-item:hover img {
             transform: scale(1.02);
         }
+
         .gallery-caption {
             padding: 14px 18px;
             font-size: 0.85rem;
@@ -411,6 +738,7 @@
             align-items: center;
             gap: 8px;
         }
+
         .gallery-caption .tag {
             font-family: 'JetBrains Mono', monospace;
             font-size: 0.7rem;
@@ -419,60 +747,30 @@
             background: rgba(110, 147, 214, 0.1);
             color: var(--accent-blue);
             font-weight: 500;
+            white-space: nowrap;
         }
 
-        /* ---- Stats banner ---- */
-        .stats-banner {
-            display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 1px;
-            background: var(--border);
-            border-radius: var(--radius);
-            overflow: hidden;
-            margin: 80px 0 0;
-        }
-        @media (max-width: 700px) {
-            .stats-banner { grid-template-columns: repeat(2, 1fr); }
-        }
-        .stat-item {
-            background: var(--bg-card);
-            padding: 32px 24px;
-            text-align: center;
-        }
-        .stat-value {
-            font-size: 2rem;
-            font-weight: 700;
-            font-family: 'JetBrains Mono', monospace;
-            background: linear-gradient(135deg, var(--accent-blue), var(--accent-cyan));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-        }
-        .stat-label {
-            font-size: 0.82rem;
-            color: var(--text-muted);
-            margin-top: 4px;
-            font-weight: 400;
-            letter-spacing: 0.3px;
-        }
-
-        /* ---- How it works ---- */
+        /* STEPS */
         .steps {
             display: grid;
             grid-template-columns: repeat(3, 1fr);
             gap: 32px;
             margin-top: 48px;
         }
+
         @media (max-width: 800px) {
-            .steps { grid-template-columns: 1fr; }
+            .steps {
+                grid-template-columns: 1fr;
+            }
         }
+
         .step {
-            position: relative;
             padding: 28px;
             background: var(--bg-card);
             border: 1px solid var(--border);
             border-radius: var(--radius);
         }
+
         .step-num {
             font-family: 'JetBrains Mono', monospace;
             font-size: 0.75rem;
@@ -485,11 +783,13 @@
             margin-bottom: 16px;
             letter-spacing: 1px;
         }
+
         .step h3 {
             font-size: 1.05rem;
             font-weight: 600;
             margin-bottom: 10px;
         }
+
         .step p {
             color: var(--text-secondary);
             font-size: 0.88rem;
@@ -497,15 +797,28 @@
             line-height: 1.6;
         }
 
-        /* ---- Config / Docs section ---- */
+        .step p code {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.82rem;
+            background: rgba(110, 147, 214, 0.08);
+            padding: 2px 7px;
+            border-radius: 4px;
+            color: var(--accent-cyan);
+        }
+
+        /* DOCS */
         .docs-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 24px;
         }
+
         @media (max-width: 800px) {
-            .docs-grid { grid-template-columns: 1fr; }
+            .docs-grid {
+                grid-template-columns: 1fr;
+            }
         }
+
         .doc-card {
             background: var(--bg-card);
             border: 1px solid var(--border);
@@ -513,23 +826,24 @@
             padding: 32px;
             transition: all 0.3s;
         }
+
         .doc-card:hover {
             border-color: var(--border-glow);
         }
+
         .doc-card h3 {
             font-size: 1.15rem;
             font-weight: 600;
             margin-bottom: 12px;
-            display: flex;
-            align-items: center;
-            gap: 10px;
         }
+
         .doc-card p {
             color: var(--text-secondary);
             font-size: 0.9rem;
             font-weight: 300;
             line-height: 1.65;
         }
+
         .doc-card code {
             font-family: 'JetBrains Mono', monospace;
             font-size: 0.82rem;
@@ -539,12 +853,16 @@
             color: var(--accent-cyan);
         }
 
-        /* ---- CTA / Install ---- */
+        /* CTA */
         .cta-section {
             text-align: center;
             background: linear-gradient(180deg, var(--bg-deep) 0%, #0c1220 100%);
         }
-        .cta-section .section-desc { margin: 0 auto 36px; }
+
+        .cta-section .section-desc {
+            margin: 0 auto 36px;
+        }
+
         .cta-card {
             display: inline-block;
             background: var(--bg-card);
@@ -554,6 +872,7 @@
             margin-top: 40px;
             text-align: left;
         }
+
         .cta-card h4 {
             font-size: 0.9rem;
             color: var(--text-muted);
@@ -561,6 +880,7 @@
             margin-bottom: 12px;
             letter-spacing: 0.5px;
         }
+
         .wallet-addr {
             font-family: 'JetBrains Mono', monospace;
             font-size: 0.78rem;
@@ -568,6 +888,7 @@
             word-break: break-all;
             line-height: 1.8;
         }
+
         .wallet-label {
             color: var(--text-muted);
             font-family: 'Outfit', sans-serif;
@@ -575,7 +896,7 @@
             font-weight: 500;
         }
 
-        /* ---- Footer ---- */
+        /* FOOTER */
         footer {
             padding: 40px;
             text-align: center;
@@ -583,17 +904,21 @@
             color: var(--text-muted);
             border-top: 1px solid var(--border);
         }
+
         footer a {
             color: var(--accent-blue);
             text-decoration: none;
         }
 
-        /* ---- Modal ---- */
+        /* MODAL */
         .modal-overlay {
             display: none;
             position: fixed;
             z-index: 1000;
-            top: 0; left: 0; right: 0; bottom: 0;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
             background: rgba(6, 8, 13, 0.92);
             backdrop-filter: blur(8px);
             align-items: center;
@@ -601,313 +926,419 @@
             padding: 40px;
             cursor: zoom-out;
         }
-        .modal-overlay.active { display: flex; }
+
+        .modal-overlay.active {
+            display: flex;
+        }
+
         .modal-overlay img {
             max-width: 92%;
             max-height: 88vh;
             border-radius: var(--radius);
-            box-shadow: 0 20px 80px rgba(0,0,0,0.6);
+            box-shadow: 0 20px 80px rgba(0, 0, 0, 0.6);
         }
 
-        /* ---- Scroll fade-in ---- */
+        /* REVEAL */
         .reveal {
             opacity: 0;
             transform: translateY(30px);
             transition: opacity 0.7s ease, transform 0.7s ease;
         }
+
         .reveal.visible {
             opacity: 1;
             transform: translateY(0);
         }
 
-        /* ---- Mobile nav ---- */
+        /* MOBILE */
         @media (max-width: 700px) {
-            nav { padding: 12px 20px; }
-            .nav-links { display: none; }
-            section { padding: 60px 20px; }
-            .hero { padding: 100px 20px 60px; }
-            .hero h1 { font-size: 2rem; }
-            .cta-card { padding: 24px; }
+            nav {
+                padding: 12px 20px;
+            }
+
+            .nav-links {
+                display: none;
+            }
+
+            section {
+                padding: 60px 20px;
+            }
+
+            .hero {
+                padding: 100px 20px 60px;
+            }
+
+            .hero h1 {
+                font-size: 2rem;
+            }
+
+            .cta-card {
+                padding: 24px;
+            }
+
+            .metrics-banner {
+                flex-direction: column;
+                text-align: center;
+            }
         }
     </style>
 </head>
+
 <body>
+    <div class="grid-bg"></div>
 
-<div class="grid-bg"></div>
+    <!-- Navigation -->
+    <nav id="topnav">
+        <a href="#" class="nav-brand">
+            <img src="images/icond.png" alt="DPMP">
+            <span>DPMP</span>
+        </a>
+        <div class="nav-links">
+            <a href="#features">Features</a>
+            <a href="#modes">Modes</a>
+            <a href="#dashboard">Dashboard</a>
+            <a href="#setup">Setup</a>
+            <a href="#install" class="nav-cta">Install</a>
+        </div>
+    </nav>
 
-<!-- Navigation -->
-<nav id="topnav">
-    <a href="#" class="nav-brand">
-        <img src="images/icond.png" alt="DPMP">
-        <span>DPMP</span>
-    </a>
-    <div class="nav-links">
-        <a href="#features">Features</a>
-        <a href="#dashboard">Dashboard</a>
-        <a href="#setup">Setup</a>
-        <a href="#install" class="nav-cta">Install</a>
-    </div>
-</nav>
-
-<!-- Hero -->
-<section class="hero">
-    <div class="hero-orb hero-orb-1"></div>
-    <div class="hero-orb hero-orb-2"></div>
-    <div class="hero-orb hero-orb-3"></div>
-    <div class="hero-content">
-        <div class="hero-badge">
-            <span class="dot"></span>
-            Stratum v1 Mining Infrastructure
-        </div>
-        <img src="images/icond.png" alt="DPMP" class="hero-icon">
-        <h1>Intelligent <span class="gradient-text">Dual-Pool</span> Mining Proxy</h1>
-        <p class="hero-sub">
-            Split your SHA-256 hashrate across two pools with real-time oracle-driven
-            rebalancing. One proxy, two pools, zero wasted hash power.
-        </p>
-        <div class="hero-actions">
-            <a href="https://github.com/ckryza/ckryza-umbrel-app-store" class="btn btn-primary">
-                <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
-                Install on Umbrel
-            </a>
-            <a href="https://github.com/ckryza/dpmpv2" class="btn btn-outline">
-                <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 00-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0020 4.77 5.07 5.07 0 0019.91 1S18.73.65 16 2.48a13.38 13.38 0 00-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 005 4.77a5.44 5.44 0 00-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 009 18.13V22"/></svg>
-                Bare-Metal Install
-            </a>
-        </div>
-    </div>
-</section>
-
-<!-- Features -->
-<section id="features">
-    <div class="container">
-        <div class="reveal">
-            <div class="section-label">Core Capabilities</div>
-            <h2 class="section-title">Built for Solo Miners</h2>
-            <p class="section-desc">
-                DPMP sits between your ASIC fleet and two upstream pools, intelligently
-                routing hashrate where it matters most.
-            </p>
-        </div>
-        <div class="features-grid reveal">
-            <div class="feature-card">
-                <div class="feature-icon fi-gold">&#x2728;</div>
-                <h3>Oracle Auto-Balance</h3>
-                <p>Real-time BTC and BCH network hashrate tracking automatically adjusts pool weights to optimize your mining allocation.</p>
-            </div>
-            <div class="feature-card">
-                <div class="feature-icon fi-cyan">&#x2699;</div>
-                <h3>Manual Slider Control</h3>
-                <p>Set your own hashrate split with a live slider. Changes apply instantly with zero downtime, no miner restart needed.</p>
-            </div>
-            <div class="feature-card">
-                <div class="feature-icon fi-green">&#x1F6E1;</div>
-                <h3>Fleet Health Scoring</h3>
-                <p>Per-miner reliability tracking with EWMA-based health scores. Unreliable miners are automatically pinned to a single pool.</p>
-            </div>
-            <div class="feature-card">
-                <div class="feature-icon fi-blue">&#x26A1;</div>
-                <h3>Adaptive Scheduling</h3>
-                <p>Dynamic time-slicing with health-adjusted floors and stagger offsets prevents herding across your fleet.</p>
-            </div>
-            <div class="feature-card">
-                <div class="feature-icon fi-orange">&#x1F4CA;</div>
-                <h3>Deep Metrics</h3>
-                <p>Fleet, worker, and pool stats with sortable tables, hashrate estimates, reject tracking, and Prometheus integration.</p>
-            </div>
-            <div class="feature-card">
-                <div class="feature-icon fi-purple">&#x1F504;</div>
-                <h3>Worker On/Off Toggle</h3>
-                <p>Temporarily disable any miner without disconnecting it. Shares are silently swallowed while the miner stays connected and hashing.</p>
-            </div>
-        </div>
-
-        <div class="stats-banner reveal">
-            <div class="stat-item">
-                <div class="stat-value">&lt;0.3%</div>
-                <div class="stat-label">Typical Reject Rate</div>
-            </div>
-            <div class="stat-item">
-                <div class="stat-value">2</div>
-                <div class="stat-label">Simultaneous Pools</div>
-            </div>
-            <div class="stat-item">
-                <div class="stat-value">BTC/BCH</div>
-                <div class="stat-label">Oracle Support</div>
-            </div>
-            <div class="stat-item">
-                <div class="stat-value">24/7</div>
-                <div class="stat-label">Autonomous Operation</div>
-            </div>
-        </div>
-    </div>
-</section>
-
-<!-- Dashboard Gallery -->
-<section id="dashboard" style="background: linear-gradient(180deg, var(--bg-deep), #0a0f18, var(--bg-deep));">
-    <div class="container">
-        <div class="reveal">
-            <div class="section-label">Dashboard</div>
-            <h2 class="section-title">Full Visibility, Real-Time Control</h2>
-            <p class="section-desc">
-                A built-in web dashboard gives you complete oversight of your mining operation
-                from any browser on your network.
-            </p>
-        </div>
-        <div class="gallery-grid reveal">
-            <div class="gallery-item" onclick="openModal('images/1a.png')">
-                <img src="images/1a.png" alt="Oracle Auto-Balance" loading="lazy">
-                <div class="gallery-caption"><span class="tag">HOME</span> Oracle Auto-Balance with live hashrate charts</div>
-            </div>
-            <div class="gallery-item" onclick="openModal('images/1b.png')">
-                <img src="images/1b.png" alt="Manual Slider" loading="lazy">
-                <div class="gallery-caption"><span class="tag">HOME</span> Manual hashrate allocation slider</div>
-            </div>
-            <div class="gallery-item" onclick="openModal('images/2.png')">
-                <img src="images/2.png" alt="Fleet and Worker Stats" loading="lazy">
-                <div class="gallery-caption"><span class="tag">STATS</span> Fleet assignments and worker metrics</div>
-            </div>
-            <div class="gallery-item" onclick="openModal('images/2b.png')">
-                <img src="images/2b.png" alt="Pool Stats" loading="lazy">
-                <div class="gallery-caption"><span class="tag">STATS</span> Per-pool performance and diagnostics</div>
-            </div>
-            <div class="gallery-item" onclick="openModal('images/3.png')">
-                <img src="images/3.png" alt="Configuration" loading="lazy">
-                <div class="gallery-caption"><span class="tag">CONFIG</span> Full configuration interface</div>
-            </div>
-            <div class="gallery-item" onclick="openModal('images/4.png')">
-                <img src="images/4.png" alt="Logs" loading="lazy">
-                <div class="gallery-caption"><span class="tag">LOGS</span> Structured JSON logs with export</div>
-            </div>
-        </div>
-    </div>
-</section>
-
-<!-- How it works -->
-<section id="setup">
-    <div class="container">
-        <div class="reveal">
-            <div class="section-label">Getting Started</div>
-            <h2 class="section-title">Up and Running in Minutes</h2>
-            <p class="section-desc">
-                Three steps from install to mining on two pools simultaneously.
-            </p>
-        </div>
-        <div class="steps reveal">
-            <div class="step">
-                <div class="step-num">01 &mdash; INSTALL</div>
-                <h3>Deploy DPMP</h3>
-                <p>One-click install via the Umbrel Community App Store, or clone the repo for a bare-metal setup on any Linux box. Docker and native installs are both supported.</p>
-            </div>
-            <div class="step">
-                <div class="step-num">02 &mdash; CONFIGURE</div>
-                <h3>Set Up Your Pools</h3>
-                <p>On the Config tab, enter the host, port, and wallet address for each of your two pools. Assign the correct coin type if using Oracle Auto-Balance. Set your preferred Slice Seconds (10-15 recommended).</p>
-            </div>
-            <div class="step">
-                <div class="step-num">03 &mdash; MINE</div>
-                <h3>Point Your Miners</h3>
-                <p>Point your ASIC miners to the DPMP host on port <code>3351</code>. Use any wallet address with your worker name appended (e.g., <code>address.WorkerName</code>). DPMP handles the rest.</p>
-            </div>
-        </div>
-    </div>
-</section>
-
-<!-- Configuration Details -->
-<section>
-    <div class="container">
-        <div class="docs-grid reveal">
-            <div class="doc-card">
-                <h3>&#x2699; Pool Configuration</h3>
-                <p>Define two upstream pools on the Config tab with host URL, port, and wallet address. Optionally assign a display name and coin type. For Oracle Auto-Balance, assign <code>BTC</code> to one pool and <code>BCH</code> to the other. Double-check your wallet addresses as all pool payouts are sent to the addresses defined here.</p>
-            </div>
-            <div class="doc-card">
-                <h3>&#x23F1; Scheduler Settings</h3>
-                <p>Configure default pool weights and the Slice Seconds parameter, which sets the minimum time a Dynamic miner stays on one pool before switching. Start with <code>10</code> or <code>15</code> seconds for optimal fleet operation. Switch between Oracle and Manual modes at any time from the Home tab without restarting.</p>
-            </div>
-            <div class="doc-card">
-                <h3>&#x26CF; Miner Setup</h3>
-                <p>Point miners to your DPMP host IP on port <code>3351</code>. The wallet address you enter in your miner is ignored by DPMP; only the worker name (after the period) is used. DPMP substitutes the wallet addresses from your pool configuration when communicating upstream.</p>
-            </div>
-            <div class="doc-card">
-                <h3>&#x1F4DD; Logging</h3>
-                <p>Real-time structured JSON logs on the Logs tab with event filtering and zip export. Logs rotate at 50MB with a maximum of 3 files retained. Configure which events to display in the Logging Settings section of the Config tab.</p>
-            </div>
-        </div>
-    </div>
-</section>
-
-<!-- Install CTA -->
-<section id="install" class="cta-section">
-    <div class="container">
-        <div class="reveal">
-            <div class="section-label">Get DPMP</div>
-            <h2 class="section-title">Ready to Split Your Hashrate?</h2>
-            <p class="section-desc">
-                Available now as a one-click Umbrel app or a bare-metal install from GitHub.
-            </p>
+    <!-- Hero -->
+    <section class="hero">
+        <div class="hero-orb hero-orb-1"></div>
+        <div class="hero-orb hero-orb-2"></div>
+        <div class="hero-orb hero-orb-3"></div>
+        <div class="hero-content">
+            <div class="hero-badge"><span class="dot"></span>Stratum v1 Mining Infrastructure</div>
+            <img src="images/icond.png" alt="DPMP" class="hero-icon">
+            <h1>Intelligent <span class="gradient-text">Dual-Pool</span> Mining Proxy</h1>
+            <p class="hero-sub">Split your SHA-256 hashrate across two pools with real-time oracle-driven rebalancing.
+                One proxy, two pools, zero wasted hash power.</p>
             <div class="hero-actions">
                 <a href="https://github.com/ckryza/ckryza-umbrel-app-store" class="btn btn-primary">
-                    <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
-                    Umbrel App Store
+                    <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                        <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" />
+                    </svg>
+                    Install on Umbrel
                 </a>
                 <a href="https://github.com/ckryza/dpmpv2" class="btn btn-outline">
-                    <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 00-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0020 4.77 5.07 5.07 0 0019.91 1S18.73.65 16 2.48a13.38 13.38 0 00-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 005 4.77a5.44 5.44 0 00-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 009 18.13V22"/></svg>
-                    GitHub Repo
+                    <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                        <path
+                            d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 00-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0020 4.77 5.07 5.07 0 0019.91 1S18.73.65 16 2.48a13.38 13.38 0 00-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 005 4.77a5.44 5.44 0 00-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 009 18.13V22" />
+                    </svg>
+                    Bare-Metal Install
                 </a>
             </div>
-            <div class="cta-card">
-                <h4>Support the DPMP Project</h4>
-                <div class="wallet-addr">
-                    <span class="wallet-label">BTC:</span> bc1q9qrn7lsdnpy8w33dsdnu6cr4jdpg53zexgxh59<br>
-                    <span class="wallet-label">BCH:</span> bitcoincash:qqlldmmc978u5u7uzas8cakxgfftraquxvjhcc8a3q
+        </div>
+    </section>
+
+    <!-- Features -->
+    <section id="features">
+        <div class="container">
+            <div class="reveal">
+                <div class="section-label">Core Capabilities</div>
+                <h2 class="section-title">Built for Solo Miners</h2>
+                <p class="section-desc">DPMP sits between your ASIC fleet and two upstream pools, intelligently routing
+                    hashrate where it matters most.</p>
+            </div>
+            <div class="features-grid reveal">
+                <div class="feature-card">
+                    <div class="feature-icon fi-gold">&#x2728;</div>
+                    <h3>Oracle Auto-Balance</h3>
+                    <p>Real-time BTC and BCH network hashrate tracking automatically adjusts pool weights to optimize
+                        your mining allocation.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon fi-cyan">&#x2699;</div>
+                    <h3>Three Scheduling Modes</h3>
+                    <p>Oracle auto-balance, manual slider, or direct per-miner assignment. Switch modes instantly from
+                        the dashboard with no miner restarts.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon fi-green">&#x1F6E1;</div>
+                    <h3>Fleet Health Scoring</h3>
+                    <p>Per-miner reliability tracking with EWMA-based health scores. Unreliable miners are automatically
+                        pinned to a single pool.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon fi-blue">&#x26A1;</div>
+                    <h3>Adaptive Scheduling</h3>
+                    <p>Dynamic time-slicing with health-adjusted floors and stagger offsets prevents herding across your
+                        fleet.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon fi-orange">&#x1F4CA;</div>
+                    <h3>Deep Metrics</h3>
+                    <p>Fleet, worker, and pool stats with sortable tables, hashrate estimates, reject tracking, and
+                        Prometheus integration.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon fi-purple">&#x1F504;</div>
+                    <h3>Worker On/Off Toggle</h3>
+                    <p>Temporarily disable any miner without disconnecting it. Shares are silently swallowed while the
+                        miner stays connected and hashing.</p>
+                </div>
+            </div>
+            <div class="stats-banner reveal">
+                <div class="stat-item">
+                    <div class="stat-value">&lt;0.3%</div>
+                    <div class="stat-label">Typical Reject Rate</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value">2</div>
+                    <div class="stat-label">Simultaneous Pools</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value">BTC/BCH</div>
+                    <div class="stat-label">Oracle Support</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value">24/7</div>
+                    <div class="stat-label">Autonomous Operation</div>
                 </div>
             </div>
         </div>
+    </section>
+
+    <!-- Three Modes -->
+    <section id="modes" style="background: linear-gradient(180deg, var(--bg-deep), #0a0f18, var(--bg-deep));">
+        <div class="container">
+            <div class="reveal">
+                <div class="section-label">Scheduling Modes</div>
+                <h2 class="section-title">Three Modes, One Dashboard</h2>
+                <p class="section-desc">Switch between modes at any time from the Home tab with no miner restarts
+                    required. Navigate between modes using the arrow buttons on each panel.</p>
+            </div>
+            <div class="modes-grid reveal">
+                <div class="mode-card mode-oracle">
+                    <div class="mode-badge badge-oracle">&#x2728; Oracle</div>
+                    <h3>Oracle Auto-Balance</h3>
+                    <p>Let the oracle decide. DPMP polls live BTC and BCH network hashrate data every 10 minutes and
+                        automatically rebalances your split to keep you on the most favorable pool.</p>
+                    <ul>
+                        <li>Fully autonomous operation</li>
+                        <li>Responds to real network hashrate shifts</li>
+                        <li>Live charts show BTC &amp; BCH hashrate trends</li>
+                        <li>Conservative clamping keeps splits within safe bounds</li>
+                        <li>Falls back to 50/50 if data becomes stale</li>
+                        <li><b>Note</b>: Requires that you are hashing to a BTC and a BCH pool</li>
+                    </ul>
+                </div>
+                <div class="mode-card mode-slider">
+                    <div class="mode-badge badge-slider">&#x2699; Slider</div>
+                    <h3>Manual Slider</h3>
+                    <p>You set the split. A simple slider lets you define exactly what percentage of your hashrate goes
+                        to Pool A versus Pool B. DPMP applies your weights immediately with no restart.</p>
+                    <ul>
+                        <li>Full manual control, 5% to 95% in steps of 5</li>
+                        <li>Live weight display updates as you drag</li>
+                        <li>Override takes effect without restarting miners</li>
+                        <li>Scheduler Ratio gauge shows actual achieved split</li>
+                        <li>Reset to config defaults with one click</li>
+                    </ul>
+                </div>
+                <div class="mode-card mode-manual">
+                    <div class="mode-badge badge-manual">&#x1F527; Manual</div>
+                    <h3>Manual Assignment</h3>
+                    <p>Direct pool assignment per miner. Use the Fleet table dropdowns in the Stats tab to lock any
+                        individual miner to Pool A or Pool B. The scheduler is bypassed entirely.</p>
+                    <ul>
+                        <li>Assign each miner independently to Pool A or B</li>
+                        <li>Changes take effect immediately, no restart needed</li>
+                        <li>Assignments persist across DPMP restarts</li>
+                        <li>Ideal for testing, maintenance, or custom setups</li>
+                        <li>Switch back to Oracle or Slider at any time</li>
+                    </ul>
+                </div>
+            </div>
+            <div class="metrics-banner reveal">
+                <div class="metrics-banner-icon">&#x1F4CA;</div>
+                <div class="metrics-banner-text">
+                    <h4>Comprehensive metrics, always available</h4>
+                    <p>No matter which mode you choose, the full Stats tab remains active. Fleet health scores,
+                        per-miner hashrate estimates, reject rates, pool latency, share counts, and difficulty totals
+                        are all visible in one place &mdash; giving you complete visibility into your operation at all
+                        times.</p><br>
+                        <hr>
+                    <br><p>See the <em>About</em> tab in the DPMP Dashboard for more details on all of the features, along with setup and configuration information.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Dashboard Gallery -->
+    <section id="dashboard" style="background: linear-gradient(180deg, #0a0f18, var(--bg-deep));">
+        <div class="container">
+            <div class="reveal">
+                <div class="section-label">Dashboard</div>
+                <h2 class="section-title">Full Visibility, Real-Time Control</h2>
+                <p class="section-desc">A built-in web dashboard gives you complete oversight of your mining operation
+                    from any browser on your network. Click any screenshot to enlarge.</p>
+            </div>
+            <div class="gallery-grid reveal">
+                <div class="gallery-item" onclick="openModal('images/1a.png')">
+                    <img src="images/1a.png" alt="Oracle Auto-Balance" loading="lazy">
+                    <div class="gallery-caption"><span class="tag">HOME &mdash; ORACLE</span> Oracle Auto-Balance with
+                        live BTC &amp; BCH hashrate charts</div>
+                </div>
+                <div class="gallery-item" onclick="openModal('images/1b.png')">
+                    <img src="images/1b.png" alt="Slider Mode" loading="lazy">
+                    <div class="gallery-caption"><span class="tag">HOME &mdash; SLIDER</span> Manual hashrate allocation
+                        slider</div>
+                </div>
+                <div class="gallery-item" onclick="openModal('images/1c.png')">
+                    <img src="images/1c.png" alt="Manual Assignment Mode" loading="lazy">
+                    <div class="gallery-caption"><span class="tag">HOME &mdash; MANUAL</span> Manual mode &mdash; assign
+                        each miner directly to Pool A or Pool B</div>
+                </div>
+                <div class="gallery-item" onclick="openModal('images/2.png')">
+                    <img src="images/2.png" alt="Fleet and Worker Stats" loading="lazy">
+                    <div class="gallery-caption"><span class="tag">STATS &mdash; FLEET</span> Fleet assignments and
+                        worker metrics (Oracle / Slider modes)</div>
+                </div>
+                <div class="gallery-item" onclick="openModal('images/2a.png')">
+                    <img src="images/2a.png" alt="Fleet Stats Manual Mode" loading="lazy">
+                    <div class="gallery-caption"><span class="tag">STATS &mdash; FLEET</span> Fleet table in Manual mode
+                        &mdash; Pool column shows A/B dropdowns per miner</div>
+                </div>
+                <div class="gallery-item" onclick="openModal('images/2b.png')">
+                    <img src="images/2b.png" alt="Pool Stats" loading="lazy">
+                    <div class="gallery-caption"><span class="tag">STATS &mdash; POOLS</span> Per-pool performance and
+                        diagnostics</div>
+                </div>
+                <div class="gallery-item" onclick="openModal('images/3.png')">
+                    <img src="images/3.png" alt="Configuration" loading="lazy">
+                    <div class="gallery-caption"><span class="tag">CONFIG</span> Full configuration interface with pool,
+                        scheduler, and difficulty settings</div>
+                </div>
+                <div class="gallery-item" onclick="openModal('images/4.png')">
+                    <img src="images/4.png" alt="Logs" loading="lazy">
+                    <div class="gallery-caption"><span class="tag">LOGS</span> Structured JSON logs with live filter and
+                        zip export</div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- How it works -->
+    <section id="setup">
+        <div class="container">
+            <div class="reveal">
+                <div class="section-label">Getting Started</div>
+                <h2 class="section-title">Up and Running in Minutes</h2>
+                <p class="section-desc">Three steps from install to mining on two pools simultaneously.</p>
+            </div>
+            <div class="steps reveal">
+                <div class="step">
+                    <div class="step-num">01 &mdash; INSTALL</div>
+                    <h3>Deploy DPMP</h3>
+                    <p>One-click install via the Umbrel Community App Store, or clone the repo for a bare-metal setup on
+                        any Linux box. Docker and native installs are both supported.</p>
+                </div>
+                <div class="step">
+                    <div class="step-num">02 &mdash; CONFIGURE</div>
+                    <h3>Set Up Your Pools</h3>
+                    <p>On the Config tab, enter the host, port, and wallet address for each of your two pools. Assign
+                        the correct coin type if using Oracle Auto-Balance. Set your preferred Slice Seconds (10-15
+                        recommended).</p>
+                </div>
+                <div class="step">
+                    <div class="step-num">03 &mdash; MINE</div>
+                    <h3>Point Your Miners</h3>
+                    <p>Point your ASIC miners to the DPMP host on port <code>3351</code>. Use any wallet address with
+                        your worker name appended (e.g., <code>[address].[WorkerName]</code>). DPMP handles the rest.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Configuration Details -->
+    <section>
+        <div class="container">
+            <div class="docs-grid reveal">
+                <div class="doc-card">
+                    <h3>&#x2699; Pool Configuration</h3>
+                    <p>Define two upstream pools on the Config tab with host URL, port, and wallet address. Optionally
+                        assign a display name and coin type. For Oracle Auto-Balance, you MUST assign <code>BTC</code> to one
+                        pool and <code>BCH</code> to the other. Double-check your wallet addresses as all pool payouts
+                        are sent to the addresses defined here.</p>
+                </div>
+                <div class="doc-card">
+                    <h3>&#x23F1; Scheduler Settings</h3>
+                    <p>Configure default pool weights and the Slice Seconds parameter, which sets the minimum time a
+                        Dynamic miner stays on one pool before switching. Start with <code>10</code> or <code>15</code>
+                        seconds for optimal fleet operation. Switch between Oracle, Slider, and Manual modes at any time
+                        from the Home tab without restarting.</p>
+                </div>
+                <div class="doc-card">
+                    <h3>&#x26CF; Miner Setup</h3>
+                    <p>Point miners to your DPMP host IP on port <code>3351</code>. The wallet address you enter in your
+                        miner is ignored by DPMP; only the worker name (after the period) is used. DPMP substitutes the
+                        wallet addresses from your pool configuration when communicating upstream.</p>
+                </div>
+                <div class="doc-card">
+                    <h3>&#x1F4DD; Logging</h3>
+                    <p>Real-time structured JSON logs on the Logs tab with event filtering and zip export. Logs rotate
+                        at 50MB with a maximum of 4 log files retained. Configure which events to display in the Logging
+                        Settings section of the Config tab.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Install CTA -->
+    <section id="install" class="cta-section">
+        <div class="container">
+            <div class="reveal">
+                <div class="section-label">Get DPMP</div>
+                <h2 class="section-title">Ready to Split Your Hashrate?</h2>
+                <p class="section-desc">Available now as a one-click Umbrel app or a bare-metal install from GitHub.</p>
+                <div class="hero-actions">
+                    <a href="https://github.com/ckryza/ckryza-umbrel-app-store" class="btn btn-primary">
+                        <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"
+                            viewBox="0 0 24 24">
+                            <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" />
+                        </svg>
+                        Umbrel App Store
+                    </a>
+                    <a href="https://github.com/ckryza/dpmpv2" class="btn btn-outline">
+                        <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"
+                            viewBox="0 0 24 24">
+                            <path
+                                d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 00-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0020 4.77 5.07 5.07 0 0019.91 1S18.73.65 16 2.48a13.38 13.38 0 00-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 005 4.77a5.44 5.44 0 00-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 009 18.13V22" />
+                        </svg>
+                        GitHub Repo
+                    </a>
+                </div>
+                <div class="cta-card">
+                    <h4>Support the DPMP Project</h4>
+                    <div class="wallet-addr">
+                        <span class="wallet-label">BTC:</span> bc1q9qrn7lsdnpy8w33dsdnu6cr4jdpg53zexgxh59<br>
+                        <span class="wallet-label">BCH:</span> bitcoincash:qqlldmmc978u5u7uzas8cakxgfftraquxvjhcc8a3q
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <footer>
+        <p>&copy; 2026 DPMP Project &middot; Built with NiceGUI &middot; Stratum v1 Mining Infrastructure</p>
+        <p style="margin-top: 6px;">Questions? <a href="mailto:dpmp.project@gmail.com">dpmp.project@gmail.com</a></p>
+    </footer>
+
+    <div class="modal-overlay" id="imageModal" onclick="closeModal()">
+        <img id="modalImg" src="" alt="Screenshot">
     </div>
-</section>
 
-<footer>
-    <p>&copy; 2026 DPMP Project &middot; Built with NiceGUI &middot; Stratum v1 Mining Infrastructure</p>
-    <p style="margin-top: 6px;">
-        Questions? <a href="mailto:dpmp.project@gmail.com">dpmp.project@gmail.com</a>
-    </p>
-</footer>
-
-<!-- Image Modal -->
-<div class="modal-overlay" id="imageModal" onclick="closeModal()">
-    <img id="modalImg" src="" alt="Screenshot">
-</div>
-
-<script>
-// Sticky nav shrink
-const nav = document.getElementById('topnav');
-window.addEventListener('scroll', () => {
-    nav.classList.toggle('scrolled', window.scrollY > 40);
-});
-
-// Modal
-function openModal(src) {
-    document.getElementById('modalImg').src = src;
-    document.getElementById('imageModal').classList.add('active');
-}
-function closeModal() {
-    document.getElementById('imageModal').classList.remove('active');
-}
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
-
-// Scroll reveal
-const reveals = document.querySelectorAll('.reveal');
-const observer = new IntersectionObserver((entries) => {
-    entries.forEach(e => {
-        if (e.isIntersecting) {
-            e.target.classList.add('visible');
-            observer.unobserve(e.target);
-        }
-    });
-}, { threshold: 0.12 });
-reveals.forEach(el => observer.observe(el));
-</script>
-
+    <script>
+        const nav = document.getElementById('topnav');
+        window.addEventListener('scroll', () => { nav.classList.toggle('scrolled', window.scrollY > 40); });
+        function openModal(src) { document.getElementById('modalImg').src = src; document.getElementById('imageModal').classList.add('active'); }
+        function closeModal() { document.getElementById('imageModal').classList.remove('active'); }
+        document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+        const reveals = document.querySelectorAll('.reveal');
+        const observer = new IntersectionObserver((entries) => { entries.forEach(e => { if (e.isIntersecting) { e.target.classList.add('visible'); observer.unobserve(e.target); } }); }, { threshold: 0.12 });
+        reveals.forEach(el => observer.observe(el));
+    </script>
 </body>
+
 </html>
