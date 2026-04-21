@@ -210,6 +210,12 @@ _DEBUG_EVENTS = {
     "reject_suppressed_vardiff",
     # Upstream response dedup
     "upstream_response_dup_observed",
+    # No-cached-job / reconnect (high volume during pool outage)
+    "switch_skipped_no_cached_job",
+    "pool_no_job_rearm_reconnect",
+    # Null-error reject diagnostics (per-reject)
+    "null_error_reject_diag",
+    "null_error_reject_suppressed_startup",
 }
 
 # Structured logging function
@@ -293,6 +299,7 @@ class PoolCfg:
     port: int
     wallet: str
     chain: str = ""
+    idle_disconnect: bool = False  # True if pool disconnects idle connections (e.g. MiningCore ~10min timeout)
 
 
 @dataclass
@@ -309,7 +316,14 @@ class SchedulerCfg:
     min_slice_seconds: float = 10.0       # floor for any single pool stay
     assigner_interval_seconds: float = 3.0  # how often global assigner runs
     convergence_tolerance: float = 0.02   # 2% = "close enough" to target
+    max_slicers: int = 4                   # max concurrent time-slicing miners (0 = unlimited)
+    pool_failover_seconds: float = 90.0   # seconds of no-job before declaring pool unresponsive
     force_reconnect_on_en2_mismatch: bool = False  # force reconnect when pools have different en2 sizes
+    sr_recruit_exclusions: list = None  # worker names excluded from SR dynamic slicer recruitment
+
+    def __post_init__(self):
+        if self.sr_recruit_exclusions is None:
+            self.sr_recruit_exclusions = []
 
 @dataclass
 class AppCfg:
@@ -388,6 +402,7 @@ def load_config(path: str) -> AppCfg:
             port=int(p.get("port", 3333)),
             wallet=str(p.get("wallet", "")).strip(),
             chain=str(p.get("chain", "")).strip().upper(),
+            idle_disconnect=bool(p.get("idle_disconnect", False)),
         )
 
     wA = int(sched.get("poolA_weight", 50))
@@ -445,7 +460,27 @@ def load_config(path: str) -> AppCfg:
     v3_assigner_interval = max(1.0, min(10.0, v3_assigner_interval))
     v3_convergence_tol = float(sched.get("convergence_tolerance", 0.02))
     v3_convergence_tol = max(0.005, min(0.10, v3_convergence_tol))
+    # max_slicers: max number of miners that may time-slice simultaneously.
+    # 0 means unlimited (recruits as many as needed to converge).
+    # Default 4 is generous enough for any realistic fleet size.
+    v3_max_slicers = int(sched.get("max_slicers", 4))
+    if v3_max_slicers < 0:
+        v3_max_slicers = 0
+    # pool_failover_seconds: how long a pool must be job-silent before DPMP
+    # declares it unresponsive and moves all miners to the other pool.
+    # Default 90s: short enough to fail over during a pool crash (typically
+    # 2-4 minutes to recover), long enough to avoid false positives from
+    # brief network glitches.  Min 30s, max 600s.
+    v3_pool_failover_s = float(sched.get("pool_failover_seconds", 90.0))
+    v3_pool_failover_s = max(30.0, min(600.0, v3_pool_failover_s))
     v3_force_reconnect_en2 = bool(sched.get("force_reconnect_on_en2_mismatch", False))
+    # sr_recruit_exclusions: list of worker names that should never be SR-recruited
+    # as dynamic time-slicers. These miners still switch pools normally as statics.
+    raw_exclusions = sched.get("sr_recruit_exclusions", [])
+    if isinstance(raw_exclusions, list):
+        v3_sr_exclusions = [str(x).strip() for x in raw_exclusions if str(x).strip()]
+    else:
+        v3_sr_exclusions = []
 
     return AppCfg(
         listen_host=str(listen_host),
@@ -461,7 +496,10 @@ def load_config(path: str) -> AppCfg:
                            min_slice_seconds=v3_min_slice,
                            assigner_interval_seconds=v3_assigner_interval,
                            convergence_tolerance=v3_convergence_tol,
-                           force_reconnect_on_en2_mismatch=v3_force_reconnect_en2),
+                           max_slicers=v3_max_slicers,
+                           pool_failover_seconds=v3_pool_failover_s,
+                           force_reconnect_on_en2_mismatch=v3_force_reconnect_en2,
+                           sr_recruit_exclusions=v3_sr_exclusions),
         downstream_diff=dict(cfg.get("downstream_diff", {})),
     )
 
@@ -945,6 +983,21 @@ class ProxySession:
         # sending set_extranonce and the new pool's clean notify.
         self.block_submits: bool = False
 
+        # Pending switch state: set to the target pool key when a switch is
+        # waiting for a cached job to arrive.  Suppresses the per-message
+        # switch_skipped_no_cached_job tight loop -- DPMP waits silently
+        # rather than retrying on every incoming miner message.
+        # Cleared when the switch completes or the target pool changes.
+        self._switch_pending_pool: str = ""
+
+        # Post-switch stale share grace window: monotonic timestamp until
+        # which all job-not-found/stale rejects are suppressed regardless
+        # of accept count.  Miner hardware pipelines can contain many
+        # in-flight shares built on the prior pool's work -- suppressing
+        # these for 30s after a switch prevents ckpool from banning the
+        # miner for a burst of unavoidable stale rejects.
+        self._switch_grace_end: float = 0.0
+
         self.latest_diff: Dict[str, Optional[float]] = {"A": None, "B": None}
         self.last_downstream_diff_by_pool: Dict[str, Optional[float]] = {"A": None, "B": None}
         self.last_downstream_extranonce: Optional[tuple[str, int]] = None
@@ -1039,7 +1092,12 @@ class ProxySession:
         #             Set to False when pool_reader detects EOF or error.
         #             Set back to True when reconnect succeeds.
         self.pool_alive: Dict[str, bool] = {"A": True, "B": True}
+        
         self.pool_idle_disconnected: Dict[str, bool] = {"A": False, "B": False}
+        # pool_reconnect_mono: monotonic time of last reconnect attempt per pool.
+        # Used to detect the race condition where reconnect completed but
+        # mining.notify hasn't arrived yet -- re-arms reconnect after 10s.
+        self._pool_reconnect_mono: Dict[str, float] = {"A": 0.0, "B": 0.0}
 
         # pool_fail_count: consecutive reconnect failures (drives exponential backoff).
         #                  Reset to 0 on successful reconnect.
@@ -1094,6 +1152,13 @@ class ProxySession:
         # CANNOT switch (Gekko) will still hit the threshold after the
         # grace period expires because they never produce accepts.
         self._pin_grace_period_s: float = 5.0
+
+        # Post-switch stale-share grace period (seconds).  After a pool
+        # switch, suppress all stale/job-not-found rejects for this long
+        # regardless of accept count.  Hardware pipelines can hold many
+        # in-flight shares from the old pool -- we don't want ckpool to
+        # ban the miner for this unavoidable burst.
+        self._SWITCH_GRACE_S: float = 30.0
 
         # VarDiff ramp suppression: track consecutive null-error rejects per pool.
         # When a pool raises its required diff before sending mining.set_difficulty,
@@ -2146,6 +2211,8 @@ class ProxySession:
                 jid = jobid_from_notify(msg)
                 self.latest_jobid[pool_key] = jid
                 self.notify_seq[pool_key] += 1
+                # Clear unresponsive state -- pool is now sending valid work.
+                dpmp_fleet.pool_record_job_received(pool_key)
 
                 # Cache parsed params for share difficulty calculation.
                 # mining.notify params: [jobid, prevhash, coinb1, coinb2,
@@ -2424,14 +2491,18 @@ class ProxySession:
                                 self._post_switch_en1_mismatch = 0
                                 dpmp_fleet.en1_mismatch_carry_clear(
                                     self.worker or "unknown")
-                            # Also clear reconnect-switch tracking -- the miner
-                            # successfully switched, so it doesn't need pinning.
-                            try:
-                                _peer_ok = self.miner_w.get_extra_info("peername")
-                                if _peer_ok:
-                                    dpmp_fleet.reconnect_switch_clear(_peer_ok[0])
-                            except Exception:
-                                pass
+                            # Also clear reconnect-switch tracking -- but only after the
+                            # miner has demonstrated reliable operation on the new pool
+                            # (5+ accepts required).  A single lucky accept is not enough
+                            # evidence -- miners with en2 size mismatches can occasionally
+                            # get accepts through before the incompatibility becomes apparent.
+                            if self._post_switch_accepts >= 5:
+                                try:
+                                    _peer_ok = self.miner_w.get_extra_info("peername")
+                                    if _peer_ok:
+                                        dpmp_fleet.reconnect_switch_clear(_peer_ok[0])
+                                except Exception:
+                                    pass
 
                         # Update this miner's fleet weight based on share difficulty.
                         dpmp_fleet.fleet_update_weight(str(self.sid), d)
@@ -2468,6 +2539,46 @@ class ProxySession:
                         # 1-2 seconds to respond, so shares submitted within the
                         # grace window can get rejected responses after it ends.
                         _suppressed_vardiff = False
+
+                        # Switch grace window: suppress stale/job-not-found rejects
+                        # for _SWITCH_GRACE_S seconds after any pool switch.
+                        # Miner hardware pipelines hold many in-flight shares built
+                        # on the prior pool's work -- these arrive immediately after
+                        # the switch and would otherwise cause ckpool to ban the miner
+                        # for a burst of unavoidable stale share submissions.
+                        # This suppression is independent of the VarDiff path and
+                        # fires even after the first accept on the new pool.
+                        if (self._switch_grace_end > 0
+                                and time.monotonic() < self._switch_grace_end):
+                            _err = msg.get("error")
+                            _err_str = (
+                                _err[1].lower() if isinstance(_err, list) and len(_err) >= 2 and isinstance(_err[1], str)
+                                else _err.get("message", "").lower() if isinstance(_err, dict)
+                                else _err.lower() if isinstance(_err, str)
+                                else ""
+                            )
+                            _is_stale = bool(_err_str and (
+                                "stale" in _err_str
+                                or "job not found" in _err_str
+                                or "duplicate" in _err_str
+                            ))
+                            if _is_stale:
+                                _suppressed_vardiff = True
+                                _vd_count = getattr(self, "_vardiff_suppressed", 0)
+                                self._vardiff_suppressed = _vd_count + 1
+                                if _vd_count == 0 or _vd_count % 10 == 0:
+                                    log("reject_suppressed_switch_grace",
+                                        sid=self.sid, pool=p,
+                                        grace_remaining_s=round(self._switch_grace_end - time.monotonic(), 1),
+                                        error=str(_err)[:100],
+                                        suppressed_count=_vd_count + 1,
+                                        worker=self.worker or "unknown")
+                                await write_line(self.miner_w, dumps_json({
+                                    "id": msg.get("id"),
+                                    "result": True,
+                                    "error": None
+                                }), "downstream")
+                                continue
 
                         _submit_switch_mono = self.submit_switch_mono.pop(mid, None)
                         if _submit_switch_mono is not None and self._post_switch_accepts == 0:
@@ -2753,8 +2864,17 @@ class ProxySession:
                                             and not self._health_post_switch_storm_fired):
                                         self._health_post_switch_storm_fired = True
                                         dpmp_fleet.health_event(wn, 0.0, "reject_storm")
+                                        # Record SR recruit cooldown for this worker.
+                                        # If it was SR-recruited, it won't be recruited
+                                        # again for an exponentially increasing cooldown
+                                        # period (30min base, doubling on each repeat).
+                                        dpmp_fleet.sr_recruit_record_cooldown(wn)
 
                                     # Null-error reject (VarDiff ramp issue)
+                                    # Skip health penalty if the share was submitted
+                                    # very early after connect/switch -- these are
+                                    # expected startup artifacts from in-flight shares
+                                    # that were submitted before the pool sent new work.
                                     _err = msg.get("error")
                                     _is_null_err = (
                                         _err is None
@@ -2765,7 +2885,30 @@ class ProxySession:
                                             and "null" in _err[1].lower())
                                     )
                                     if _is_null_err:
-                                        dpmp_fleet.health_event(wn, 0.0, "null_error_reject")
+                                        # Suppress health penalty if share was submitted
+                                        # within 10s of last switch (in-flight startup
+                                        # shares arrive after suppression window closes).
+                                        _null_submit_age = (
+                                            _submit_ts - self.last_switch_mono
+                                            if self.last_switch_mono and _submit_ts > 0
+                                            else 999.0
+                                        )
+                                        log("null_error_reject_diag",
+                                            sid=self.sid, worker=wn,
+                                            submit_age_s=round(_null_submit_age, 2),
+                                            health_switch_age_s=round(_health_switch_age, 2),
+                                            submit_ts=round(_submit_ts, 3),
+                                            last_switch_mono=round(self.last_switch_mono, 3) if self.last_switch_mono else None,
+                                            grace_window_s=round(dpmp_fleet.miner_grace_window_s(
+                                                dpmp_fleet.fleet_state.get("miners", {}).get(
+                                                    str(self.sid), {}).get("hashrate_ths", 5.0)), 2))
+                                        if _null_submit_age > 10.0:
+                                            dpmp_fleet.health_event(wn, 0.0, "null_error_reject")
+                                        else:
+                                            log("null_error_reject_suppressed_startup",
+                                                sid=self.sid, worker=wn,
+                                                submit_age_s=round(_null_submit_age, 2))
+
                         except Exception:
                             pass
 
@@ -2977,11 +3120,14 @@ class ProxySession:
             self.clear_pool_state(pool_key)
 
             # Check if this is a pool-initiated idle disconnect on the
-            # inactive pool. If so, don't reconnect -- just wait silently
-            # until the scheduler needs this pool again (on-demand reconnect).
-            # This prevents zombie-worker timeout churn on pools like MiningCore
-            # that disconnect idle connections after ~10 minutes.
-            _is_idle_disconnect = (pool_key != self.active_pool)
+            # inactive pool. Only treat it as an idle disconnect if the pool
+            # is configured with idle_disconnect=True (e.g. MiningCore which
+            # drops idle connections after ~10 minutes). For pools that don't
+            # have a timeout (e.g. Bassin, PublicPool), reconnect immediately
+            # as normal so we don't leave the connection silently dropped.
+            _pool_cfg = self.cfg.poolA if pool_key == "A" else self.cfg.poolB
+            _is_idle_disconnect = (pool_key != self.active_pool
+                                   and _pool_cfg.idle_disconnect)
             if _is_idle_disconnect:
                 self.pool_idle_disconnected[pool_key] = True
                 log("pool_idle_disconnect", sid=self.sid, pool=pool_key,
@@ -3391,6 +3537,10 @@ class ProxySession:
             # en2_size changes -- they stay on whichever pool they handshaked on.
 
             if pick != current_pool:
+                # If the assigner changed its mind about which pool to target,
+                # clear the pending-switch flag so we log the new skip event.
+                if self._switch_pending_pool and self._switch_pending_pool != pick:
+                    self._switch_pending_pool = ""
                 _skip_en2 = False
                 try:
                     _peer = self.miner_w.get_extra_info("peername")
@@ -3478,11 +3628,34 @@ class ProxySession:
                         log("pool_ondemand_reconnect_triggered", sid=self.sid,
                             pool=pick, worker=self.worker or "unknown")
                         self.pool_idle_disconnected[pick] = False
+                        self._pool_reconnect_mono[pick] = time.monotonic()
                         # pool_reader_with_reconnect is waiting on this flag --
                         # clearing it lets it fall through to Phase 3 (reconnect).
                     else:
-                        log("switch_skipped_no_cached_job", sid=self.sid,
-                            from_pool=current_pool, to_pool=pick)
+                        # Only log and act on the FIRST skip -- after that, set
+                        # _switch_pending_pool and wait silently until pool_notify
+                        # arrives for the target pool.  Firing on every incoming
+                        # miner message creates a tight loop of 50+ log events
+                        # per second and hammers pool_record_no_job unnecessarily.
+                        if self._switch_pending_pool != pick:
+                            self._switch_pending_pool = pick
+                            log("switch_skipped_no_cached_job", sid=self.sid,
+                                from_pool=current_pool, to_pool=pick)
+                            # Track how long this pool has had no job -- declare
+                            # it unresponsive after _POOL_NO_JOB_FAILOVER_S so
+                            # the assigner can move miners to the working pool.
+                            dpmp_fleet.pool_record_no_job(pick, time.monotonic())
+                            # Re-arm reconnect if pool reconnected but never sent
+                            # a job (race condition: reconnect completed but
+                            # mining.notify hasn't arrived yet).  Wait 10s before
+                            # re-triggering to give the pool time to send a job.
+                            _last_reconnect = self._pool_reconnect_mono.get(pick, 0.0)
+                            if time.monotonic() - _last_reconnect > 10.0:
+                                log("pool_no_job_rearm_reconnect", sid=self.sid,
+                                    pool=pick, worker=self.worker or "unknown",
+                                    secs_since_reconnect=round(time.monotonic() - _last_reconnect, 1))
+                                self.pool_idle_disconnected[pick] = True
+                                self._pool_reconnect_mono[pick] = time.monotonic()
 
                 elif not dpmp_fleet.fleet_try_switch():
                     # Another miner switched recently -- wait for cooldown.
@@ -3497,6 +3670,14 @@ class ProxySession:
                     last_switch_ts = now
                     self.switch_count += 1
                     self.last_switch_mono = time.monotonic()
+                    # Open the stale-share grace window.  All stale/job-not-found
+                    # rejects within this window are suppressed -- miner pipelines
+                    # hold in-flight shares from the prior pool that will arrive
+                    # immediately after the switch and would otherwise cause ckpool
+                    # to ban the miner.
+                    self._switch_grace_end = time.monotonic() + self._SWITCH_GRACE_S
+                    # Clear the pending-switch flag -- switch completed.
+                    self._switch_pending_pool = ""
                     dpmp_fleet.fleet_register(str(self.sid), pick,
                                     worker_name=self.worker or "unknown",
                                     switch_count=self.switch_count,
@@ -3804,7 +3985,11 @@ async def main():
         pinned_assignments_path=_pinned_assignments_path,
     )
     dpmp_fleet.load_best_shares()
-    dpmp_fleet.load_fleet_health()
+    # Health scores are intentionally NOT loaded on startup -- all miners
+    # start fresh at 1.0.  Loading persisted scores would carry over damage
+    # from reject storms in the previous session, causing miners to start
+    # in a degraded state even after a clean restart.
+    # dpmp_fleet.load_fleet_health()
 
     # Start background thread that writes worker_stats.json every 5 seconds
     _stats_writer = threading.Thread(target=dpmp_fleet.worker_stats_write_loop_sync, daemon=True)
@@ -3829,6 +4014,9 @@ async def main():
         pass
 
     cfg = load_config(cfg_path)
+
+    # Now that cfg is loaded, pass pool_failover_seconds to the fleet module
+    dpmp_fleet.init_pool_failover(cfg.sched.pool_failover_seconds)
 
     # Log normalized scheduler targets (weights need not sum to 100; they are relative ratios).
     try:

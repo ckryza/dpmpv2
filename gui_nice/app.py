@@ -715,7 +715,7 @@ def load_state() -> AppState:
 
 state = load_state()
 
-today = date.today()
+# today = date.today()  # replaced by dynamic _update_date()
 
 # we are storing the icon in static/ to avoid issues with relative paths
 app.add_static_files('/static', 'gui_nice/static')
@@ -725,8 +725,14 @@ with ui.row().classes("gap-4 items-center h-10 w-full"):
     ui.image("/static/icond.png").classes("hide-on-mobile w-12 h-12 mb-0").style('fit: fill') # - hide this on small screens
     ui.label(f"Dual Pool Mining Proxy (DPMP)").classes("text-xl font-bold").style('color: #6E93D6')
     ui.space().classes("hide-on-mobile") # hide this on small screens
-    ui.label(f"{today.strftime('%Y-%m-%d')}").classes("hide-on-mobile text-xs ").style('color: #6E93D6') # hide this on small screens
+    lbl_date = ui.label("").classes("hide-on-mobile text-xs").style('color: #6E93D6') # hide this on small screens
 ui.separator().classes("hide-on-mobile") # hide this on small screens
+
+def _update_date():
+    lbl_date.text = date.today().strftime('%Y-%m-%d')
+
+_update_date()  # set immediately on load
+ui.timer(60.0, _update_date)  # refresh every 60 seconds
 
 # Tabs definition
 with ui.tabs().classes("w-full") as tabs:
@@ -1895,8 +1901,9 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             ("best",     "Best",    "num", lambda v: fmt_diff(v)),
             ("rejected", "Rej",     "num", lambda v: f"{v:,}"),
             ("rej_pct",  "Rej%",    "num", lambda v: f"{v:.1f}%"),
-            ("ago",      "Seen",    "num", None),  # special: computed from last_seen
-            ("toggle",   "",        "",    None),  # special: on/off toggle button
+            ("ago",      "Seen",    "num", None),    # special: computed from last_seen
+            ("uptime",   "Uptime",  "num", None),    # special: computed from connected_at
+            ("toggle",   "",        "",    None),     # special: on/off toggle button
         ]
 
         # ---- Pool table column definitions ----
@@ -2074,6 +2081,8 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                         if last_seen <= 0 or (now - last_seen) >= stale_cutoff:
                             continue
                     ago = now - last_seen
+                    connected_at = data.get("connected_at", 0)
+                    uptime = (now - connected_at) if connected_at > 0 else 0.0
                     row = {
                         "name": name,
                         "hr_5m": data.get("hr_5m", 0),
@@ -2086,6 +2095,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                         "rejected": data.get("rejected", 0),
                         "rej_pct": data.get("rej_pct", 0),
                         "ago": ago,
+                        "uptime": uptime,
                     }
                     row_data.append(row)
 
@@ -2143,7 +2153,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                                 hc = "#f59e0b"
                                 op = ";opacity:0.45" if is_paused else ""
                                 cells += f'<td{cls} style="color:{hc}{op}">{val}</td>'
-                            elif key == "ago":
+                            elif key in ("ago", "uptime"):
                                 op = ' style="opacity:0.45"' if is_paused else ""
                                 cells += f'<td{cls}{op}>{_fmt_ago(val)}</td>'
                             elif fmt_fn:
@@ -2165,7 +2175,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                                 tot_cells += f"<td{tot_style}></td>"
                             elif key == "name":
                                 tot_cells += f"<td{tot_style}>Total</td>"
-                            elif key in ("rej_pct", "ago"):
+                            elif key in ("rej_pct", "ago", "uptime"):
                                 tot_cells += f"<td{cls}{tot_style}>--</td>"
                             elif key == "best":
                                 val = max(r[key] for r in row_data)
@@ -2541,6 +2551,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             a_wallet, b_wallet = poolA_wallet.value, poolB_wallet.value
             a_chain, b_chain = poolA_chain.value, poolB_chain.value
             a_dmin, b_dmin = dd_poolA_min.value, dd_poolB_min.value
+            a_idle, b_idle = poolA_idle_disconnect.value, poolB_idle_disconnect.value
             # Swap
             poolA_host.set_value(b_host)
             poolB_host.set_value(a_host)
@@ -2554,6 +2565,8 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             poolB_chain.set_value(a_chain)
             dd_poolA_min.set_value(b_dmin)
             dd_poolB_min.set_value(a_dmin)
+            poolA_idle_disconnect.set_value(b_idle)
+            poolB_idle_disconnect.set_value(a_idle)
             ui.notify("Pool A and Pool B settings swapped. Review and click Apply + Restart when ready.", type="info")
 
         with ui.row().classes("items-center gap-4"):
@@ -2649,6 +2662,12 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             poolA_chain  = ui.select(["BTC", "BCH", "BSV", "DGB", "XEC", "PPC", "None"], value="BTC", label="Chain").classes("w-64").tooltip(
                 "Which SHA-256 blockchain this pool mines. Set to 'None' if not applicable. "
                 "Oracle auto-balance requires one BTC and one BCH pool.")
+            poolA_idle_disconnect = ui.checkbox("Pool disconnects idle connections").tooltip(
+                "Enable if this pool automatically disconnects miners that have been idle "
+                "(not actively mining on this pool) for an extended period. "
+                "Example: MiningCore disconnects idle connections after ~10 minutes. "
+                "When enabled, DPMP will wait and reconnect on-demand rather than "
+                "immediately retrying. Leave unchecked for most pools (Bassin, PublicPool).")
             ui.separator().classes("my-2")
             btn_poolA_select = ui.button("Select from Address Book", icon="menu_book").props(
                 "flat dense no-caps").classes("text-sm").style("color: #6E93D6").tooltip(
@@ -2663,6 +2682,12 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             poolB_chain  = ui.select(["BTC", "BCH", "BSV", "DGB", "XEC", "PPC", "None"], value="BCH", label="Chain").classes("w-64").tooltip(
                 "Which SHA-256 blockchain this pool mines. Set to 'None' if not applicable. "
                 "Oracle auto-balance requires one BTC and one BCH pool.")
+            poolB_idle_disconnect = ui.checkbox("Pool disconnects idle connections").tooltip(
+                "Enable if this pool automatically disconnects miners that have been idle "
+                "(not actively mining on this pool) for an extended period. "
+                "Example: MiningCore disconnects idle connections after ~10 minutes. "
+                "When enabled, DPMP will wait and reconnect on-demand rather than "
+                "immediately retrying. Leave unchecked for most pools (Bassin, PublicPool).")
             ui.separator().classes("my-2")
             btn_poolB_select = ui.button("Select from Address Book", icon="menu_book").props(
                 "flat dense no-caps").classes("text-sm").style("color: #6E93D6").tooltip(
@@ -2707,6 +2732,12 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                 "This ensures each pool receives correctly-sized shares. "
                 "Not needed for MiningCore/Bassin which handles oversized en2 gracefully. "
                 "Enable only if one pool shows 0 accepted shares.")
+            sch_sr_exclusions = ui.input("SR Recruitment Exclusions").classes("w-full").tooltip(
+                "Comma-separated list of worker names that should never be recruited as dynamic "
+                "time-slicers for SR correction. These miners will still switch pools normally "
+                "as static miners when the oracle changes the target. "
+                "Use this for miners that generate reject storms when switching pools frequently "
+                "(e.g. firmware-sensitive devices). Example: GekkoA2Z, BM101A")
 
         ui.separator()
 
@@ -2796,6 +2827,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
                 "NONE": "None",
             }
             poolA_chain.value = _chain_map.get(_raw_chainA, "BTC")
+            poolA_idle_disconnect.value = bool(_safe_get(cfg, ["pools", "A", "idle_disconnect"], False))
 
             # pools B
             poolB_host.value   = str(_safe_get(cfg, ["pools", "B", "host"], "") or "")
@@ -2804,6 +2836,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             poolB_wallet.value = str(_safe_get(cfg, ["pools", "B", "wallet"], "") or "")
             _raw_chainB = str(_safe_get(cfg, ["pools", "B", "chain"], "") or "").strip().upper()
             poolB_chain.value = _chain_map.get(_raw_chainB, "BCH")
+            poolB_idle_disconnect.value = bool(_safe_get(cfg, ["pools", "B", "idle_disconnect"], False))
 
             # scheduler
             #sch_min_switch.value = _to_int(_safe_get(cfg, ["scheduler", "min_switch_seconds"], 30), 30)
@@ -2816,6 +2849,11 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             sch_oracle_url.value    = str(_safe_get(cfg, ["scheduler", "oracle_url"], "https://www.sr-analyst.com/dpmp/oracle.php") or "")
             sch_oracle_poll.value   = _to_int(_safe_get(cfg, ["scheduler", "oracle_poll_seconds"], 600), 600)
             sch_force_reconnect_en2.value = bool(_safe_get(cfg, ["scheduler", "force_reconnect_on_en2_mismatch"], False))
+            _raw_exclusions = _safe_get(cfg, ["scheduler", "sr_recruit_exclusions"], [])
+            if isinstance(_raw_exclusions, list):
+                sch_sr_exclusions.value = ", ".join(str(x).strip() for x in _raw_exclusions if str(x).strip())
+            else:
+                sch_sr_exclusions.value = ""
 
             lbl_cfg.text = f"[{now_utc()}] reloaded"
             ui.notify("config reloaded", type="positive")
@@ -2911,6 +2949,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             cfg["pools"]["A"]["port"]   = _to_int(poolA_port.value, 3333)
             cfg["pools"]["A"]["wallet"] = str(poolA_wallet.value or "").strip()
             cfg["pools"]["A"]["chain"]  = str(poolA_chain.value or "BTC").strip().upper()
+            cfg["pools"]["A"]["idle_disconnect"] = bool(poolA_idle_disconnect.value)
 
             cfg["pools"].setdefault("B", {})
             cfg["pools"]["B"]["host"]   = str(poolB_host.value or "").strip()
@@ -2918,6 +2957,7 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             cfg["pools"]["B"]["port"]   = _to_int(poolB_port.value, 2018)
             cfg["pools"]["B"]["wallet"] = str(poolB_wallet.value or "").strip()
             cfg["pools"]["B"]["chain"]  = str(poolB_chain.value or "BCH").strip().upper()
+            cfg["pools"]["B"]["idle_disconnect"] = bool(poolB_idle_disconnect.value)
 
             # Auto-save both pools to address book (only if not already present)
             address_book_autosave(
@@ -2941,6 +2981,10 @@ with ui.tab_panels(tabs, value=t_home).classes("w-full"):
             cfg["scheduler"]["oracle_url"]                 = str(sch_oracle_url.value or "").strip()
             cfg["scheduler"]["oracle_poll_seconds"]        = max(600, min(3600, _to_int(sch_oracle_poll.value, 600)))
             cfg["scheduler"]["force_reconnect_on_en2_mismatch"] = bool(sch_force_reconnect_en2.value)
+            _excl_raw = str(sch_sr_exclusions.value or "").strip()
+            cfg["scheduler"]["sr_recruit_exclusions"] = [
+                x.strip() for x in _excl_raw.split(",") if x.strip()
+            ]
 
             cfg.setdefault("scheduler", {}).setdefault("mode", "ratio")  # preserve/ensure
 

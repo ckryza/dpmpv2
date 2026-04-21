@@ -400,30 +400,7 @@
         sense; the miner immediately begins productive work on the new pool within one to two seconds of the switch.</p>
 
     <hr />
-    <h4>The Relationship Between Slice Duration and Reject Rate</h4>
 
-    <p dir="auto">There is a direct inverse relationship between the <code>Slice Seconds</code> configuration value and
-        the reject rate seen on Dynamic miners. Each pool switch carries a roughly fixed cost of a few rejected shares
-        during the transition, regardless of how long the miner stays on a given pool. If <code>Slice Seconds</code> is
-        set low (for example, 10 seconds), the miner switches more frequently, and those fixed-cost rejects accumulate
-        as
-        a larger percentage of total shares submitted.</p>
-
-    <p dir="auto">Conversely, a higher <code>Slice Seconds</code> value (for example, 30 seconds) means fewer switches
-        per hour and a proportionally lower reject rate, since the miner spends more time doing productive work between
-        each transition. For most configurations, a <code>Slice Seconds</code> value between 20 and 30 seconds strikes a
-        good balance between responsive weight tracking and acceptable reject rates, typically keeping the Dynamic
-        miner's
-        dashboard reject rate below 2&ndash;3%.</p>
-
-    <p dir="auto">It is important to keep in mind that the higher the <code>Slice Seconds</code> value, the more stable
-        the miner's performance will be (e.g., lower reject percentage), but it will take longer for the system to
-        respond
-        to pool ratio changes. We recommend starting with a value of 10 for <code>Slice Seconds</code>. If you see a
-        spike in reject rate on any Dynamic miner, consider increasing the value to 20 or 25 to reduce the frequency of
-        pool switches. The valid range for <code>Slice Seconds</code> is between 10 and 30 seconds.</p>
-
-    <hr />
     <h4>Hashrate Allocation</h4>
 
     <p><strong>DPMP</strong> supports three modes for allocating hashrate between the two pools:
@@ -625,6 +602,17 @@
         VarDiff behavior and not an error.
     </p>
 
+    <div class="callout callout-tip">
+        <div class="callout-label">Configuration</div>
+        <p>Idle timeout handling is configured independently for each pool using the
+            <strong>Disconnect Idle Connections</strong> toggle in the
+            <span class="cfg">Pool A Settings</span> and <span class="cfg">Pool B Settings</span> sections of the
+            <span class="tab-pill">Config</span> tab. Enable it only for pools that implement idle timeouts (such as
+            MiningCore). Leave it off for pools that maintain persistent connections regardless of share activity
+            (such as Bassin / ckpool).
+        </p>
+    </div>
+
     <hr />
     <h4>Configuration and Setup</h4>
 
@@ -642,10 +630,30 @@
         described in the Oracle Auto-Balance section above.
     </p>
 
-    <p dir="auto">Lastly, check the value of <code>Slice Seconds</code> in the
-        <span class="cfg">Scheduler Settings</span> section. Start with a value of 10 seconds and give that a try. If
-        you see too many rejects on your Dynamic miner dashboards, raise the value in 5-second increments until the
-        reject percentage stabilizes.
+    <p dir="auto">In the <span class="cfg">Pool A Settings</span> and <span class="cfg">Pool B Settings</span> sections
+        you will also find two additional options worth reviewing:</p>
+    <ul>
+        <li><strong>Disconnect Idle Connections</strong> &mdash; Enable this if your pool software (such as MiningCore)
+            automatically closes upstream connections that have not submitted a share within a set period. When enabled,
+            <strong>DPMP</strong> will not attempt to keep an idle upstream connection alive for miners that are not
+            currently assigned to that pool. Leave this off for pools that maintain persistent connections regardless of
+            share activity (such as Bassin / ckpool). See the <em>Pool Idle Timeout Handling</em> section below for
+            more detail.</li>
+        <li><strong>Force Reconnect on EN2 Size Mismatch</strong> &mdash; When enabled, if a miner's extranonce2 size
+            does not match what the pool advertises during the handshake, <strong>DPMP</strong> will force a
+            reconnect to re-negotiate the correct parameters rather than attempting to continue with a mismatched
+            session. This is recommended for pools that are strict about extranonce2 sizes. See the
+            <em>Automatic Miner Compatibility Detection</em> section above for background on how extranonce handling
+            works.</li>
+    </ul>
+
+    <p dir="auto">The <span class="cfg">Scheduler Settings</span> section also includes an
+        <strong>SR Recruitment Exclusions</strong> field. This allows you to specify a comma-separated list of worker
+        names that should never be dynamically recruited as additional time-slicers by the SR (Share Ratio) feedback
+        system. Excluded miners can still participate in the fleet as static miners &mdash; they simply will not be
+        promoted to Dynamic (time-slicing) duty by the automatic SR correction mechanism. This is useful for miners
+        that are known to behave poorly during pool switches (such as those with firmware that crashes on extranonce
+        renegotiation) or miners that you want to keep stable on a fixed pool assignment at all times.
     </p>
 
     <p dir="auto">Once you make the configuration changes, click the <strong>APPLY + RESTART</strong> button and

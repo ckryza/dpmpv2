@@ -75,6 +75,17 @@ def init(*, log_fn, read_weights_fn, read_oracle_fn, health_gauge,
     MANUAL_MODE_PATH = manual_mode_path
     PINNED_ASSIGNMENTS_PATH = pinned_assignments_path
 
+def init_pool_failover(seconds: float) -> None:
+    """Set the pool failover timeout. Called from main() after config is loaded.
+
+    Args:
+        seconds: How long a pool must be job-silent before declaring unresponsive.
+    """
+    global _POOL_NO_JOB_FAILOVER_S
+    _POOL_NO_JOB_FAILOVER_S = max(30.0, min(600.0, float(seconds)))
+    log("pool_failover_timeout_set", seconds=_POOL_NO_JOB_FAILOVER_S)
+
+
 def log(event, **kw):
     """Internal log wrapper -- delegates to injected log function."""
     if _log_fn:
@@ -232,6 +243,29 @@ _FLEET_SWITCH_COOLDOWN_S = 3.0  # seconds between consecutive miner switches
 _fleet_next_pool_idx: int = 0  # round-robin counter for initial pool assignment
 
 # ---------------------------------------------------------------------------
+# Pool unresponsive tracking
+# ---------------------------------------------------------------------------
+# Tracks pools that are TCP-connected but not sending mining.notify jobs.
+# This happens when an upstream node (e.g. Bitcoin Core) restarts and the
+# pool software loses its block template but keeps accepting stratum
+# connections.  Without this, miners get stuck unable to switch for hours.
+#
+# When a pool has had no cached job for _POOL_NO_JOB_FAILOVER_S seconds,
+# it is declared unresponsive.  The assigner treats it as unavailable and
+# moves all miners to the working pool.  When a job finally arrives, the
+# pool is automatically recovered and normal operation resumes.
+# ---------------------------------------------------------------------------
+_pool_no_job_first_seen: dict[str, float] = {"A": 0.0, "B": 0.0}
+_pool_healthy_since:     dict[str, float] = {"A": 0.0, "B": 0.0}
+_POOL_HEALTHY_MIN_S = 60.0   # pool must deliver jobs for 60s before no-job clock clears
+_pool_unresponsive: dict[str, bool] = {"A": False, "B": False}
+_POOL_NO_JOB_FAILOVER_S = 90.0   # overridden by init() from config; default 90s
+_pool_flap_count:        dict[str, int]   = {"A": 0, "B": 0}
+_pool_flap_window_start: dict[str, float] = {"A": 0.0, "B": 0.0}
+_POOL_FLAP_MAX      = 3      # declare unresponsive after 3 flaps...
+_POOL_FLAP_WINDOW_S = 600.0  # ...within a 10-minute window
+
+# ---------------------------------------------------------------------------
 # Rolling ratio window (Phase 1a of Scheduler v3)
 # ---------------------------------------------------------------------------
 # Instead of decay-based counters, track a fixed-size rolling window of
@@ -354,7 +388,12 @@ _NONCES = 4294967296.0
 #   "last_decay": float, -- time.time() of last decay update
 # }
 _decay_state: dict[str, dict] = {}
-
+# Per-worker, per-pool decay state for the 5-minute EWMA only.
+# Used by the assigner to get a stable hashrate estimate for time-slicing
+# miners that switch between pools with very different difficulty levels.
+# Keyed by (worker_name, pool_key) e.g. ("AvalonQ", "A").
+# Each entry: {"dsps5": float, "last_decay": float}
+_decay_state_pool: dict[tuple, dict] = {}
 
 def _decay_time(dsps: float, diff: float, tdiff: float, interval: float) -> float:
     """Apply an implementation of ckpool's exponential decay to a dsps value.
@@ -441,6 +480,64 @@ def _decay_worker(worker: str, diff: float, now: float) -> None:
     state["last_decay"] = now
 
 
+def _decay_worker_pool(worker: str, pool_key: str, diff: float, now: float) -> None:
+    """Update the per-pool 5-minute EWMA for a worker on a specific pool.
+
+    Called on every accepted share alongside _decay_worker().  Maintains
+    a separate EWMA for each (worker, pool) pair so that the assigner can
+    sum Pool A + Pool B estimates to get a stable total hashrate for
+    time-slicing miners.
+
+    Without this, a miner switching between pools with very different
+    difficulty levels (e.g. AvalonQ: Pool A diff ~97K, Pool B diff ~5K)
+    causes the combined EWMA to oscillate with every switch cycle, making
+    slice_frac calculations unstable even though the miner's actual
+    hashrate is constant.
+
+    Args:
+        worker:   Worker name (e.g. "AvalonQ")
+        pool_key: Pool this share was accepted on ("A" or "B")
+        diff:     Share difficulty
+        now:      Current time (time.time())
+    """
+    if not pool_key:
+        return
+    key = (worker, pool_key)
+    state = _decay_state_pool.get(key)
+    if state is None:
+        state = {"dsps5": 0.0, "last_decay": now}
+        _decay_state_pool[key] = state
+
+    tdiff = now - state["last_decay"]
+    if tdiff < 0.001:
+        tdiff = 0.001
+    elif tdiff > 86400.0:
+        tdiff = 86400.0
+
+    state["dsps5"] = _decay_time(state["dsps5"], diff, tdiff, _DECAY_MIN5)
+    state["last_decay"] = now
+
+
+def _decay_get_hashrate_pool_sum(worker: str) -> float:
+    """Return stable total hashrate (H/s) by summing per-pool 5m EWMAs.
+
+    For miners that stay on one pool, this returns that pool's EWMA
+    (same as the combined EWMA).  For time-slicing miners, this sums
+    the Pool A and Pool B EWMAs independently, giving a stable total
+    that does not oscillate with pool switches.
+
+    Returns 0.0 if no per-pool data exists yet (falls back to combined
+    EWMA in _fleet_state_build).
+    """
+    total = 0.0
+    for pool_key in ("A", "B"):
+        key = (worker, pool_key)
+        state = _decay_state_pool.get(key)
+        if state:
+            total += state["dsps5"] * _NONCES
+    return total
+
+
 def _decay_seed_from_share_log(worker: str, now: float) -> dict:
     """Warm-start decay state by replaying the worker's share_log.
 
@@ -494,6 +591,23 @@ def _decay_seed_from_share_log(worker: str, now: float) -> dict:
         state["dsps60"] = _decay_time(state["dsps60"], diff, tdiff, _DECAY_HOUR)
         state["dsps1440"] = _decay_time(state["dsps1440"], diff, tdiff, _DECAY_DAY)
         state["last_decay"] = ts
+
+        # Also seed the per-pool state for this share's pool.
+        # This warm-starts the per-pool EWMAs so they don't have to
+        # ramp up from zero after every restart.
+        if _pool_key:
+            pool_key_state = _decay_state_pool.get((worker, _pool_key))
+            if pool_key_state is None:
+                pool_key_state = {"dsps5": 0.0, "dsps60": 0.0, "last_decay": ts}
+                _decay_state_pool[(worker, _pool_key)] = pool_key_state
+            pool_tdiff = ts - pool_key_state["last_decay"]
+            if pool_tdiff < 0.001:
+                pool_tdiff = 0.001
+            elif pool_tdiff > 86400.0:
+                pool_tdiff = 86400.0
+            pool_key_state["dsps5"] = _decay_time(
+                pool_key_state["dsps5"], diff, pool_tdiff, _DECAY_MIN5)
+            pool_key_state["last_decay"] = ts
 
     # Apply idle decay from last share to now (so we don't show stale
     # high values if the miner has been quiet for a while)
@@ -555,6 +669,46 @@ def _decay_idle_all(now: float) -> None:
     for worker in list(_decay_state.keys()):
         _decay_worker(worker, 0.0, now)
 
+    # Idle-decay per-pool states only when the miner is genuinely idle
+    # (no shares on ANY pool recently).  If the miner is actively switching
+    # between pools, we must NOT decay the inactive pool's EWMA -- it holds
+    # the hashrate estimate for when the miner returns to that pool.
+    # We use the combined decay state's last_decay as a proxy for "miner
+    # is alive" -- if it received a share in the last 120 seconds, skip
+    # idle decay on all its per-pool states.
+
+    for key in list(_decay_state_pool.keys()):
+        worker_name = key[0]
+        state = _decay_state_pool[key]
+        combined = _decay_state.get(worker_name)
+        if combined is not None:
+            combined_idle = now - combined["last_decay"]
+            if combined_idle < 120.0:
+                # Worker is actively submitting shares on some pool.
+                # Only apply idle decay if this specific pool's EWMA is
+                # also recent -- meaning the miner is currently on this
+                # pool and we need to fill gaps between shares.
+                # If this pool's last_decay is old, the miner has switched
+                # away -- hold the EWMA steady so it remembers the hashrate
+                # for when the miner returns.
+                pool_idle = now - state["last_decay"]
+                if pool_idle < 120.0:
+                    # Miner is on this pool -- apply gap-filling idle decay
+                    tdiff = pool_idle
+                    if tdiff < 0.001:
+                        tdiff = 0.001
+                    state["dsps5"] = _decay_time(state["dsps5"], 0.0, tdiff, _DECAY_MIN5)
+                    state["last_decay"] = now
+                # else: miner switched away -- hold EWMA steady
+                continue
+        # Worker is genuinely offline -- decay toward zero
+        tdiff = now - state["last_decay"]
+        if tdiff < 0.001:
+            tdiff = 0.001
+        elif tdiff > 86400.0:
+            tdiff = 86400.0
+        state["dsps5"] = _decay_time(state["dsps5"], 0.0, tdiff, _DECAY_MIN5)
+        state["last_decay"] = now
 
 def load_best_shares() -> None:
     """Load best shares from JSON file on startup."""
@@ -741,6 +895,7 @@ def worker_record_share(worker: str, difficulty: float, accepted: bool,
                 "diff_sum": 0.0,
                 "difficulty": difficulty,
                 "last_seen": now,
+                "connected_at": now,
                 "share_log": [],
             }
             worker_stats[worker] = ws
@@ -761,6 +916,7 @@ def worker_record_share(worker: str, difficulty: float, accepted: bool,
     # Update decay hashrate (on every accepted share).
     if accepted and difficulty > 0:
         _decay_worker(worker, difficulty, now)
+        _decay_worker_pool(worker, pool_key, difficulty, now)
 
     # Update best share (accepted shares only)
     # Use the TRUE share difficulty computed from the block header hash.
@@ -924,6 +1080,7 @@ def _worker_build_stats_snapshot() -> dict:
             "rejected": ws.get("rejected", 0),
             "difficulty": ws.get("difficulty", 0.0),
             "last_seen": ws.get("last_seen", 0.0),
+            "connected_at": ws.get("connected_at", 0.0),
         } for wname, ws in worker_stats.items()}
 
     with _best_shares_lock:
@@ -941,8 +1098,13 @@ def _worker_build_stats_snapshot() -> dict:
         elapsed_5m = min(300.0, now - sl[0][0]) if sl and sl[0][0] >= cutoff_5m else 300.0
         sps = shares_in_5m / max(1.0, elapsed_5m) if shares_in_5m > 0 else 0.0
 
-        # Read hashrate from ckpool-style decay state
-        hr_1m, hr_5m, hr_60m, hr_24h = _decay_get_hashrates(wname)
+        # Read hashrate from decay state.
+        # 5m: use per-pool sum for stability (avoids oscillation on
+        # time-slicing miners with mismatched pool difficulties).
+        # 60m/24h: use combined EWMA (longer windows are less affected).
+        hr_1m, hr_5m_combined, hr_60m, hr_24h = _decay_get_hashrates(wname)
+        hr_pool_sum = _decay_get_hashrate_pool_sum(wname)
+        hr_5m = hr_pool_sum if hr_pool_sum > 0 else hr_5m_combined
 
         best = best_snap.get(wname, 0.0)
 
@@ -957,6 +1119,7 @@ def _worker_build_stats_snapshot() -> dict:
             "rejected": rej,
             "rej_pct": round(rej / total * 100, 2) if total > 0 else 0.0,
             "last_seen": ws["last_seen"],
+            "connected_at": ws.get("connected_at", 0.0),
         }
 
     return {
@@ -1128,6 +1291,115 @@ def fleet_try_switch() -> bool:
             _fleet_last_switch_mono = now
             return True
         return False
+
+
+# ---------------------------------------------------------------------------
+# Pool unresponsive tracking functions
+# ---------------------------------------------------------------------------
+
+
+def pool_record_no_job(pool_key: str, now: float) -> None:
+    """Record that a pool has no cached job (mining.notify not yet received).
+
+    Called each time switch_skipped_no_cached_job fires for a pool that is
+    TCP-connected but not sending work.  After _POOL_NO_JOB_FAILOVER_S
+    seconds of continuous no-job state, the pool is declared unresponsive
+    and the assigner will move all miners to the working pool.
+
+    Args:
+        pool_key: "A" or "B"
+        now:      Current time (time.monotonic())
+    """
+    global _pool_unresponsive
+    if _pool_no_job_first_seen[pool_key] == 0.0:
+        _pool_no_job_first_seen[pool_key] = now
+        log("pool_no_job_first_seen", pool=pool_key,
+            failover_in_s=_POOL_NO_JOB_FAILOVER_S)
+
+    elapsed = now - _pool_no_job_first_seen[pool_key]
+    if not _pool_unresponsive[pool_key] and elapsed >= _POOL_NO_JOB_FAILOVER_S:
+        _pool_unresponsive[pool_key] = True
+        log("pool_declared_unresponsive", pool=pool_key,
+            elapsed_s=round(elapsed, 1),
+            reason="no mining.notify received after TCP connect")
+
+
+def pool_record_job_received(pool_key: str) -> None:
+    """Record that a pool has sent a valid mining.notify job.
+
+    Called when latest_notify_raw[pool_key] is populated.  Clears the
+    unresponsive state so the assigner can resume normal operation.
+
+    Uses hysteresis: when a pool is in the no-job detection window, a
+    single job arrival does NOT immediately clear the no-job clock.
+    Instead, _pool_healthy_since tracks when continuous job delivery
+    resumed.  The clock only clears after _POOL_HEALTHY_MIN_S seconds
+    of sustained delivery.  This prevents pool flickering (brief job
+    then silence) from repeatedly restarting the 300s failover timer.
+
+    Args:
+        pool_key: "A" or "B"
+    """
+    global _pool_unresponsive
+    now = time.monotonic()
+
+    if _pool_unresponsive[pool_key]:
+        # Full recovery from declared-unresponsive -- clear everything.
+        # Note: only clear the unresponsive flag here, not at the top of
+        # the function -- this prevents a flap-triggered unresponsive state
+        # from being immediately undone by the next job arrival in the same
+        # call (race condition fix).
+        _pool_unresponsive[pool_key] = False
+        _pool_no_job_first_seen[pool_key] = 0.0
+        _pool_healthy_since[pool_key] = 0.0
+        _pool_flap_count[pool_key] = 0
+        _pool_flap_window_start[pool_key] = 0.0
+        log("pool_recovered", pool=pool_key,
+            reason="mining.notify received after unresponsive period")
+
+    elif _pool_no_job_first_seen[pool_key] > 0.0:
+        # In no-job detection window -- start or continue healthy streak
+        if _pool_healthy_since[pool_key] == 0.0:
+            _pool_healthy_since[pool_key] = now
+        elif now - _pool_healthy_since[pool_key] >= _POOL_HEALTHY_MIN_S:
+            # Sustained delivery for long enough -- clear no-job clock.
+            # Also count this as a flap: pool went silent, recovered briefly,
+            # and is now healthy again.  Too many flaps in a short window
+            # means the pool is unreliable -- declare it unresponsive even
+            # though no single outage reached _POOL_NO_JOB_FAILOVER_S.
+            _healthy_duration = round(now - _pool_healthy_since[pool_key], 1)
+            _pool_no_job_first_seen[pool_key] = 0.0
+            _pool_healthy_since[pool_key] = 0.0
+            if now - _pool_flap_window_start[pool_key] > _POOL_FLAP_WINDOW_S:
+                _pool_flap_count[pool_key] = 0
+                _pool_flap_window_start[pool_key] = now
+            _pool_flap_count[pool_key] += 1
+            log("pool_no_job_clock_cleared", pool=pool_key,
+                healthy_s=_healthy_duration,
+                flap_count=_pool_flap_count[pool_key],
+                flap_max=_POOL_FLAP_MAX)
+            if _pool_flap_count[pool_key] >= _POOL_FLAP_MAX:
+                _pool_flap_count[pool_key] = 0
+                _pool_flap_window_start[pool_key] = 0.0
+                _pool_unresponsive[pool_key] = True
+                log("pool_declared_unresponsive", pool=pool_key,
+                    elapsed_s=0.0,
+                    reason=f"pool flapping: {_POOL_FLAP_MAX} recoveries "
+                           f"within {_POOL_FLAP_WINDOW_S}s window")
+    else:
+        # Normal operation -- reset healthy streak tracker
+        _pool_healthy_since[pool_key] = 0.0
+
+
+def pool_is_unresponsive(pool_key: str) -> bool:
+    """Return True if the pool is TCP-connected but not sending jobs.
+
+    Used by the assigner to skip assignments to unresponsive pools.
+
+    Args:
+        pool_key: "A" or "B"
+    """
+    return _pool_unresponsive.get(pool_key, False)
 
 
 # ---------------------------------------------------------------------------
@@ -1514,14 +1786,35 @@ def _fleet_state_build() -> dict:
             diff_sum = ws.get("diff_sum", 0.0)
             _last_seen = ws.get("last_seen", 0.0)
 
-        # Read smoothed hashrate from decay state (updated on every share)
-        _, hr_5m, _, _ = _decay_get_hashrates(worker_name)
-        if hr_5m > 0:
-            hashrate_ths = hr_5m / 1e12
-        elif ws:
-            # Fallback: decay state empty (first seconds after connect)
-            sl = ws.get("share_log", [])
-            hashrate_ths = _worker_calc_hashrate_combined(sl, 60) / 1e12
+        # Read smoothed hashrate from per-pool decay state (summed).
+        # This gives a stable estimate for time-slicing miners by summing
+        # independent Pool A and Pool B EWMAs, avoiding the oscillation
+        # that occurs when a single combined EWMA sees alternating share
+        # difficulties from two pools (e.g. AvalonQ: Pool A diff ~97K,
+        # Pool B diff ~5K -- the combined EWMA swings with every switch).
+        hr_pool_sum = _decay_get_hashrate_pool_sum(worker_name)
+        _, hr_5m, hr_60m, hr_24h = _decay_get_hashrates(worker_name)
+
+        if hr_pool_sum > 0:
+            hashrate_ths = hr_pool_sum / 1e12
+        else:
+            # Fallback: per-pool state not yet populated (first shares
+            # after connect). Use combined EWMA until pool data arrives.
+            if hr_5m > 0:
+                hashrate_ths = hr_5m / 1e12
+            elif ws:
+                # Last resort: decay state empty, use raw share_log
+                sl = ws.get("share_log", [])
+                hashrate_ths = _worker_calc_hashrate_combined(sl, 60) / 1e12
+
+        # Long-window floor: if the 60m or 24h combined EWMA is significantly
+        # higher than the per-pool sum, the per-pool sum is likely underestimating
+        # due to sparse shares on the minority pool (e.g. AvalonQ spending only
+        # 10% of time on Pool A with high difficulty = very few Pool A shares).
+        # Use the best long-window estimate as a floor to prevent under-assignment.
+        hr_long = max(hr_60m, hr_24h)
+        if hr_long > 0 and hr_long / 1e12 > hashrate_ths * 1.2:
+            hashrate_ths = hr_long / 1e12
 
         # Stale miner detection: if this miner hasn't submitted a share
         # in over 5 minutes, skip it in this snapshot but DON'T unregister.
@@ -1738,7 +2031,9 @@ def _write_scheduler_diag(state: dict, assignments: dict) -> None:
 # them to assignments.
 # ---------------------------------------------------------------------------
 
-def _compute_assignments(fleet: dict, min_slice_s: float) -> dict:
+def _compute_assignments(fleet: dict, min_slice_s: float,
+                         convergence_tolerance: float = 0.02,
+                         sr_exclusions: list = None) -> dict:
     """Compute optimal fleet assignments given current state.
 
     This is the core bin-packing + time-slicing algorithm from spec Section 5.
@@ -1820,6 +2115,28 @@ def _compute_assignments(fleet: dict, min_slice_s: float) -> dict:
     if not active_miners:
         return assignments
 
+    # Pool unresponsive override: if a pool is TCP-connected but not sending
+    # jobs, treat it as 0% target so all miners move to the working pool.
+    # This prevents miners being stuck unable to switch for hours when the
+    # upstream node (e.g. Bitcoin Core) restarts and the pool loses its
+    # block template.  Normal operation resumes automatically when the pool
+    # starts sending jobs again.
+    _a_unresponsive = pool_is_unresponsive("A")
+    _b_unresponsive = pool_is_unresponsive("B")
+    if _a_unresponsive and not _b_unresponsive:
+        log("assigner_pool_failover", unresponsive_pool="A",
+            original_target_a=round(target_a, 3))
+        target_a = 0.0
+        target_b = 1.0
+    elif _b_unresponsive and not _a_unresponsive:
+        log("assigner_pool_failover", unresponsive_pool="B",
+            original_target_b=round(target_b, 3))
+        target_a = 1.0
+        target_b = 0.0
+    elif _a_unresponsive and _b_unresponsive:
+        # Both pools unresponsive -- can't do anything useful, keep current
+        log("assigner_both_pools_unresponsive")
+
     # Determine minority pool (the one wanting less hashrate)
     if target_a <= target_b:
         minority_pool = "A"
@@ -1844,6 +2161,7 @@ def _compute_assignments(fleet: dict, min_slice_s: float) -> dict:
     # Separate switchable miners from pinned miners
     switchable = []   # (sid_str, hashrate_ths, health)
     pinned = []       # (sid_str, current_pool)
+    _excl = set(sr_exclusions) if sr_exclusions else set()
 
     for sid_str, m in active_miners.items():
         hr = m.get("hashrate_ths", 0.0)
@@ -1873,55 +2191,62 @@ def _compute_assignments(fleet: dict, min_slice_s: float) -> dict:
     #   Strategy B: Pack ALL small miners even if it overshoots (avoids time-slicing)
     # A small static overshoot (e.g., 12% actual vs 10% target) is preferable
     # to introducing time-slicing, which adds switch overhead and rejects.
+    #
+    # SLICER RESERVATION: Before packing, identify the best slicer candidate
+    # (highest-hashrate switchable miner, i.e. the last entry after ascending
+    # sort) and exclude it from static packing entirely.  This guarantees it
+    # always has a deficit to cover via time-slicing, even at low minority
+    # targets where small static miners could collectively fill the entire
+    # deficit.  Without reservation, all statics get packed first, the slicer
+    # finds _true_remaining <= _meaningful_threshold and goes static:majority
+    # with sf=0 -- leaving no slicer to compensate when actual ratio drifts.
+    # This logic is fully miner-agnostic: it reserves whichever miner has the
+    # highest hashrate, regardless of model or identity.
+    _slicer_candidate_sid = switchable[-1][0] if switchable else None
+    _packable = [(s, h, hl) for s, h, hl in switchable
+                 if s != _slicer_candidate_sid]
+    _slicer_entry = [e for e in switchable if e[0] == _slicer_candidate_sid]
 
-    # Strategy A: strict no-overshoot packing
+    # Strategy A: strict no-overshoot packing (packable miners only)
     strict_minority = []
     strict_available = []
     strict_deficit = remaining_deficit
-    for sid_str, hr, health in switchable:
+    for sid_str, hr, health in _packable:
         if hr <= strict_deficit:
             strict_minority.append(sid_str)
             strict_deficit -= hr
         else:
             strict_available.append((sid_str, hr, health))
+    # Slicer candidate always goes to available, never packed static
+    strict_available.extend(_slicer_entry)
 
-    # Strategy B: pack ALL switchable miners that are smaller than the
-    # time-slicer candidate (i.e., all except the largest miner).
-    # This avoids time-slicing if the overshoot is within tolerance.
-    greedy_minority = []
-    greedy_available = []
-    greedy_minority_ths = 0.0
-    for sid_str, hr, health in switchable:
-        greedy_minority.append(sid_str)
-        greedy_minority_ths += hr
-    # The last (largest) miner goes to available if it's much bigger than the rest
-    # Actually, simpler: pack all EXCEPT the largest switchable miner
-    if len(switchable) > 1:
-        greedy_minority = [s for s, _, _ in switchable[:-1]]  # all but largest
-        greedy_available = [switchable[-1]]  # largest goes to available
-        greedy_minority_ths = sum(hr for _, hr, _ in switchable[:-1])
-    else:
-        greedy_minority = []
-        greedy_available = list(switchable)
-        greedy_minority_ths = 0.0
+    # Strategy B: pack ALL packable miners (all except slicer candidate)
+    greedy_minority = [s for s, _, _ in _packable]
+    greedy_available = list(_slicer_entry)
+    greedy_minority_ths = sum(hr for _, hr, _ in _packable)
 
     greedy_overshoot = greedy_minority_ths - target_minority_ths
 
     # Decision: use Strategy B (all-static) if the overshoot is within
-    # tolerance (convergence_tolerance, default 2%) or if it means we
-    # don't need a time-slicer at all.
-    # Use the more conservative convergence tolerance of 5% for this check
-    # since we're choosing between static placement and time-slicing.
+    # tolerance AND it leaves the slicer candidate with meaningful work.
+    # Use 5% overshoot tolerance since we're choosing between static
+    # placement and time-slicing.
     _static_overshoot_frac = greedy_overshoot / total_ths if total_ths > 0 else 0
     _strict_needs_slicer = strict_deficit > 0.01
 
-    if _static_overshoot_frac <= 0.05 and _static_overshoot_frac >= -0.01:
-        # Strategy B: all small miners on minority, no slicing needed
+    # Would Strategy B leave the slicer with meaningful work?
+    _greedy_remaining = target_minority_ths - greedy_minority_ths - pinned_minority_ths
+    _meaningful_threshold_check = total_ths * 0.02
+    _greedy_strands_slicer = _greedy_remaining <= _meaningful_threshold_check
+
+    if (_static_overshoot_frac <= 0.05 and _static_overshoot_frac >= -0.01
+            and not _greedy_strands_slicer):
+        # Strategy B: all packable miners on minority, slicer candidate available
         static_minority = greedy_minority
         available = greedy_available
-        remaining_deficit = target_minority_ths - greedy_minority_ths - pinned_minority_ths
+        remaining_deficit = _greedy_remaining
     else:
-        # Strategy A: strict packing, may need time-slicing
+        # Strategy A: strict packing, slicer candidate reserved for time-slicing
         static_minority = strict_minority
         available = strict_available
         remaining_deficit = strict_deficit
@@ -1930,126 +2255,282 @@ def _compute_assignments(fleet: dict, min_slice_s: float) -> dict:
     for sid_str in static_minority:
         assignments[sid_str] = {"mode": "static", "pool": minority_pool}
 
-    # Step 2: If there's still a deficit, we need time-slicers
+    # Step 2: If there's still a deficit, we need time-slicers.
+    #
+    # REDESIGNED SLICE FRACTION APPROACH (scheduler redesign, April 2026):
+    #
+    # The old approach calculated slice_frac = remaining_deficit / slicer_hr.
+    # This was problematic because hashrate estimates for high-difficulty miners
+    # like AvalonQ are severely underestimated when they spend little time on
+    # the high-difficulty pool (e.g. AvalonQ at ~97K Pool A diff spending only
+    # 10% of time there gets very few Pool A shares, so its Pool A EWMA sits
+    # near zero, causing the combined estimate to be far too low).
+    #
+    # NEW APPROACH:
+    #   - Initial slice_frac = minority_frac (the target fraction directly).
+    #     Example: target A=30% -> primary slicer starts at 30% on Pool A.
+    #     This is always correct as a starting point: if the slicer is the
+    #     ONLY contributor to the minority pool, it needs to spend exactly
+    #     minority_frac of its time there.  Static miners already assigned
+    #     to the minority pool reduce this below minority_frac proportionally.
+    #   - Feasibility check: if the primary slicer's hashrate / total fleet
+    #     hashrate < minority_frac, that miner cannot cover the target alone.
+    #     In that case, recruit additional slicers upfront (not just via SR
+    #     feedback after the fact).
+    #   - SR feedback correction (in assigner_loop duration-update path) is
+    #     now capped at +-0.02/cycle with a 3% threshold, preventing the
+    #     lag-induced oscillation seen with the old +-0.15 cap.
+    #
+    # Hashrate is still used for RANKING candidates (highest hashrate = best
+    # primary slicer) but NOT for computing the initial slice fraction.
     if remaining_deficit > 0.01 and available:
-        # Pick the best time-slicer.  Two-pass approach:
-        #   Pass 1: Only consider miners with perfect health (>= 0.98).
-        #   Pass 2: If no perfect-health miner fits, consider all miners.
-        # Within each pass, prefer the miner whose hashrate is closest
-        # to (but >= ) the deficit.  Health is used as a tiebreaker weight.
-        #
-        # This ensures a miner like BM101 (health 0.96) is never chosen
-        # as the slicer when AvalonQ (health 1.0) is available, regardless
-        # of hashrate fit.
+        # Select the primary slicer: highest-hashrate eligible miner with
+        # good health.  Healthy miners (>= 0.98) get priority; fall back to
+        # all available if no healthy candidate exists.
+        # SR-excluded miners are deprioritized -- only considered if no
+        # other switchable miner is available to cover the deficit.
         best_sid = None
         best_score = -1.0
 
-        # Pass 1: healthy miners only
-        _healthy_available = [(s, h, hl) for s, h, hl in available if hl >= 0.98]
-        _search_pool = _healthy_available if _healthy_available else available
+        _non_excluded = [(s, h, hl) for s, h, hl in available
+                         if active_miners.get(s, {}).get("worker_name", "") not in _excl]
+        _slicer_pool = _non_excluded if _non_excluded else available
+        _healthy_available = [(s, h, hl) for s, h, hl in _slicer_pool if hl >= 0.98]
+        _search_pool = _healthy_available if _healthy_available else _slicer_pool
 
         for sid_str, hr, health in _search_pool:
             if hr < 0.001:
                 continue
-            # How well does this miner's hashrate match the deficit?
-            # Lower distance = better fit.  We use inverse distance * health.
-            distance = abs(hr - remaining_deficit) + 0.1  # avoid div by zero
-            score = (1.0 / distance) * health
+            # Primary selection criterion: highest hashrate (most impact).
+            # Health is used as a tiebreaker multiplier.
+            score = hr * health
             if score > best_score:
                 best_score = score
                 best_sid = sid_str
+
+        # Track how many slicers we've assigned so far for stagger calculation
+        slicer_count = 0
+        primary_cycle = 30.0  # will be updated once primary is assigned
 
         if best_sid is not None:
             slicer_hr = active_miners[best_sid].get("hashrate_ths", 1.0)
             slicer_health = active_miners[best_sid].get("health", 1.0)
 
-            # What fraction of time should the slicer spend on minority pool?
-            slice_frac = min(1.0, max(0.0, remaining_deficit / slicer_hr))
-
-            # Health-adjusted minimum slice floor
-            effective_floor = min_slice_s + (1.0 - slicer_health) * 10.0
-            #effective_floor = max(min_slice_s, slicer_hr * 0.20) + (1.0 - slicer_health) * 10.0
-
-            # Calculate cycle length from the minority fraction
-            if slice_frac > 0.001:
-                cycle_length = effective_floor / slice_frac
-            else:
-                cycle_length = 60.0
-            cycle_length = max(20.0, min(120.0, cycle_length))
-
-            # Durations on each pool
-            slice_duration = cycle_length * slice_frac
-            home_duration = cycle_length * (1.0 - slice_frac)
-
-            # Ensure both durations respect the floor
-            slice_duration = max(effective_floor, slice_duration)
-            home_duration = max(effective_floor, home_duration)
-
-            assignments[best_sid] = {
-                "mode": "time_slice",
-                "pool": majority_pool,    # current/default pool
-                "home_pool": majority_pool,
-                "slice_pool": minority_pool,
-                "home_duration_s": round(home_duration, 1),
-                "slice_duration_s": round(slice_duration, 1),
-                "cycle_length_s": round(slice_duration + home_duration, 1),
-                "stagger_offset_s": 0.0,
-                "slice_frac": round(slice_frac, 4),
-            }
-
-            # Remove the slicer from available list
-            available = [(s, h, hl) for s, h, hl in available if s != best_sid]
-
-        # If deficit still remains after one slicer (rare with mixed fleets),
-        # assign additional slicers with staggered offsets
-        slicer_count = 1
-        stagger_base = assignments.get(best_sid, {}).get("cycle_length_s", 30.0)
-        for sid_str, hr, health in available:
-            if remaining_deficit <= 0.01:
-                break
-            # Check if we still need more hashrate on minority
-            slicer_hr_covered = 0.0
-            for s, a in assignments.items():
-                if a.get("mode") == "time_slice":
-                    shr = active_miners.get(s, {}).get("hashrate_ths", 0.0)
-                    slicer_hr_covered += shr * a.get("slice_frac", 0.0)
-            total_static_minority = sum(
+            # Initial slice_frac = remaining_deficit / slicer_hr,
+            # clamped to [min_floor, minority_frac].
+            #
+            # WHY remaining_deficit / slicer_hr (not minority_frac directly):
+            #   When static miners already cover part of the minority target,
+            #   the slicer only needs to cover what remains.  Using minority_frac
+            #   directly ignores static coverage and causes massive overshoot --
+            #   e.g. at 33% target with ~14 TH/s of statics already on Pool A,
+            #   adding AvalonQ at 33% pushes actual A to ~55-60%.
+            #
+            # WHY not plain remaining_deficit / slicer_hr alone:
+            #   At high pool difficulty (e.g. Pool A ~97K vs Pool B ~5K), AvalonQ's
+            #   hashrate EWMA is underestimated because it gets few high-difficulty
+            #   shares when spending little time on Pool A.  This causes
+            #   remaining_deficit / slicer_hr to be too LOW (e.g. 5% when it
+            #   should be 20%).  The SR feedback correction (+-0.02/cycle) handles
+            #   this -- it climbs from an underestimate in ~2-3 minutes.
+            #
+            # WHY minority_frac as the cap:
+            #   A slicer can never meaningfully spend MORE than minority_frac of
+            #   its time on the minority pool -- that would over-contribute even
+            #   if statics contribute zero.  The cap prevents runaway overcorrection.
+            #
+            # MIN FLOOR = 1% so the slicer stays in time_slice mode rather than
+            #   being silently zeroed out.  If remaining_deficit <= 0 (statics
+            #   already exceed the target), we assign AvalonQ static:majority so
+            #   it doesn't contribute to the minority pool at all.
+            #
+            # EXAMPLE (target A=33%, total=39 TH/s, statics on A = 14.3 TH/s):
+            #   target_minority_ths = 39 * 0.33 = 12.9 TH/s
+            #   remaining_deficit   = 12.9 - 14.3 = -1.4  -> clamped to 0
+            #   -> Statics already exceed target; assign AvalonQ static:B
+            #
+            # EXAMPLE (target A=48%, total=70 TH/s, statics on A = 8 TH/s):
+            #   target_minority_ths = 70 * 0.48 = 33.6 TH/s
+            #   remaining_deficit   = 33.6 - 8.0 = 25.6 TH/s
+            #   slice_frac = 25.6 / 56 = 0.457, capped at minority_frac=0.48 -> 0.457
+            #   SR correction lifts this if AvalonQ EWMA is underestimated.
+            _static_on_minority = sum(
                 active_miners.get(s, {}).get("hashrate_ths", 0.0)
                 for s, a in assignments.items()
                 if a.get("mode") == "static" and a.get("pool") == minority_pool
             )
-            effective_deficit = target_minority_ths - total_static_minority - slicer_hr_covered
+            _true_remaining = target_minority_ths - _static_on_minority
+
+            # Meaningful work threshold: if the remaining deficit is less than
+            # 2% of total fleet hashrate, there is not enough work left for the
+            # slicer to justify putting it in time_slice mode.  A 1% slice_frac
+            # assignment causes disruptive pool transitions (temporary SR dips
+            # each cycle) for essentially zero SR benefit.  Send it static:majority
+            # instead and let the SR feedback correction handle any tiny residual.
+            _meaningful_threshold = total_ths * 0.02
+
+            if _true_remaining <= _meaningful_threshold:
+                # Deficit too small to justify time-slicing.
+                # Assign the slicer static on the majority pool instead.
+                assignments[best_sid] = {"mode": "static", "pool": majority_pool}
+                log("assigner_primary_slicer",
+                    worker=active_miners[best_sid].get("worker_name", best_sid),
+                    slice_frac=0.0,
+                    slicer_hr=round(slicer_hr, 2),
+                    total_ths=round(total_ths, 2),
+                    minority_frac=round(minority_frac, 4),
+                    static_on_minority=round(_static_on_minority, 2),
+                    remaining_deficit=round(_true_remaining, 2),
+                    can_cover_alone=False,
+                    note="deficit_below_threshold_slicer_goes_static")
+                available = [(s, h, hl) for s, h, hl in available if s != best_sid]
+            else:
+                # Normal path: slicer covers the remaining deficit.
+                _raw_frac = _true_remaining / slicer_hr if slicer_hr > 0 else minority_frac
+                slice_frac = min(minority_frac, max(0.01, _raw_frac))
+
+                # Feasibility: can this slicer cover the remaining deficit alone?
+                _slicer_can_cover = (slicer_hr > 0
+                                     and _true_remaining / slicer_hr <= 1.0)
+
+                # Health-adjusted minimum slice floor
+                effective_floor = min_slice_s + (1.0 - slicer_health) * 10.0
+
+                # Calculate cycle length from the slice fraction
+                if slice_frac > 0.001:
+                    cycle_length = effective_floor / slice_frac
+                else:
+                    cycle_length = 60.0
+                cycle_length = max(20.0, min(120.0, cycle_length))
+
+                # Durations on each pool
+                slice_duration = cycle_length * slice_frac
+                home_duration = cycle_length * (1.0 - slice_frac)
+
+                # Ensure both durations respect the floor
+                slice_duration = max(effective_floor, slice_duration)
+                home_duration = max(effective_floor, home_duration)
+
+                primary_cycle = slice_duration + home_duration
+
+                assignments[best_sid] = {
+                    "mode": "time_slice",
+                    "pool": majority_pool,    # current/default pool
+                    "home_pool": majority_pool,
+                    "slice_pool": minority_pool,
+                    "home_duration_s": round(home_duration, 1),
+                    "slice_duration_s": round(slice_duration, 1),
+                    "cycle_length_s": round(primary_cycle, 1),
+                    "stagger_offset_s": 0.0,
+                    "slice_frac": round(slice_frac, 4),
+                }
+                slicer_count = 1
+                log("assigner_primary_slicer",
+                    worker=active_miners[best_sid].get("worker_name", best_sid),
+                    slice_frac=round(slice_frac, 4),
+                    slicer_hr=round(slicer_hr, 2),
+                    total_ths=round(total_ths, 2),
+                    minority_frac=round(minority_frac, 4),
+                    static_on_minority=round(_static_on_minority, 2),
+                    remaining_deficit=round(_true_remaining, 2),
+                    can_cover_alone=_slicer_can_cover)
+
+                # Remove the primary slicer from available list
+                available = [(s, h, hl) for s, h, hl in available if s != best_sid]
+
+        # Step 2b: Recruit additional slicers if the primary cannot cover the
+        # target alone (feasibility check) or if the predicted deviation after
+        # the primary assignment is still above convergence_tolerance.
+        #
+        # Additional slicers are recruited in DESCENDING hashrate order so
+        # the most impactful miner is added first.  Each additional slicer
+        # uses the same target-fraction approach: slice_frac = minority_frac
+        # adjusted for what's already covered by statics and prior slicers.
+        #
+        # Recruitment stops when predicted deviation drops within tolerance
+        # or no more eligible miners remain.
+
+        # Sort remaining available miners by hashrate DESCENDING for recruitment
+        available_desc = sorted(available, key=lambda x: x[1], reverse=True)
+
+        for sid_str, hr, health in available_desc:
+            # Skip SR-excluded miners in secondary slicer recruitment.
+            # They can still be static miners but should not time-slice.
+            _wn = active_miners.get(sid_str, {}).get("worker_name", "")
+            if _wn in _excl:
+                continue
+            # Compute what's already covered: statics + slicers assigned so far
+            slicer_minority_ths = sum(
+                active_miners.get(s, {}).get("hashrate_ths", 0.0)
+                * a.get("slice_frac", 0.0)
+                for s, a in assignments.items()
+                if a.get("mode") == "time_slice"
+                and a.get("slice_pool") == minority_pool
+            )
+            static_minority_ths = sum(
+                active_miners.get(s, {}).get("hashrate_ths", 0.0)
+                for s, a in assignments.items()
+                if a.get("mode") == "static" and a.get("pool") == minority_pool
+            )
+            effective_deficit = max(0.0, target_minority_ths
+                                    - static_minority_ths
+                                    - slicer_minority_ths)
+
+            # Check predicted deviation with current assignments
+            predicted_minority_frac = ((static_minority_ths + slicer_minority_ths)
+                                        / total_ths if total_ths > 0 else 0.0)
+            predicted_deviation = abs(predicted_minority_frac - minority_frac)
+
+            # Stop recruiting if already within tolerance
+            if predicted_deviation <= convergence_tolerance:
+                break
+
+            # Stop if no meaningful deficit remains
             if effective_deficit <= 0.01:
                 break
 
-            slice_frac_2 = min(1.0, max(0.0, effective_deficit / hr)) if hr > 0 else 0.0
-            eff_floor_2 = min_slice_s + (1.0 - health) * 10.0
-            #eff_floor_2 = max(min_slice_s, hr * 0.20) + (1.0 - health) * 10.0
+            # Skip if this miner can't contribute meaningfully
+            if hr < 0.001:
+                continue
 
-            if slice_frac_2 > 0.001:
-                cycle_2 = eff_floor_2 / slice_frac_2
+            # Slice fraction for this additional slicer.
+            # effective_deficit already accounts for what statics and prior
+            # slicers contribute, so deficit/hr gives the correct time fraction.
+            # Cap at minority_frac to prevent over-contribution.
+            slice_frac_n = min(minority_frac, max(0.01,
+                               effective_deficit / hr if hr > 0 else minority_frac))
+            eff_floor_n = min_slice_s + (1.0 - health) * 10.0
+
+            if slice_frac_n > 0.001:
+                cycle_n = eff_floor_n / slice_frac_n
             else:
-                cycle_2 = 60.0
-            cycle_2 = max(20.0, min(120.0, cycle_2))
-            sd2 = max(eff_floor_2, cycle_2 * slice_frac_2)
-            hd2 = max(eff_floor_2, cycle_2 * (1.0 - slice_frac_2))
+                cycle_n = 60.0
+            cycle_n = max(20.0, min(120.0, cycle_n))
+            sd_n = max(eff_floor_n, cycle_n * slice_frac_n)
+            hd_n = max(eff_floor_n, cycle_n * (1.0 - slice_frac_n))
 
-            # Stagger offset: spread slicers evenly across the cycle
-            stagger = (stagger_base / (slicer_count + 1)) * slicer_count
+            # Stagger offset: spread switches across time so slicers alternate
+            # naturally rather than all switching simultaneously.
+            stagger_n = (primary_cycle / (slicer_count + 1)) * slicer_count
 
             assignments[sid_str] = {
                 "mode": "time_slice",
                 "pool": majority_pool,
                 "home_pool": majority_pool,
                 "slice_pool": minority_pool,
-                "home_duration_s": round(hd2, 1),
-                "slice_duration_s": round(sd2, 1),
-                "cycle_length_s": round(sd2 + hd2, 1),
-                "stagger_offset_s": round(stagger, 1),
-                "slice_frac": round(slice_frac_2, 4),
+                "home_duration_s": round(hd_n, 1),
+                "slice_duration_s": round(sd_n, 1),
+                "cycle_length_s": round(sd_n + hd_n, 1),
+                "stagger_offset_s": round(stagger_n, 1),
+                "slice_frac": round(slice_frac_n, 4),
             }
             slicer_count += 1
-            available = [(s, h, hl) for s, h, hl in available if s != sid_str]
+            log("assigner_recruited_slicer",
+                worker=active_miners[sid_str].get("worker_name", sid_str),
+                slicer_count=slicer_count,
+                slice_frac=round(slice_frac_n, 4),
+                stagger_offset_s=round(stagger_n, 1),
+                predicted_deviation_before=round(predicted_deviation, 4))
 
     # Step 3: Remaining unassigned miners go to majority pool (static)
     for sid_str, hr, health in available:
@@ -2093,6 +2574,39 @@ async def assigner_loop(cfg):
     _force_recompute = True        # always compute on first iteration
     _last_recompute_mono: float = 0.0  # monotonic time of last recompute
 
+    # SR-based dynamic slicer recruitment state.
+    # Rather than relying solely on hashrate estimates (which can be
+    # inaccurate), we track the actual SR deviation over time and recruit
+    # additional slicers when the SR persistently misses the target.
+    _consec_over_tolerance: int = 0   # consecutive cycles above tolerance
+    _consec_under_tolerance: int = 0  # consecutive cycles within tolerance
+    _RECRUIT_AFTER_CYCLES = 5        # recruit after 5 cycles above tolerance (~15s)
+    _RELEASE_AFTER_CYCLES = 5        # release after 5 cycles within tolerance (~15s)
+    _extra_slicers: list = []         # sids of SR-recruited extra slicers
+    _sr_recruit_grace_end = time.monotonic() + 90.0  # no recruitment for first 90s
+    _sr_recruit_direction: str = ""   # "under" or "over" -- which way SR was off when recruited
+
+    # Deviation-triggered flush cooldown: after flushing the rolling window
+    # due to a deviation recompute, suppress further deviation flushes for
+    # this many seconds.  Without this, the flush+recompute loop becomes
+    # self-defeating -- the flush clears the window, the window shows near-zero
+    # actual ratio, deviation stays high, another flush fires 30s later, repeat
+    # indefinitely.  The cooldown gives the window time to rebuild from new
+    # assignments before the next flush is allowed.
+    # Target-change flushes bypass this cooldown (they're always correct).
+    _last_deviation_flush_mono: float = 0.0
+    _DEVIATION_FLUSH_COOLDOWN_S: float = 180.0  # 3 minutes between deviation flushes
+
+    # SR recruit cooldown is tracked in the module-level _sr_recruit_cooldown
+    # dict so the proxy can also call sr_recruit_record_cooldown() when it
+    # detects a reject storm on an SR-recruited miner.  No local copy needed.
+
+    # Post-convergence dead-band: track how many consecutive assigner cycles
+    # the SR error has persisted before applying a slice_frac correction.
+    # Small errors (2-5%) require 3 consecutive cycles to avoid reacting to
+    # cycle-induced measurement noise.  Large errors (>5%) correct immediately.
+    _sr_consec_error: int = 0         # consecutive cycles with SR error > threshold
+
     while True:
         try:
             # Yield to the event loop before doing any lock-acquiring work.
@@ -2120,6 +2634,19 @@ async def assigner_loop(cfg):
             # 4. Max hashrate changed significantly (estimates stabilizing)
             # 5. Deviation-triggered: actual ratio drifted far from target
             target = state.get("target_ratio", {"A": 0.5, "B": 0.5})
+
+            # Pool unresponsive override: if a pool has been connected but
+            # sending no jobs for _POOL_NO_JOB_FAILOVER_S seconds, treat
+            # it as 0% target so the assigner moves all miners to the
+            # working pool.  Both the recompute path and duration-update
+            # path use this corrected target automatically.
+            _a_unresp = pool_is_unresponsive("A")
+            _b_unresp = pool_is_unresponsive("B")
+            if _a_unresp and not _b_unresp:
+                target = {"A": 0.0, "B": 1.0}
+            elif _b_unresp and not _a_unresp:
+                target = {"A": 1.0, "B": 0.0}
+
             _curr_target = (round(target.get("A", 0.5), 4),
                             round(target.get("B", 0.5), 4))
             _curr_miner_set = set(miners.keys())
@@ -2129,7 +2656,7 @@ async def assigner_loop(cfg):
             _hr_changed = False
             if _prev_max_hr > 0 and _curr_max_hr > 0:
                 _hr_ratio = _curr_max_hr / _prev_max_hr
-                _hr_changed = _hr_ratio > 1.2 or _hr_ratio < 0.8
+                _hr_changed = _hr_ratio > 1.5 or _hr_ratio < 0.5
             elif _curr_max_hr > 5.0 and _prev_max_hr <= 5.0:
                 # Crossed the startup threshold -- hashrate data is now reliable
                 _hr_changed = True
@@ -2138,10 +2665,11 @@ async def assigner_loop(cfg):
             # the current assignments aren't achieving the target ratio.
             # This prevents unnecessary reshuffling when things are working.
             _deviation_recompute = False
+            _dev = 0.0
             if (time.monotonic() - _last_recompute_mono) >= 30.0:
                 actual = state.get("actual_ratio", {})
                 _dev = abs(actual.get("A", 0.5) - target.get("A", 0.5))
-                if _dev > 0.05:
+                if _dev > 0.10:
                     _deviation_recompute = True
                     log("assigner_deviation_recompute",
                         deviation=round(_dev, 4),
@@ -2167,17 +2695,72 @@ async def assigner_loop(cfg):
             )
 
             if _needs_recompute:
-                # If the target ratio changed, flush the rolling window so
-                # the actual ratio display reflects the new allocation
-                # immediately instead of showing stale data for up to 10 min.
-                if _curr_target != _prev_target and not _force_recompute:
+                # Flush the rolling window when the target changes OR when a
+                # deviation recompute fires with large deviation (>10%). In both
+                # cases the window holds stale data from the previous allocation
+                # that will drag the actual ratio measurement for up to 10 min.
+                # Flushing lets the window rebuild from the new assignments
+                # immediately rather than slowly washing out stale entries.
+                # Deviation-triggered flushes are rate-limited by a cooldown
+                # to prevent the self-defeating loop where flush->low actual_A
+                # ->recompute->flush fires every 30s indefinitely after a
+                # disruption, never giving the window time to rebuild.
+                # Target-change flushes always fire immediately.
+                _now_mono_flush = time.monotonic()
+                _deviation_flush_ok = (
+                    _deviation_recompute
+                    and _dev > 0.10
+                    and (_now_mono_flush - _last_deviation_flush_mono)
+                        >= _DEVIATION_FLUSH_COOLDOWN_S
+                )
+                if ((_curr_target != _prev_target and not _force_recompute)
+                        or _deviation_flush_ok):
                     _ratio_window_flush()
+                    if _deviation_flush_ok:
+                        _last_deviation_flush_mono = _now_mono_flush
+                        log("deviation_flush_cooldown_armed",
+                            cooldown_s=_DEVIATION_FLUSH_COOLDOWN_S,
+                            dev=round(_dev, 4))
 
                 # Compute fresh assignments
-                new_assignments = _compute_assignments(state, min_slice)
+                new_assignments = _compute_assignments(
+                    state, min_slice, cfg.sched.convergence_tolerance,
+                    sr_exclusions=cfg.sched.sr_recruit_exclusions)
 
                 # Write to global table
                 _put_assignments(new_assignments)
+
+                # Clear SR recruitment state on STRUCTURAL recomputes only
+                # (target change, miner connect/disconnect, hashrate shift).
+                # A deviation_recompute just re-seats the slicer for the same
+                # target -- resetting the recruitment counter here would starve
+                # recruitment by restarting the grace window every 10 minutes,
+                # preventing _consec_over_tolerance from ever reaching the
+                # threshold needed to recruit a second slicer.
+                _structural_recompute = (
+                    _force_recompute
+                    or _curr_target != _prev_target
+                    or _curr_miner_set != _prev_miner_set
+                    or _hr_changed
+                )
+                if _structural_recompute:
+                    if _extra_slicers:
+                        _curr = _snap_assignments()
+                        _t_a = _target.get("A", 0.5)
+                        _t_b = _target.get("B", 0.5)
+                        _maj_pool = "A" if _t_a >= _t_b else "B"
+                        for _sid in _extra_slicers:
+                            if _sid in _curr:
+                                _wn = miners.get(_sid, {}).get("worker_name", _sid)
+                                _curr[_sid] = {"mode": "static", "pool": _maj_pool}
+                                log("sr_released_slicer", worker=_wn,
+                                    consec_under=0, direction="target_change")
+                        _put_assignments(_curr, clear_first=False)
+                    _extra_slicers.clear()
+                    _consec_over_tolerance = 0
+                    _consec_under_tolerance = 0
+                    _sr_recruit_direction = ""
+                    _sr_recruit_grace_end = time.monotonic() + 30.0
 
                 _prev_target = _curr_target
                 _prev_miner_set = _curr_miner_set
@@ -2229,6 +2812,7 @@ async def assigner_loop(cfg):
                 # The structural assignment (who's static, who slices) stays
                 # locked, but the slice fraction gets recalculated so that
                 # drifting hashrate estimates don't cause the ratio to drift.
+                actual = state.get("actual_ratio", {})
                 total_ths = sum(
                     m.get("hashrate_ths", 0.0) for m in miners.values()
                 )
@@ -2239,6 +2823,16 @@ async def assigner_loop(cfg):
                 _current = _snap_assignments()
 
                 _updated = False
+
+                # Pre-compute the list of all time-slicers so each slicer's
+                # deficit calculation can subtract other slicers' contributions.
+                # This prevents multiple slicers from each trying to cover the
+                # full deficit independently (which would cause over-contribution).
+                _all_slicers = [
+                    (s, a) for s, a in _current.items()
+                    if a.get("mode") == "time_slice"
+                ]
+
                 for sid_str, a in _current.items():
                     if a.get("mode") != "time_slice":
                         continue
@@ -2256,15 +2850,77 @@ async def assigner_loop(cfg):
                     _target_slice_ths = total_ths * _slice_target_frac if total_ths > 0 else 0
 
                     # How much is already provided by static miners on the slice pool?
+                    # Only count miners that are actually ON the slice pool right now.
+                    # A miner assigned to pool X but currently on pool Y contributes
+                    # zero real hashrate to X's deficit -- counting it would cause the
+                    # slicer's fraction to be too low and the SR to drift from target.
                     _static_on_slice = sum(
                         miners.get(s, {}).get("hashrate_ths", 0.0)
                         for s, sa in _current.items()
-                        if sa.get("mode") == "static" and sa.get("pool") == _slice
+                        if sa.get("mode") == "static"
+                        and sa.get("pool") == _slice
+                        and miners.get(s, {}).get("current_pool") == _slice
                     )
 
-                    # Deficit that this slicer must cover
-                    _deficit = max(0.0, _target_slice_ths - _static_on_slice)
-                    _new_frac = min(1.0, max(0.0, _deficit / slicer_hr))
+                    # How much do OTHER slicers (not this one) already contribute
+                    # to this slice pool?  Subtract their contribution so this
+                    # slicer only covers the remaining deficit.
+                    _other_slicer_ths = sum(
+                        miners.get(s, {}).get("hashrate_ths", 0.0)
+                        * oa.get("slice_frac", 0.0)
+                        for s, oa in _all_slicers
+                        if s != sid_str
+                        and oa.get("slice_pool") == _slice
+                    )
+
+                    # Deficit that THIS slicer must cover (after statics and other slicers)
+                    _deficit = max(0.0, _target_slice_ths
+                                   - _static_on_slice
+                                   - _other_slicer_ths)
+                    # Use the current slice_frac as the baseline rather than
+                    # recalculating from hashrate every cycle.  Hashrate estimates
+                    # (especially for high-difficulty miners like AvalonQ) are too
+                    # inaccurate to use as a running baseline -- recalculating from
+                    # them every cycle resets the SR correction and prevents
+                    # convergence.  On first assignment (no prior slice_frac), fall
+                    # back to the hashrate-based estimate as the starting value.
+                    _prior_frac = a.get("slice_frac", None)
+                    if _prior_frac is None:
+                        _new_frac = min(1.0, max(0.0, _deficit / slicer_hr))
+                    else:
+                        _new_frac = _prior_frac
+
+                    # SR-feedback correction: adjust slice_frac directly from
+                    # the actual SR error.  This is the primary convergence
+                    # mechanism -- hashrate estimates are only used for the
+                    # initial assignment, not for ongoing adjustments.
+                    #
+                    # Cap is +-0.05/cycle: fast enough to close a 5% gap in
+                    # ~3 minutes (matching Oracle's ~12-minute target hold time),
+                    # slow enough to avoid overshoot on the 10-minute SR window.
+                    #
+                    # Dead-band: small errors (2-5%) require 3 consecutive
+                    # assigner cycles before correcting, to avoid reacting to
+                    # cycle-induced measurement noise in the 5-second SR samples.
+                    # Large errors (>5%) correct immediately on every cycle.
+                    _actual_slice = actual.get(_slice, 0.5)
+                    _sr_error = _slice_target_frac - _actual_slice
+                    if abs(_sr_error) > 0.05:
+                        # Large error: correct immediately, reset dead-band
+                        _sr_consec_error = 3  # treat as already persisted
+                    elif abs(_sr_error) > 0.02:
+                        _sr_consec_error += 1
+                    else:
+                        _sr_consec_error = 0  # within tolerance, reset
+                    if (_sr_consec_error >= 3
+                            and abs(_sr_error) > 0.02
+                            and _new_frac > 0.001):
+                        _slicer_share = min(1.0, _deficit / max(0.001,
+                                            _target_slice_ths - _static_on_slice))
+                        _correction = _sr_error * _slicer_share
+                        _correction = max(-0.05, min(0.05, _correction))
+                        _new_frac = min(0.95, max(0.01, _new_frac + _correction))
+                        _sr_consec_error = 0  # reset after applying correction
 
                     # Health-adjusted floor
                     _health = miners.get(sid_str, {}).get("health", 1.0)
@@ -2311,6 +2967,218 @@ async def assigner_loop(cfg):
                 _write_scheduler_diag(state, _diag_assignments)
             except Exception:
                 pass
+
+            # ------------------------------------------------------------------
+            # SR-based dynamic slicer recruitment.
+            # Uses actual SR deviation as the primary signal -- if the SR has
+            # been outside tolerance for _RECRUIT_AFTER_CYCLES consecutive
+            # assigner cycles, recruit the next eligible miner as an additional
+            # time-slicer.  Releases extra slicers when SR stays within
+            # tolerance for _RELEASE_AFTER_CYCLES consecutive cycles.
+            # This corrects for hashrate estimation errors that cause the
+            # hashrate-based deficit calculation to under-assign slicers.
+            # ------------------------------------------------------------------
+            try:
+                if not is_manual_mode_active():
+                    _actual = state.get("actual_ratio", {})
+                    _target = state.get("target_ratio", {})
+                    _sr_dev = abs(_actual.get("A", 0.5) - _target.get("A", 0.5))
+                    _tol = cfg.sched.convergence_tolerance
+
+                    if _sr_dev > _tol:
+                        _consec_over_tolerance += 1
+                        _consec_under_tolerance = 0
+                    else:
+                        _consec_under_tolerance += 1
+                        _consec_over_tolerance = 0
+
+                    # Recruit an additional slicer if persistently off-target.
+                    # Skip during startup grace period to let rolling window fill.
+                    # Max slicers comes from config (max_slicers); 0 = unlimited.
+                    _MAX_TOTAL_SLICERS = cfg.sched.max_slicers
+                    if (_consec_over_tolerance >= _RECRUIT_AFTER_CYCLES
+                            and time.monotonic() >= _sr_recruit_grace_end):
+                        _consec_over_tolerance = 0  # reset so we don't recruit every cycle
+                        _sr_recruit_grace_end = time.monotonic() + 30.0  # wait 30s before next recruit
+                        _actual_A = _actual.get("A", 0.5)
+                        _target_A = _target.get("A", 0.5)
+                        _sr_recruit_direction = "under" if _actual_A < _target_A else "over"
+                        _curr = _snap_assignments()
+
+                        # Find eligible miners not already slicing
+                        _already_slicing = {s for s, a in _curr.items()
+                                            if a.get("mode") == "time_slice"}
+
+                        # Don't recruit if already at max slicers (0 = unlimited)
+                        if _MAX_TOTAL_SLICERS > 0 and len(_already_slicing) >= _MAX_TOTAL_SLICERS:
+                            _candidates = []
+                        else:
+                            _now_mono = time.monotonic()
+                            _sr_exclusions = cfg.sched.sr_recruit_exclusions
+                            _candidates = [
+                                (s, m) for s, m in miners.items()
+                                if s not in _already_slicing
+                                and m.get("can_switch", True)
+                                and m.get("health", 1.0) >= 0.90
+                                and not is_manual_mode_active()
+                                and m.get("worker_name", "") not in _sr_exclusions
+                                and _now_mono >= _sr_recruit_cooldown.get(
+                                    m.get("worker_name", ""), (0.0, 0))[0]
+                            ]
+                        # Sort by hashrate descending -- most impactful first
+                        _candidates.sort(
+                            key=lambda x: x[1].get("hashrate_ths", 0.0),
+                            reverse=True)
+
+                        if _candidates:
+                            _recruit_sid, _recruit_m = _candidates[0]
+                            _recruit_hr = _recruit_m.get("hashrate_ths", 1.0)
+                            _recruit_health = _recruit_m.get("health", 1.0)
+
+                            # Determine minority/majority from current target
+                            _t_a = _target.get("A", 0.5)
+                            _t_b = _target.get("B", 0.5)
+                            _min_pool = "A" if _t_a <= _t_b else "B"
+                            _maj_pool = "B" if _min_pool == "A" else "A"
+                            _min_frac = min(_t_a, _t_b)
+                            _total_ths = sum(
+                                m.get("hashrate_ths", 0.0)
+                                for m in miners.values())
+
+                            # Slice fraction: compute what the recruited slicer
+                            # still needs to cover after existing assignments.
+                            # Capped at _min_frac to prevent over-contribution.
+                            _static_on_min = sum(
+                                miners.get(s, {}).get("hashrate_ths", 0.0)
+                                for s, a in _curr.items()
+                                if a.get("mode") == "static"
+                                and a.get("pool") == _min_pool)
+                            _slicer_on_min = sum(
+                                miners.get(s, {}).get("hashrate_ths", 0.0)
+                                * a.get("slice_frac", 0.0)
+                                for s, a in _curr.items()
+                                if a.get("mode") == "time_slice"
+                                and a.get("slice_pool") == _min_pool)
+                            _residual = max(0.0,
+                                _total_ths * _min_frac
+                                - _static_on_min
+                                - _slicer_on_min)
+                            _sf = min(_min_frac, max(0.01,
+                                      _residual / _recruit_hr
+                                      if _recruit_hr > 0 else _min_frac))
+
+                            # Skip recruit if contribution is too small to matter.
+                            # _recruit_hr * _sf is the effective TH/s this slicer
+                            # would add toward the deficit. If it's less than 1% of
+                            # total fleet hashrate, it won't meaningfully move SR
+                            # and will only add noise and unnecessary pool switches.
+                            _min_contribution = _total_ths * 0.01
+                            if _recruit_hr * _sf < _min_contribution:
+                                log("sr_recruit_skipped",
+                                    worker=_recruit_m.get("worker_name", _recruit_sid),
+                                    reason="contribution_below_threshold",
+                                    contribution_ths=round(_recruit_hr * _sf, 3),
+                                    threshold_ths=round(_min_contribution, 3))
+                            else:
+                                _floor = min_slice + (1.0 - _recruit_health) * 10.0
+                                if _sf > 0.001:
+                                    _cyc = _floor / _sf
+                                else:
+                                    _cyc = 60.0
+                                _cyc = max(20.0, min(120.0, _cyc))
+                                _sd = max(_floor, _cyc * _sf)
+                                _hd = max(_floor, _cyc * (1.0 - _sf))
+
+                                # Stagger offset relative to existing slicers
+                                _n_slicers = len(_already_slicing)
+                                _stagger = (_cyc / (_n_slicers + 1)) * _n_slicers
+
+                                _new_a = {
+                                    "mode": "time_slice",
+                                    "pool": _maj_pool,
+                                    "home_pool": _maj_pool,
+                                    "slice_pool": _min_pool,
+                                    "home_duration_s": round(_hd, 1),
+                                    "slice_duration_s": round(_sd, 1),
+                                    "cycle_length_s": round(_sd + _hd, 1),
+                                    "stagger_offset_s": round(_stagger, 1),
+                                    "slice_frac": round(_sf, 4),
+                                }
+                                _curr[_recruit_sid] = _new_a
+                                _put_assignments(_curr, clear_first=False)
+                                _extra_slicers.append(_recruit_sid)
+                                log("sr_recruited_slicer",
+                                    worker=_recruit_m.get("worker_name",
+                                                           _recruit_sid),
+                                    sr_deviation=round(_sr_dev, 4),
+                                    slice_frac=round(_sf, 4),
+                                    total_slicers=len(_already_slicing) + 1)
+
+                    # Release extra slicers only when SR has crossed to the
+                    # other side of target -- i.e., we recruited because actual
+                    # was under target, and now actual has overshot above target
+                    # (or vice versa).  This prevents premature release when SR
+                    # is merely close to target but still drifting on the same
+                    # side.  A safety fallback releases if no direction was
+                    # recorded (e.g. after a restart).
+                    elif (_extra_slicers
+                          and _consec_under_tolerance >= _RELEASE_AFTER_CYCLES):
+                        _actual_A_now = _actual.get("A", 0.5)
+                        _target_A_now = _target.get("A", 0.5)
+                        _now_over = _actual_A_now > _target_A_now
+                        _should_release = (
+                            (_sr_recruit_direction == "under" and _now_over)
+                            or (_sr_recruit_direction == "over" and not _now_over)
+                            or (_sr_recruit_direction == "")
+                        )
+                        if _should_release:
+                            _consec_under_tolerance = 0
+                            _curr = _snap_assignments()
+                            _t_a = _target.get("A", 0.5)
+                            _t_b = _target.get("B", 0.5)
+                            _maj_pool = "A" if _t_a >= _t_b else "B"
+                            for _release_sid in _extra_slicers:
+                                if _release_sid in _curr:
+                                    _release_wn = miners.get(_release_sid, {}).get(
+                                        "worker_name", _release_sid)
+                                    _curr[_release_sid] = {
+                                        "mode": "static",
+                                        "pool": _maj_pool,
+                                    }
+                                    log("sr_released_slicer",
+                                        worker=_release_wn,
+                                        consec_under=_RELEASE_AFTER_CYCLES,
+                                        direction=_sr_recruit_direction)
+                            _put_assignments(_curr, clear_first=False)
+                            _extra_slicers.clear()
+
+                    # Reset extra slicers on target change or fleet change
+                    # Use the loop-level variables which are always defined
+                    _current_target_now = (
+                        round(_target.get("A", 0.5), 4),
+                        round(_target.get("B", 0.5), 4))
+                    _current_miners_now = set(miners.keys())
+                    if (_current_target_now != _prev_target
+                            or _current_miners_now != _prev_miner_set):
+                        if _extra_slicers:
+                            _curr = _snap_assignments()
+                            _t_a = _target.get("A", 0.5)
+                            _t_b = _target.get("B", 0.5)
+                            _maj_pool = "A" if _t_a >= _t_b else "B"
+                            for _sid in _extra_slicers:
+                                if _sid in _curr:
+                                    _wn = miners.get(_sid, {}).get("worker_name", _sid)
+                                    _curr[_sid] = {"mode": "static", "pool": _maj_pool}
+                                    log("sr_released_slicer", worker=_wn,
+                                        consec_under=0, direction="target_change")
+                            _put_assignments(_curr, clear_first=False)
+                        _extra_slicers.clear()
+                        _consec_over_tolerance = 0
+                        _consec_under_tolerance = 0
+                        _sr_recruit_direction = ""  # clear stale direction from previous target
+
+            except Exception as _sr_err:
+                log("sr_recruit_error", err=str(_sr_err))
 
         except Exception as e:
             log("assigner_error", err=str(e))
@@ -2451,6 +3319,61 @@ def en2_is_pinned(miner_ip: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# SR recruit cooldown tracking
+# ---------------------------------------------------------------------------
+# When a miner produces a reject storm during an SR-recruited time-slice,
+# it is placed in a cooldown period during which it cannot be SR-recruited
+# again.  Cooldown uses exponential backoff: 30 min base, doubling on each
+# repeat offense, up to 8 hours max.  After the cooldown expires the miner
+# is automatically eligible again -- no manual action required.
+#
+# This is keyed by worker_name (not IP) so it persists across reconnects.
+# The cooldown dict is module-level so both assigner_loop and the proxy's
+# reject-storm handler can access it via sr_recruit_record_cooldown().
+# ---------------------------------------------------------------------------
+
+_sr_recruit_cooldown: dict[str, tuple[float, int]] = {}
+# worker_name -> (expiry_mono, strike_count)
+_SR_COOLDOWN_BASE_S = 1800.0   # 30 minutes base
+_SR_COOLDOWN_MAX_S  = 28800.0  # 8 hours maximum
+
+
+def sr_recruit_record_cooldown(worker_name: str) -> None:
+    """Record a SR-recruit reject storm for a worker and set cooldown.
+
+    Called by the proxy when a miner that was SR-recruited generates a
+    reject storm (>5 rejects with 0 accepts after a pool switch).
+
+    Args:
+        worker_name: The worker's name string (e.g. "BM101A").
+    """
+    _expiry, strikes = _sr_recruit_cooldown.get(worker_name, (0.0, 0))
+    strikes += 1
+    cooldown_s = min(_SR_COOLDOWN_MAX_S,
+                     _SR_COOLDOWN_BASE_S * (2 ** (strikes - 1)))
+    expiry = time.monotonic() + cooldown_s
+    _sr_recruit_cooldown[worker_name] = (expiry, strikes)
+    log("sr_recruit_cooldown_set",
+        worker=worker_name,
+        strikes=strikes,
+        cooldown_minutes=round(cooldown_s / 60, 1),
+        expiry_in_minutes=round(cooldown_s / 60, 1))
+
+
+def sr_recruit_cooldown_active(worker_name: str) -> bool:
+    """Return True if this worker is currently in SR recruit cooldown.
+
+    Args:
+        worker_name: The worker's name string.
+    """
+    entry = _sr_recruit_cooldown.get(worker_name)
+    if entry is None:
+        return False
+    expiry, _ = entry
+    return time.monotonic() < expiry
+
+
+# ---------------------------------------------------------------------------
 # Force-reconnect switch: try a clean reconnect before resorting to pinning.
 # ---------------------------------------------------------------------------
 # When a miner fails set_extranonce (en1 mismatch rejects detected), we
@@ -2467,7 +3390,7 @@ def en2_is_pinned(miner_ip: str) -> bool:
 
 _reconnect_switch_attempts: dict[str, int] = {}
 _reconnect_switch_last_pool: dict[str, str] = {}
-_RECONNECT_SWITCH_MAX_ATTEMPTS = 1  # try reconnect once, pin on second failure (was 1)
+_RECONNECT_SWITCH_MAX_ATTEMPTS = 3  # pin after 3 failed reconnect-switch attempts
 
 
 def reconnect_switch_should_pin(miner_ip: str, target_pool: str) -> bool:

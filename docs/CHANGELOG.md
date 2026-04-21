@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.0.7 - 2026-04-21
+- refinements to scheduler logic
+- refinements to dynamic time-slicer allocation
+- add uptime to worker stats table
+- add pool idle disconnect checkboxes to pool A/B settings
+- add sr recruitment exclusions field to scheduler settings
+
 ## 3.0.6 - 2026-03-11
 - startup pool correction
 - implement per-submit switch timestamp
